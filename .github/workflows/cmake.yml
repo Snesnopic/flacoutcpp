@@ -1,0 +1,139 @@
+name: CMake Build
+
+on:
+  push:
+    branches: [ "**" ]
+  pull_request:
+    branches: [ "**" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.asset_name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            os: windows-2022
+            arch: x64
+            cmake_args: -A x64
+            asset_name: flacoutcpp-windows-x64
+
+          - name: Windows ARM64
+            os: windows-2022
+            arch: arm64
+            cmake_args: -A ARM64
+            asset_name: flacoutcpp-windows-arm64
+
+          - name: Windows x86
+            os: windows-2022
+            arch: x86
+            cmake_args: -A Win32
+            asset_name: flacoutcpp-windows-x86
+
+          - name: Ubuntu x64 GCC
+            os: ubuntu-24.04
+            arch: x64
+            compiler_c: gcc
+            compiler_cxx: g++
+            asset_name: flacoutcpp-linux-x64-gcc
+
+          - name: Ubuntu x64 Clang
+            os: ubuntu-24.04
+            arch: x64
+            compiler_c: clang
+            compiler_cxx: clang++
+            asset_name: flacoutcpp-linux-x64-clang
+
+          - name: Ubuntu ARM64 GCC
+            os: ubuntu-24.04-arm
+            arch: arm64
+            compiler_c: gcc
+            compiler_cxx: g++
+            asset_name: flacoutcpp-linux-arm64
+
+          - name: Ubuntu x86 GCC
+            os: ubuntu-24.04
+            arch: x86
+            compiler_c: gcc
+            compiler_cxx: g++
+            cmake_args: -DCMAKE_CXX_FLAGS=-m32 -DCMAKE_C_FLAGS=-m32
+            install_deps: sudo apt-get update && sudo apt-get install -y g++-multilib
+            asset_name: flacoutcpp-linux-x86
+
+          - name: macOS Intel
+            os: macos-15-intel
+            arch: x64
+            asset_name: flacoutcpp-darwin-x64
+
+          - name: macOS ARM64
+            os: macos-14
+            arch: arm64
+            asset_name: flacoutcpp-darwin-arm64
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Dependencies
+        if: matrix.install_deps
+        run: ${{ matrix.install_deps }}
+
+      - name: Configure CMake
+        run: >
+          cmake -B build
+          -DCMAKE_BUILD_TYPE=Release
+          ${{ matrix.cmake_args }}
+        env:
+          CC: ${{ matrix.compiler_c }}
+          CXX: ${{ matrix.compiler_cxx }}
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.asset_name }}
+          path: |
+            build/flacoutcpp
+            build/flacoutcpp.exe
+            build/Release/flacoutcpp.exe
+
+  build-freebsd:
+    name: ${{ matrix.asset_name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            asset_name: flacoutcpp-freebsd-x64
+            release: '15.0'
+          - arch: aarch64
+            asset_name: flacoutcpp-freebsd-arm64
+            release: '15.0'
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build in VM
+        uses: vmactions/freebsd-vm@v1
+        with:
+          usesh: true
+          arch: ${{ matrix.arch }}
+          release: ${{ matrix.release }}
+          prepare: pkg install -y cmake git
+          run: |
+            cmake -B build -DCMAKE_BUILD_TYPE=Release
+            cmake --build build --config Release
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.asset_name }}
+          path: |
+            build/flacoutcpp
+            build/flacoutcpp.exe
+            build/Release/flacoutcpp.exe

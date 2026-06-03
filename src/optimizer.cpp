@@ -16,14 +16,14 @@
 #define M_E 2.71828182845904523536
 #endif
 
-Optimizer::Optimizer(const uint32_t channels, const uint32_t bits_per_sample, const uint32_t sample_rate)
-    : m_channels(channels), m_bps(bits_per_sample), m_sample_rate(sample_rate) {}
+Optimizer::Optimizer(uint32_t channels, uint32_t bits_per_sample)
+    : m_channels(channels), m_bps(bits_per_sample) {}
 
 void Optimizer::precompute_granules(const std::vector<std::vector<int32_t>>& pcm_data) {
     size_t num_granules = pcm_data[0].size() / 16;
-    m_granules.assign(m_channels, std::vector<Granule>(num_granules));
+    m_granules.resize(m_channels, std::vector<Granule>(num_granules));
 
-    for (int c = 0; c < m_channels; ++c) {
+    for (uint32_t c = 0; c < m_channels; ++c) {
         for (size_t g = 0; g < num_granules; ++g) {
             const int32_t* src = &pcm_data[c][g * 16];
             for (int i = 0; i <= 32; ++i) {
@@ -139,7 +139,7 @@ SubframeParams Optimizer::optimize_subframe(const int32_t* samples, uint32_t blo
 
     for (int mode : {0, 1, 2, 3}) {
         if (mode == 2) {
-            for (int order = 0; order <= 4; ++order) {
+            for (uint32_t order = 0; order <= 4; ++order) {
                 if (order >= block_size && order > 0) break;
                 SubframeParams cur{};
                 uint32_t cost = estimate_subframe_cost(samples, block_size, mode, order, 0, wasted, bps, &cur);
@@ -148,7 +148,7 @@ SubframeParams Optimizer::optimize_subframe(const int32_t* samples, uint32_t blo
         } else if (mode == 3) {
             uint32_t best_order_cost = std::numeric_limits<uint32_t>::max();
             int no_improvement_count = 0;
-            for (int order = 1; order <= 32; ++order) {
+            for (uint32_t order = 1; order <= 32; ++order) {
                 if (order >= block_size) break;
                 uint32_t min_prec_cost = std::numeric_limits<uint32_t>::max();
                 for (int prec = 8; prec <= 15; ++prec) {
@@ -273,7 +273,7 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(const std::v
                         int best_sm = 0;
 
                         uint32_t c_indep = 16;
-                        for (int c = 0; c < m_channels; ++c) c_indep += estimate_lpc_bits_fast(c, i, j, m_bps);
+                        for (uint32_t c = 0; c < m_channels; ++c) c_indep += estimate_lpc_bits_fast(c, i, j, m_bps);
                         best_total_b_bits = c_indep;
 
                         if (m_channels == 2) {
@@ -353,7 +353,7 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(const std::v
                 j.bp.stereo_mode = j.sm;
                 
                 if (j.sm == 0 || m_channels != 2) {
-                    for(int c=0; c<m_channels; ++c) j.bp.subframes[c] = optimize_subframe(&pcm_data[c][j.sample_offset], j.b_size, m_bps);
+                    for(uint32_t c=0; c<m_channels; ++c) j.bp.subframes[c] = optimize_subframe(&pcm_data[c][j.sample_offset], j.b_size, m_bps);
                 } else {
                     uint32_t best_bits = std::numeric_limits<uint32_t>::max();
                     for (int mode : {8, 9, 10}) {

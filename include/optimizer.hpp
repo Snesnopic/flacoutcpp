@@ -25,7 +25,7 @@ struct BlockParams {
 
 class Optimizer {
 public:
-    Optimizer(uint32_t channels, uint32_t bits_per_sample, uint32_t sample_rate);
+    Optimizer(uint32_t channels, uint32_t bps);
 
     std::vector<BlockParams> find_optimal_block_partitioning(const std::vector<std::vector<int32_t>>& pcm_data);
     static SubframeParams optimize_subframe(const int32_t* samples, uint32_t block_size, uint32_t bps);
@@ -49,7 +49,6 @@ private:
 
     uint32_t m_channels;
     uint32_t m_bps;
-    uint32_t m_sample_rate;
 };
 
 #endif // OPTIMIZER_HPP

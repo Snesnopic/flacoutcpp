@@ -56,7 +56,7 @@ bool Processor::process() {
 
     std::cout << "Optimizing " << m_total_samples << " samples...\n";
 
-    Optimizer opt(m_channels, m_bps, m_sample_rate);
+    Optimizer opt(m_channels, m_bps);
     std::vector<BlockParams> blocks = opt.find_optimal_block_partitioning(m_pcm_data);
 
     // Setup Encoder
@@ -106,24 +106,29 @@ FLAC__StreamDecoderWriteStatus Processor::write_callback(const FLAC__StreamDecod
                                                          const FLAC__Frame *frame, 
                                                          const FLAC__int32 * const buffer[], 
                                                          void *client_data) {
-    auto p = static_cast<Processor*>(client_data);
-    if (p->m_pcm_data.empty()) p->m_pcm_data.resize(frame->header.channels);
+    (void)decoder;
+    auto* self = static_cast<Processor*>(client_data);
+    uint32_t blocksize = frame->header.blocksize;
+    if (self->m_pcm_data.empty()) self->m_pcm_data.resize(frame->header.channels);
     for (uint32_t i = 0; i < frame->header.channels; ++i) {
-        p->m_pcm_data[i].insert(p->m_pcm_data[i].end(), buffer[i], buffer[i] + frame->header.blocksize);
+        self->m_pcm_data[i].insert(self->m_pcm_data[i].end(), buffer[i], buffer[i] + blocksize);
     }
     return FLAC__STREAM_DECODER_WRITE_STATUS_CONTINUE;
 }
 
 void Processor::error_callback(const FLAC__StreamDecoder *decoder, FLAC__StreamDecoderErrorStatus status, void *client_data) {
-    std::cerr << "FLAC Decoder Error: " << FLAC__StreamDecoderErrorStatusString[status] << "\n";
+    (void)decoder;
+    (void)client_data;
+    std::cerr << "Decoder error: " << FLAC__StreamDecoderErrorStatusString[status] << "\n";
 }
 
 void Processor::metadata_callback(const FLAC__StreamDecoder *decoder, const FLAC__StreamMetadata *metadata, void *client_data) {
-    auto p = static_cast<Processor*>(client_data);
+    (void)decoder;
+    auto* self = static_cast<Processor*>(client_data);
     if (metadata->type == FLAC__METADATA_TYPE_STREAMINFO) {
-        p->m_sample_rate = metadata->data.stream_info.sample_rate;
-        p->m_channels = metadata->data.stream_info.channels;
-        p->m_bps = metadata->data.stream_info.bits_per_sample;
-        p->m_total_samples = metadata->data.stream_info.total_samples;
+        self->m_sample_rate = metadata->data.stream_info.sample_rate;
+        self->m_channels = metadata->data.stream_info.channels;
+        self->m_bps = metadata->data.stream_info.bits_per_sample;
+        self->m_total_samples = metadata->data.stream_info.total_samples;
     }
 }

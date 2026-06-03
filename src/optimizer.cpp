@@ -5,6 +5,9 @@
 #include <limits>
 #include <vector>
 #include <cstring>
+#include <thread>
+#include <atomic>
+#include <future>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -143,12 +146,23 @@ SubframeParams Optimizer::optimize_subframe(const int32_t* samples, uint32_t blo
                 if (cost < best.bits_cost) { best = cur; best.bits_cost = cost; }
             }
         } else if (mode == 3) {
+            uint32_t best_order_cost = std::numeric_limits<uint32_t>::max();
+            int no_improvement_count = 0;
             for (int order = 1; order <= 32; ++order) {
                 if (order >= block_size) break;
+                uint32_t min_prec_cost = std::numeric_limits<uint32_t>::max();
                 for (int prec = 8; prec <= 15; ++prec) {
                     SubframeParams cur{};
                     uint32_t cost = estimate_subframe_cost(samples, block_size, mode, order, prec, wasted, bps, &cur);
                     if (cost < best.bits_cost) { best = cur; best.bits_cost = cost; }
+                    if (cost < min_prec_cost) min_prec_cost = cost;
+                }
+                if (min_prec_cost >= best_order_cost) {
+                    no_improvement_count++;
+                    if (no_improvement_count >= 3) break;
+                } else {
+                    best_order_cost = min_prec_cost;
+                    no_improvement_count = 0;
                 }
             }
         } else {
@@ -233,86 +247,141 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(const std::v
     dp_cost[0] = 0;
     std::cout << "Starting DP search over " << num_nodes << " nodes...\n";
 
-    for (size_t i = 0; i < num_nodes; ++i) {
-        if (i % 1000 == 0) std::cout << "\rProgress: " << (i * 100 / num_nodes) << "%" << std::flush;
-        size_t max_j = std::min(i + 256, num_nodes);
-        for (size_t j = i + 1; j <= max_j; ++j) {
-            uint32_t best_total_b_bits = std::numeric_limits<uint32_t>::max();
-            int best_sm = 0;
+    const size_t CHUNK_SIZE = 4096;
+    for (size_t chunk_start = 0; chunk_start < num_nodes; chunk_start += CHUNK_SIZE) {
+        size_t chunk_end = std::min(chunk_start + CHUNK_SIZE, num_nodes);
+        
+        struct EdgeCost { uint32_t bits; int sm; };
+        std::vector<std::vector<EdgeCost>> chunk_edges(chunk_end - chunk_start);
 
-            uint32_t c_indep = 16;
-            for (int c = 0; c < m_channels; ++c) c_indep += estimate_lpc_bits_fast(c, i, j, m_bps);
-            best_total_b_bits = c_indep;
+        std::atomic<size_t> current_i{chunk_start};
+        int num_threads = std::thread::hardware_concurrency();
+        if (num_threads == 0) num_threads = 4;
+        std::vector<std::thread> threads;
+        
+        for (int t = 0; t < num_threads; ++t) {
+            threads.emplace_back([&]() {
+                while (true) {
+                    size_t i = current_i.fetch_add(1);
+                    if (i >= chunk_end) break;
+                    
+                    size_t max_j = std::min(i + 256, num_nodes);
+                    chunk_edges[i - chunk_start].resize(max_j - i);
+                    
+                    for (size_t j = i + 1; j <= max_j; ++j) {
+                        uint32_t best_total_b_bits = std::numeric_limits<uint32_t>::max();
+                        int best_sm = 0;
 
-            if (m_channels == 2) {
-                // Approximate stereo decorrelation cost
-                uint32_t c_decorr = 16 + (estimate_lpc_bits_fast(0, i, j, m_bps) + estimate_lpc_bits_fast(1, i, j, m_bps + 1)) * 0.9;
-                if (c_decorr < best_total_b_bits) {
-                    best_total_b_bits = c_decorr;
-                    best_sm = 10; // Mid-Side estimate
+                        uint32_t c_indep = 16;
+                        for (int c = 0; c < m_channels; ++c) c_indep += estimate_lpc_bits_fast(c, i, j, m_bps);
+                        best_total_b_bits = c_indep;
+
+                        if (m_channels == 2) {
+                            uint32_t c_decorr = 16 + (estimate_lpc_bits_fast(0, i, j, m_bps) + estimate_lpc_bits_fast(1, i, j, m_bps + 1)) * 0.9;
+                            if (c_decorr < best_total_b_bits) {
+                                best_total_b_bits = c_decorr;
+                                best_sm = 10;
+                            }
+                        }
+                        chunk_edges[i - chunk_start][j - i - 1] = {best_total_b_bits, best_sm};
+                    }
+                }
+            });
+        }
+        for (auto& th : threads) th.join();
+        
+        for (size_t i = chunk_start; i < chunk_end; ++i) {
+            size_t max_j = std::min(i + 256, num_nodes);
+            for (size_t j = i + 1; j <= max_j; ++j) {
+                const auto& edge = chunk_edges[i - chunk_start][j - i - 1];
+                if (dp_cost[i] + edge.bits < dp_cost[j]) {
+                    dp_cost[j] = dp_cost[i] + edge.bits;
+                    dp_parent[j] = (int)i;
+                    dp_stereo_mode[j] = edge.sm;
                 }
             }
-
-            if (dp_cost[i] + best_total_b_bits < dp_cost[j]) {
-                dp_cost[j] = dp_cost[i] + best_total_b_bits;
-                dp_parent[j] = (int)i;
-                dp_stereo_mode[j] = best_sm;
-            }
         }
+        std::cout << "\rProgress: " << (chunk_end * 100 / num_nodes) << "%" << std::flush;
     }
     std::cout << "\nDP complete. Recalculating chosen blocks...\n";
 
     std::vector<BlockParams> result;
+    
+    struct Job {
+        uint32_t b_size;
+        uint32_t sample_offset;
+        int sm;
+        BlockParams bp;
+    };
+    std::vector<Job> jobs;
+    
     int curr = static_cast<int>(num_nodes);
     while(curr > 0) {
         int parent = dp_parent[curr];
-        uint32_t b_size = (curr - parent) * 16;
-        uint32_t sample_offset = parent * 16;
-        int sm = dp_stereo_mode[curr];
-
-        BlockParams bp{};
-        bp.block_size = b_size;
-        bp.stereo_mode = sm;
-        
-        if (sm == 0 || m_channels != 2) {
-            for(int c=0; c<m_channels; ++c) bp.subframes[c] = optimize_subframe(&pcm_data[c][sample_offset], b_size, m_bps);
-        } else {
-            // Actual exhaustive search for best stereo mode during recalculation
-            uint32_t best_bits = std::numeric_limits<uint32_t>::max();
-            for (int mode : {8, 9, 10}) {
-                std::vector<int32_t> ch0(b_size), ch1(b_size);
-                for(uint32_t k=0; k<b_size; ++k) {
-                    int32_t L = pcm_data[0][sample_offset+k];
-                    int32_t R = pcm_data[1][sample_offset+k];
-                    if (mode == 10) { ch0[k] = (L + R) >> 1; ch1[k] = L - R; }
-                    else if (mode == 8) { ch0[k] = L; ch1[k] = L - R; }
-                    else if (mode == 9) { ch0[k] = L - R; ch1[k] = R; }
-                }
-                SubframeParams s0 = optimize_subframe(ch0.data(), b_size, m_bps);
-                SubframeParams s1 = optimize_subframe(ch1.data(), b_size, m_bps + 1);
-                if (s0.bits_cost + s1.bits_cost < best_bits) {
-                    best_bits = s0.bits_cost + s1.bits_cost;
-                    bp.stereo_mode = mode;
-                    bp.subframes[0] = s0;
-                    bp.subframes[1] = s1;
-                }
-            }
-        }
-        result.push_back(bp);
+        Job j;
+        j.b_size = (curr - parent) * 16;
+        j.sample_offset = parent * 16;
+        j.sm = dp_stereo_mode[curr];
+        jobs.push_back(j);
         curr = parent;
     }
-    std::reverse(result.begin(), result.end());
+    std::reverse(jobs.begin(), jobs.end());
     
     size_t total_samples = pcm_data[0].size();
     if (total_samples % 16 != 0) {
         uint32_t rem_size = total_samples % 16;
-        uint32_t offset = total_samples - rem_size;
-        BlockParams rem_bp;
-        rem_bp.block_size = rem_size;
-        rem_bp.stereo_mode = 0;
-        for(int c=0; c<m_channels; ++c) rem_bp.subframes[c] = optimize_subframe(&pcm_data[c][offset], rem_size, m_bps);
-        result.push_back(rem_bp);
+        Job j;
+        j.b_size = rem_size;
+        j.sample_offset = total_samples - rem_size;
+        j.sm = 0;
+        jobs.push_back(j);
     }
+    
+    std::atomic<size_t> next_job{0};
+    int num_threads = std::thread::hardware_concurrency();
+    if (num_threads == 0) num_threads = 4;
+    std::vector<std::thread> threads;
+    
+    for (int t = 0; t < num_threads; ++t) {
+        threads.emplace_back([&]() {
+            while (true) {
+                size_t job_idx = next_job.fetch_add(1);
+                if (job_idx >= jobs.size()) break;
+                
+                auto& j = jobs[job_idx];
+                j.bp.block_size = j.b_size;
+                j.bp.stereo_mode = j.sm;
+                
+                if (j.sm == 0 || m_channels != 2) {
+                    for(int c=0; c<m_channels; ++c) j.bp.subframes[c] = optimize_subframe(&pcm_data[c][j.sample_offset], j.b_size, m_bps);
+                } else {
+                    uint32_t best_bits = std::numeric_limits<uint32_t>::max();
+                    for (int mode : {8, 9, 10}) {
+                        std::vector<int32_t> ch0(j.b_size), ch1(j.b_size);
+                        for(uint32_t k=0; k<j.b_size; ++k) {
+                            int32_t L = pcm_data[0][j.sample_offset+k];
+                            int32_t R = pcm_data[1][j.sample_offset+k];
+                            if (mode == 10) { ch0[k] = (L + R) >> 1; ch1[k] = L - R; }
+                            else if (mode == 8) { ch0[k] = L; ch1[k] = L - R; }
+                            else if (mode == 9) { ch0[k] = L - R; ch1[k] = R; }
+                        }
+                        SubframeParams s0 = optimize_subframe(ch0.data(), j.b_size, m_bps);
+                        SubframeParams s1 = optimize_subframe(ch1.data(), j.b_size, m_bps + 1);
+                        if (s0.bits_cost + s1.bits_cost < best_bits) {
+                            best_bits = s0.bits_cost + s1.bits_cost;
+                            j.bp.stereo_mode = mode;
+                            j.bp.subframes[0] = s0;
+                            j.bp.subframes[1] = s1;
+                        }
+                    }
+                }
+            }
+        });
+    }
+    
+    for (auto& th : threads) th.join();
+    
+    for (auto& j : jobs) result.push_back(j.bp);
 
     return result;
 }

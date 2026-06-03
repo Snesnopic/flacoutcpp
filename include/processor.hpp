@@ -8,7 +8,7 @@
 
 class Processor {
 public:
-    Processor(const std::string& input_file, const std::string& output_file);
+    Processor(const std::string& input_file, const std::string& output_file, bool copy_metadata = true);
     ~Processor();
 
     bool process();
@@ -28,6 +28,7 @@ private:
 
     std::string m_input;
     std::string m_output;
+    bool m_copy_metadata;
     
     // Internal PCM storage
     std::vector<std::vector<int32_t>> m_pcm_data; // per-channel

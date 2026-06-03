@@ -4,13 +4,39 @@
 #include "FLAC/stream_encoder.h"
 #include <iostream>
 #include <algorithm>
+#include <vector>
+#include "FLAC/metadata.h"
 
-Processor::Processor(const std::string& input_file, const std::string& output_file)
-    : m_input(input_file), m_output(output_file) {}
+Processor::Processor(const std::string& input_file, const std::string& output_file, bool copy_metadata)
+    : m_input(input_file), m_output(output_file), m_copy_metadata(copy_metadata) {}
 
 Processor::~Processor() = default;
 
 bool Processor::process() {
+    FLAC__Metadata_Chain *chain = nullptr;
+    std::vector<FLAC__StreamMetadata*> metadata_blocks;
+    
+    if (m_copy_metadata) {
+        chain = FLAC__metadata_chain_new();
+        if (chain) {
+            if (FLAC__metadata_chain_read(chain, m_input.c_str())) {
+                FLAC__Metadata_Iterator *it = FLAC__metadata_iterator_new();
+                FLAC__metadata_iterator_init(it, chain);
+                do {
+                    FLAC__StreamMetadata *block = FLAC__metadata_iterator_get_block(it);
+                    if (block->type != FLAC__METADATA_TYPE_STREAMINFO) {
+                        metadata_blocks.push_back(block);
+                    }
+                } while (FLAC__metadata_iterator_next(it));
+                FLAC__metadata_iterator_delete(it);
+            } else {
+                std::cerr << "Warning: Could not read metadata chain from " << m_input << "\n";
+                FLAC__metadata_chain_delete(chain);
+                chain = nullptr;
+            }
+        }
+    }
+
     FLAC__StreamDecoder *decoder = FLAC__stream_decoder_new();
     if (decoder == nullptr) return false;
 
@@ -46,8 +72,13 @@ bool Processor::process() {
     FLAC__stream_encoder_set_do_mid_side_stereo(encoder, true);
     FLAC__stream_encoder_set_loose_mid_side_stereo(encoder, false);
 
+    if (!metadata_blocks.empty()) {
+        FLAC__stream_encoder_set_metadata(encoder, metadata_blocks.data(), metadata_blocks.size());
+    }
+
     if (FLAC__stream_encoder_init_file(encoder, m_output.c_str(), nullptr, nullptr) != FLAC__STREAM_ENCODER_INIT_STATUS_OK) {
         FLAC__stream_encoder_delete(encoder);
+        if (chain) FLAC__metadata_chain_delete(chain);
         return false;
     }
 
@@ -66,6 +97,7 @@ bool Processor::process() {
 
     FLAC__stream_encoder_finish(encoder);
     FLAC__stream_encoder_delete(encoder);
+    if (chain) FLAC__metadata_chain_delete(chain);
 
     return true;
 }

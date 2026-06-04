@@ -21,3 +21,5 @@ target_link_libraries(flacout_lib FLAC)
 # CLI
 add_executable(flacoutcpp src/main.cpp)
 target_link_libraries(flacoutcpp flacout_lib)
+
+install(TARGETS flacoutcpp DESTINATION bin)

@@ -5,6 +5,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(WITH_OGG OFF CACHE BOOL "Disable Ogg support in vendored FLAC" FORCE)
+set(INSTALL_MANPAGES OFF CACHE BOOL "Don't build FLAC manpages" FORCE)
 add_subdirectory(third_party/libflac EXCLUDE_FROM_ALL)
 
 # Include directory di libFLAC

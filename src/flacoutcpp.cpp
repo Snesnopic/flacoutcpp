@@ -8,6 +8,7 @@ bool optimise(const std::string& input_path, const std::string& output_path, con
     pc.copy_metadata = config.copy_metadata;
     pc.windows       = config.windows;
     pc.max_threads   = config.max_threads;
+    pc.exhaustive    = config.exhaustive;
     Processor proc(input_path, output_path, pc);
     return proc.process();
 }

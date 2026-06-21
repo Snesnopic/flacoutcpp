@@ -104,13 +104,19 @@ WindowType window_from_name(const std::string& raw) {
 
 Optimizer::Optimizer(uint32_t channels, uint32_t bps,
                      std::vector<WindowType> windows,
-                     unsigned max_threads)
-    : m_channels(channels), m_bps(bps), m_max_threads(max_threads)
+                     unsigned max_threads,
+                     bool exhaustive)
+    : m_channels(channels), m_bps(bps), m_max_threads(max_threads), m_exhaustive(exhaustive)
 {
-    if (windows.empty())
-        m_windows = all_window_types();
-    else
+    if (windows.empty()) {
+        if (m_exhaustive) {
+            m_windows = all_window_types();
+        } else {
+            m_windows = {WindowType::TUKEY_050, WindowType::HANN, WindowType::WELCH, WindowType::RECTANGULAR};
+        }
+    } else {
         m_windows = std::move(windows);
+    }
 }
 
 // ============================================================
@@ -532,7 +538,7 @@ uint32_t Optimizer::estimate_subframe_cost(
 
 SubframeParams Optimizer::optimize_subframe(
     const int32_t* samples, uint32_t bsize, uint32_t bps,
-    const std::vector<WindowType>& windows)
+    const std::vector<WindowType>& windows, bool exhaustive)
 {
     SubframeParams best{};
     best.bits_cost = std::numeric_limits<uint32_t>::max();
@@ -609,7 +615,14 @@ SubframeParams Optimizer::optimize_subframe(
                     log2cmax = (int)std::floor(std::log2(cmax));
                 // else cmax < 1 → log2cmax ≤ -1, but we keep it at 0 so shift stays high.
 
-                for (int prec = 8; prec <= 15; ++prec) {
+                std::vector<int> precisions;
+                if (exhaustive) {
+                    for (int p = 8; p <= 15; ++p) precisions.push_back(p);
+                } else {
+                    precisions = {12, 15};
+                }
+
+                for (int prec : precisions) {
                     // shift = (prec-1) - log2cmax - 1
                     // = prec - log2cmax - 2
                     // Ensures quantized coefficient = round(coeff * 2^shift) fits in [-(2^(prec-1)), 2^(prec-1)-1].
@@ -746,7 +759,7 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
         if (m_channels == 1) {
             bp.stereo_mode  = 0;
             bp.subframes[0] = optimize_subframe(pcm_data[0].data(),
-                                                (uint32_t)total_samples, m_bps, m_windows);
+                                                (uint32_t)total_samples, m_bps, m_windows, m_exhaustive);
         } else {
             uint32_t best_bits = std::numeric_limits<uint32_t>::max();
             for (int mode : {0, 8, 9, 10}) {
@@ -759,8 +772,8 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
                     else             { ch0[k] = (L+R)>>1; ch1[k] = L - R; }
                 }
                 uint32_t bps1 = m_bps, bps2 = (mode == 0) ? m_bps : m_bps + 1;
-                SubframeParams s0 = optimize_subframe(ch0.data(), (uint32_t)total_samples, bps1, m_windows);
-                SubframeParams s1 = optimize_subframe(ch1.data(), (uint32_t)total_samples, bps2, m_windows);
+                SubframeParams s0 = optimize_subframe(ch0.data(), (uint32_t)total_samples, bps1, m_windows, m_exhaustive);
+                SubframeParams s1 = optimize_subframe(ch1.data(), (uint32_t)total_samples, bps2, m_windows, m_exhaustive);
                 if (s0.bits_cost + s1.bits_cost < best_bits) {
                     best_bits = s0.bits_cost + s1.bits_cost;
                     bp.stereo_mode  = mode;
@@ -826,8 +839,24 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
                     size_t idx = next.fetch_add(1, std::memory_order_relaxed);
                     if (idx >= work.size()) break;
                     auto [node, ci] = work[idx];
-                    cost_table[node * NUM_CANDS + ci] =
-                        compute_block(pcm_data, (uint64_t)node * STEP, CANDIDATES[ci]);
+                    if (m_exhaustive) {
+                        cost_table[node * NUM_CANDS + ci] =
+                            compute_block(pcm_data, (uint64_t)node * STEP, CANDIDATES[ci]);
+                    } else {
+                        uint32_t bits = 0;
+                        uint32_t n_start = (uint32_t)node;
+                        uint32_t n_end = (uint32_t)(node + CANDIDATES[ci] / STEP);
+                        if (m_channels == 1) {
+                            bits = estimate_lpc_bits_fast(0, n_start, n_end, m_bps);
+                        } else {
+                            bits = estimate_lpc_bits_fast(0, n_start, n_end, m_bps) +
+                                   estimate_lpc_bits_fast(1, n_start, n_end, m_bps);
+                        }
+                        BlockParams bp{};
+                        bp.block_size = CANDIDATES[ci];
+                        bp.total_bits = bits;
+                        cost_table[node * NUM_CANDS + ci] = bp;
+                    }
                     size_t d = done.fetch_add(1, std::memory_order_relaxed) + 1;
                     if (d % 10 == 0 || d == work.size())
                         std::cout << "\r  " << d << "/" << work.size()
@@ -876,12 +905,35 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
     }
     std::reverse(path.begin(), path.end());
 
-    std::vector<BlockParams> result;
-    result.reserve(path.size() + (remainder > 0 ? 1 : 0));
-    for (auto [node, ci] : path)
-        result.push_back(cost_table[node * NUM_CANDS + ci]);
+    std::vector<BlockParams> result(path.size() + (remainder > 0 ? 1 : 0));
+    if (!m_exhaustive) {
+        std::atomic<size_t> next{0}, done{0};
+        std::vector<std::thread> threads;
+        std::cout << "Optimizing " << path.size() << " selected blocks...\n";
+        for (int t = 0; t < nthreads; ++t) {
+            threads.emplace_back([&]() {
+                for (;;) {
+                    size_t idx = next.fetch_add(1, std::memory_order_relaxed);
+                    if (idx >= path.size()) break;
+                    auto [node, ci] = path[idx];
+                    result[idx] = compute_block(pcm_data, (uint64_t)node * STEP, CANDIDATES[ci]);
+                    size_t d = done.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if (d % 10 == 0 || d == path.size())
+                        std::cout << "\r  " << d << "/" << path.size() << std::flush;
+                }
+            });
+        }
+        for (auto& th : threads) th.join();
+        std::cout << "\n";
+    } else {
+        for (size_t idx = 0; idx < path.size(); ++idx) {
+            auto [node, ci] = path[idx];
+            result[idx] = cost_table[node * NUM_CANDS + ci];
+        }
+    }
+
     if (remainder > 0)
-        result.push_back(remainder_bp);
+        result.back() = remainder_bp;
 
     {
         std::map<uint32_t,int> bs_hist;
@@ -911,41 +963,76 @@ BlockParams Optimizer::compute_block(
     if (m_channels == 1) {
         bp.stereo_mode  = 0;
         bp.subframes[0] = optimize_subframe(
-            &pcm_data[0][sample_start], block_size, m_bps, m_windows);
+            &pcm_data[0][sample_start], block_size, m_bps, m_windows, m_exhaustive);
     } else {
         uint32_t best_bits = std::numeric_limits<uint32_t>::max();
 
-        // Independent stereo
-        {
-            SubframeParams s0 = optimize_subframe(&pcm_data[0][sample_start], block_size, m_bps, m_windows);
-            SubframeParams s1 = optimize_subframe(&pcm_data[1][sample_start], block_size, m_bps, m_windows);
-            uint32_t cost = s0.bits_cost + s1.bits_cost;
-            if (cost < best_bits) {
-                best_bits       = cost;
-                bp.stereo_mode  = 0;
-                bp.subframes[0] = s0;
-                bp.subframes[1] = s1;
+        // Independent stereo (mode 0)
+        std::vector<int> modes_to_test = {0, 8, 9, 10};
+        if (!m_exhaustive) {
+            // Fast estimation using Fixed Predictor (order 2)
+            auto estimate_ch = [&](const int32_t* smp, int bits_per_sample) -> uint32_t {
+                int wasted = 0;
+                int32_t mask = 0;
+                for (uint32_t i = 0; i < block_size; ++i) mask |= smp[i];
+                if (mask != 0) while ((mask & 1) == 0) { mask >>= 1; ++wasted; }
+                return estimate_subframe_cost(smp, block_size, 2, 2, 0, wasted, bits_per_sample);
+            };
+            
+            uint32_t best_est = std::numeric_limits<uint32_t>::max();
+            int best_mode = 0;
+            for (int mode : modes_to_test) {
+                uint32_t cost = 0;
+                if (mode == 0) {
+                    cost = estimate_ch(&pcm_data[0][sample_start], m_bps) +
+                           estimate_ch(&pcm_data[1][sample_start], m_bps);
+                } else {
+                    std::vector<int32_t> ch0(block_size), ch1(block_size);
+                    for (uint32_t k = 0; k < block_size; ++k) {
+                        int32_t L = pcm_data[0][sample_start + k], R = pcm_data[1][sample_start + k];
+                        if      (mode == 8)  { ch0[k] = L;        ch1[k] = L - R; }
+                        else if (mode == 9)  { ch0[k] = L - R;    ch1[k] = R;     }
+                        else                 { ch0[k] = (L+R)>>1; ch1[k] = L - R; }
+                    }
+                    cost = estimate_ch(ch0.data(), m_bps) + estimate_ch(ch1.data(), m_bps + 1);
+                }
+                if (cost < best_est) {
+                    best_est = cost;
+                    best_mode = mode;
+                }
             }
+            modes_to_test = {best_mode};
         }
 
-        // Joint-stereo (left-side, right-side, mid-side)
-        for (int mode : {8, 9, 10}) {
-            std::vector<int32_t> ch0(block_size), ch1(block_size);
-            for (uint32_t k = 0; k < block_size; ++k) {
-                int32_t L = pcm_data[0][sample_start + k];
-                int32_t R = pcm_data[1][sample_start + k];
-                if      (mode == 8)  { ch0[k] = L;        ch1[k] = L - R; }
-                else if (mode == 9)  { ch0[k] = L - R;    ch1[k] = R;     }
-                else                 { ch0[k] = (L+R)>>1; ch1[k] = L - R; }
-            }
-            SubframeParams s0 = optimize_subframe(ch0.data(), block_size, m_bps,     m_windows);
-            SubframeParams s1 = optimize_subframe(ch1.data(), block_size, m_bps + 1, m_windows);
-            uint32_t cost = s0.bits_cost + s1.bits_cost;
-            if (cost < best_bits) {
-                best_bits       = cost;
-                bp.stereo_mode  = mode;
-                bp.subframes[0] = s0;
-                bp.subframes[1] = s1;
+        for (int mode : modes_to_test) {
+            if (mode == 0) {
+                SubframeParams s0 = optimize_subframe(&pcm_data[0][sample_start], block_size, m_bps, m_windows, m_exhaustive);
+                SubframeParams s1 = optimize_subframe(&pcm_data[1][sample_start], block_size, m_bps, m_windows, m_exhaustive);
+                uint32_t cost = s0.bits_cost + s1.bits_cost;
+                if (cost < best_bits) {
+                    best_bits       = cost;
+                    bp.stereo_mode  = 0;
+                    bp.subframes[0] = s0;
+                    bp.subframes[1] = s1;
+                }
+            } else {
+                std::vector<int32_t> ch0(block_size), ch1(block_size);
+                for (uint32_t k = 0; k < block_size; ++k) {
+                    int32_t L = pcm_data[0][sample_start + k];
+                    int32_t R = pcm_data[1][sample_start + k];
+                    if      (mode == 8)  { ch0[k] = L;        ch1[k] = L - R; }
+                    else if (mode == 9)  { ch0[k] = L - R;    ch1[k] = R;     }
+                    else                 { ch0[k] = (L+R)>>1; ch1[k] = L - R; }
+                }
+                SubframeParams s0 = optimize_subframe(ch0.data(), block_size, m_bps,     m_windows, m_exhaustive);
+                SubframeParams s1 = optimize_subframe(ch1.data(), block_size, m_bps + 1, m_windows, m_exhaustive);
+                uint32_t cost = s0.bits_cost + s1.bits_cost;
+                if (cost < best_bits) {
+                    best_bits       = cost;
+                    bp.stereo_mode  = mode;
+                    bp.subframes[0] = s0;
+                    bp.subframes[1] = s1;
+                }
             }
         }
     }

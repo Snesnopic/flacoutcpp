@@ -37,6 +37,11 @@ struct ProcessorConfig {
      * A value of 0 indicates that the hardware concurrency limit should be used.
      */
     unsigned max_threads = 0;
+
+    /**
+     * @brief If true, performs full exhaustive search over all parameters.
+     */
+    bool exhaustive = false;
 };
 
 /**

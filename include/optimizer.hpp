@@ -169,7 +169,8 @@ public:
      */
     Optimizer(uint32_t channels, uint32_t bps,
               std::vector<WindowType> windows = {},
-              unsigned max_threads = 0);
+              unsigned max_threads = 0,
+              bool exhaustive = false);
 
     /**
      * @brief Find the optimal variable block-size partition for the stream.
@@ -199,7 +200,8 @@ public:
         const int32_t*              samples,
         uint32_t                    bsize,
         uint32_t                    bps,
-        const std::vector<WindowType>& windows);
+        const std::vector<WindowType>& windows,
+        bool                        exhaustive);
 
 private:
     /// @cond INTERNAL
@@ -236,7 +238,7 @@ private:
         const int32_t* samples, uint32_t N, int wasted_bits,
         WindowType wt, double* out);
 
-    /// Fully-optimised BlockParams for one frame (all stereo modes, all windows).
+    /// Optimized BlockParams for one frame (can use heuristic or exhaustive).
     [[nodiscard]] BlockParams compute_block(
         const std::vector<std::vector<int32_t>>& pcm_data,
         uint64_t sample_start, uint32_t block_size) const;
@@ -246,6 +248,7 @@ private:
     uint32_t              m_bps;
     std::vector<WindowType> m_windows;
     unsigned              m_max_threads; ///< 0 = use all logical CPUs.
+    bool                  m_exhaustive;  ///< True = full search, False = heuristic fast-path.
 
     /// @endcond
 };

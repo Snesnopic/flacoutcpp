@@ -8,6 +8,7 @@ static void print_usage(const char* prog) {
     std::cerr
         << "Usage: " << prog << " [options] <input.flac> [output.flac]\n"
         << "Options:\n"
+        << "  -e, --exhaustive     Perform full exhaustive search (extremely slow)\n"
         << "  -n, --no-metadata    Do not copy metadata from input to output\n"
         << "  -t, --threads N      Limit parallel worker threads (default: all CPUs)\n"
         << "  -w, --windows <list> Comma-separated list of apodization windows to use\n"
@@ -40,7 +41,10 @@ int main(int argc, char* argv[]) {
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
 
-        if (arg == "-n" || arg == "--no-metadata") {
+        if (arg == "-e" || arg == "--exhaustive") {
+            cfg.exhaustive = true;
+
+        } else if (arg == "-n" || arg == "--no-metadata") {
             cfg.copy_metadata = false;
 
         } else if (arg == "-w" || arg == "--windows") {

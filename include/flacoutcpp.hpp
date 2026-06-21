@@ -66,6 +66,14 @@ struct Config {
      * linearly with thread count.
      */
     unsigned max_threads = 0;
+
+    /**
+     * @brief If true, performs full exhaustive search over all parameters.
+     * 
+     * Bypasses all heuristics for window, precision, stereo, and DP pruning.
+     * Can be extremely slow.
+     */
+    bool exhaustive = false;
 };
 
 /**

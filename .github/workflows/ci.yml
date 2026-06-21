@@ -15,7 +15,7 @@ jobs:
       # 1. Checkout (including libFLAC submodule)                           #
       # ------------------------------------------------------------------ #
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           submodules: recursive
 
@@ -119,7 +119,7 @@ jobs:
       # ------------------------------------------------------------------ #
       - name: Upload FLAC files on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: flac-debug-files
           path: |

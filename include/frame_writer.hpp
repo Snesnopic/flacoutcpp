@@ -1,3 +1,8 @@
+/**
+ * @file frame_writer.hpp
+ * @brief Custom FLAC bitstream serializer for fully-optimized parameters.
+ */
+
 #ifndef FRAME_WRITER_HPP
 #define FRAME_WRITER_HPP
 
@@ -6,20 +11,32 @@
 #include <vector>
 #include <cstdint>
 
-// Serializes FLAC audio frames from pre-computed BlockParams.
-// This replaces the libFLAC high-level encoder in the pipeline,
-// giving full control over every parameter in the bitstream.
+/**
+ * @brief Serializes FLAC audio frames from pre-computed optimal parameters.
+ * 
+ * This class replaces the libFLAC high-level encoder in the pipeline.
+ * It provides full byte-accurate control over the bitstream, taking exact
+ * `BlockParams` determined by the DP optimizer and generating valid FLAC frames.
+ */
 class FrameWriter {
 public:
+    /**
+     * @brief Construct a new FrameWriter.
+     */
     FrameWriter() = default;
 
-    // Serialize one FLAC frame (variable-blocksize mode, sample-number addressing).
-    // @param params        Optimizer output for this block (sizes, modes, LPC coefficients, Rice params).
-    // @param pcm_data      Full per-channel PCM for the entire stream.
-    // @param sample_number Absolute sample index of the first sample in this block.
-    // @param sample_rate   Stream sample rate in Hz.
-    // @param bps           Nominal bits-per-sample of the stream.
-    // @returns             Raw bytes of the complete FLAC frame (header + subframes + CRC-16).
+    /**
+     * @brief Serialize one variable-blocksize FLAC audio frame.
+     * 
+     * Uses absolute sample-number addressing.
+     * 
+     * @param params        Optimizer output for this block (sizes, modes, LPC coefficients, Rice params).
+     * @param pcm_data      Full per-channel PCM for the entire stream.
+     * @param sample_number Absolute sample index of the first sample in this block.
+     * @param sample_rate   Stream sample rate in Hz.
+     * @param bps           Nominal bits-per-sample of the stream.
+     * @return              Raw bytes of the complete FLAC frame (header + subframes + CRC-16).
+     */
     std::vector<uint8_t> write_frame(
         const BlockParams&                          params,
         const std::vector<std::vector<int32_t>>&   pcm_data,
@@ -28,8 +45,21 @@ public:
         uint32_t                                    bps
     );
 
-    // Serialize the 4+34 = 38-byte STREAMINFO metadata block.
-    // md5 must point to 16 bytes (the audio MD5 signature), or nullptr for all-zeros.
+    /**
+     * @brief Serialize the 38-byte STREAMINFO metadata block.
+     * 
+     * @param is_last       True if this is the final metadata block before audio frames.
+     * @param min_blocksize Minimum block size used in the stream.
+     * @param max_blocksize Maximum block size used in the stream.
+     * @param min_framesize Minimum frame byte size in the stream.
+     * @param max_framesize Maximum frame byte size in the stream.
+     * @param sample_rate   Audio sample rate in Hz.
+     * @param channels      Number of audio channels.
+     * @param bps           Bits per sample.
+     * @param total_samples Total absolute number of samples in the stream.
+     * @param md5           Pointer to 16 bytes containing the raw audio MD5 signature, or nullptr for all-zeros.
+     * @return              Serialized byte vector of the STREAMINFO block.
+     */
     static std::vector<uint8_t> make_streaminfo_block(
         bool     is_last,
         uint32_t min_blocksize, uint32_t max_blocksize,
@@ -42,14 +72,11 @@ public:
     );
 
 private:
+    /// @cond INTERNAL
+
     // Write one subframe (header + payload + residual) into bw.
-    // @param bw       BitWriter to append to.
-    // @param sp       Pre-computed subframe parameters from the Optimizer.
-    // @param samples  Raw PCM samples for this channel/block (already joint-stereo-transformed).
-    // @param bsize    Number of samples in this block.
-    // @param ch_bps   Effective bits-per-sample for this channel (nominal bps, or bps+1 for side).
     static void write_subframe(
-        BitWriter&           bw,
+        BitWriter&            bw,
         const SubframeParams& sp,
         const int32_t*        samples,
         uint32_t              bsize,
@@ -71,6 +98,8 @@ private:
     static void encode_samplerate(BitWriter& bw, uint32_t sr);
     // Encode bps → 3-bit code (0 = from STREAMINFO, which we never emit here).
     static uint8_t encode_bps(uint32_t bps);
+
+    /// @endcond
 };
 
 #endif // FRAME_WRITER_HPP

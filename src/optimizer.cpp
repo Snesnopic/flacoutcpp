@@ -731,7 +731,6 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
     precompute_granules(pcm_data);
 
     const size_t total_samples  = pcm_data[0].size();
-    const size_t total_granules = total_samples / 16; // each granule = 16 samples
 
     // -----------------------------------------------------------------
     // Short-stream fast path
@@ -886,9 +885,9 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
 
     {
         std::map<uint32_t,int> bs_hist;
-        for (auto& bp : result) ++bs_hist[bp.block_size];
+        for (const auto& bp : result) ++bs_hist[bp.block_size];
         std::cout << "DP done. Distribution:";
-        for (auto& [bs, cnt] : bs_hist)
+        for (const auto& [bs, cnt] : bs_hist)
             std::cout << "  bs=" << bs << "×" << cnt;
         std::cout << "\n";
     }

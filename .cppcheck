@@ -1,0 +1,6 @@
+# cppcheck configuration for flacoutcpp
+# Usage: cppcheck --project=.cppcheck
+# Or:    cppcheck --enable=all --suppress-xml=.cppcheck-suppress \
+#                 --std=c++17 --language=c++ \
+#                 -Iinclude -Ithird_party/libflac/include \
+#                 src/

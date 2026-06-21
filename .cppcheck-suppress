@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<suppressions>
+  <!-- third_party code is not our responsibility -->
+  <suppress>
+    <id>*</id>
+    <fileName>third_party/*</fileName>
+  </suppress>
+
+  <!-- We intentionally use reinterpret_cast in BitWriter for raw byte access -->
+  <suppress>
+    <id>cstyleCast</id>
+  </suppress>
+
+  <!-- The libFLAC callback API forces C-style function pointers -->
+  <suppress>
+    <id>passedByValue</id>
+    <fileName>src/processor.cpp</fileName>
+  </suppress>
+
+  <!-- Rice-coded residual loops use pointer arithmetic intentionally -->
+  <suppress>
+    <id>useStlAlgorithm</id>
+    <fileName>src/optimizer.cpp</fileName>
+  </suppress>
+
+  <!-- Large switch for window types is intentional (exhaustive) -->
+  <suppress>
+    <id>missingReturn</id>
+    <fileName>src/optimizer.cpp</fileName>
+  </suppress>
+</suppressions>

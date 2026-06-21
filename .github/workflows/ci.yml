@@ -1,0 +1,129 @@
+name: Build & Compression Test
+
+on:
+  push:
+    branches: [ "**" ]
+  pull_request:
+    branches: [ "**" ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ------------------------------------------------------------------ #
+      # 1. Checkout (including libFLAC submodule)                           #
+      # ------------------------------------------------------------------ #
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # ------------------------------------------------------------------ #
+      # 2. System dependencies                                               #
+      # ------------------------------------------------------------------ #
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y cmake build-essential flac sox
+
+      # ------------------------------------------------------------------ #
+      # 3. Build (Release + march=native for the CI runner's CPU)           #
+      # ------------------------------------------------------------------ #
+      - name: Configure CMake
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      # ------------------------------------------------------------------ #
+      # 4. Generate synthetic test audio                                     #
+      #                                                                      #
+      # 0.5-second stereo file (22050 samples/ch) with sweep + noise mix.   #
+      # STEP=1024, 5 candidates: ~21 nodes -> ~80 work items.               #
+      # Should finish in a few minutes on a 2-core ubuntu-latest runner.    #
+      # ------------------------------------------------------------------ #
+      - name: Generate test WAV (0.5 s stereo 44.1 kHz 16-bit)
+        run: |
+          sox -n -r 44100 -c 1 -b 16 /tmp/left.wav \
+              synth 0.5 sine 220:880 vol 0.6 \
+              synth 0.5 noise mix vol 0.4
+          sox -n -r 44100 -c 1 -b 16 /tmp/right.wav \
+              synth 0.5 sine 440:1760 vol 0.6 \
+              synth 0.5 noise mix vol 0.4
+          sox -M /tmp/left.wav /tmp/right.wav /tmp/test.wav
+          echo "WAV size: $(wc -c < /tmp/test.wav) bytes"
+
+      # ------------------------------------------------------------------ #
+      # 5. Encode baseline with flac --best                                  #
+      # ------------------------------------------------------------------ #
+      - name: Encode baseline (flac --best)
+        run: |
+          flac --best /tmp/test.wav -o /tmp/test_baseline.flac
+          BASELINE=$(wc -c < /tmp/test_baseline.flac)
+          echo "BASELINE=$BASELINE" >> "$GITHUB_ENV"
+          echo "Baseline: $BASELINE bytes"
+
+      # ------------------------------------------------------------------ #
+      # 6. Run flacoutcpp (full DP, all available threads)                  #
+      # ------------------------------------------------------------------ #
+      - name: Run flacoutcpp
+        run: |
+          THREADS=$(nproc)
+          echo "Using $THREADS threads"
+          time ./build/flacoutcpp --threads "$THREADS" \
+              /tmp/test_baseline.flac /tmp/test_opt.flac
+
+      # ------------------------------------------------------------------ #
+      # 7. Verify output is a valid FLAC stream                             #
+      # ------------------------------------------------------------------ #
+      - name: Verify FLAC validity (flac --test)
+        run: |
+          flac --test /tmp/test_opt.flac
+          echo "FLAC bitstream is valid"
+
+      # ------------------------------------------------------------------ #
+      # 8. Compression ratio report                                         #
+      # ------------------------------------------------------------------ #
+      - name: Check compression ratio
+        run: |
+          BASELINE="${{ env.BASELINE }}"
+          OPTIMIZED=$(wc -c < /tmp/test_opt.flac)
+          echo "Baseline  (flac --best):  $BASELINE bytes"
+          echo "Optimized (flacoutcpp):   $OPTIMIZED bytes"
+          if [ "$OPTIMIZED" -le "$BASELINE" ]; then
+            DELTA=$(( (BASELINE - OPTIMIZED) * 100 / BASELINE ))
+            echo "flacoutcpp is ${DELTA}% smaller than flac --best"
+          else
+            DELTA=$(( (OPTIMIZED - BASELINE) * 100 / BASELINE ))
+            echo "WARNING: flacoutcpp is ${DELTA}% larger than flac --best"
+            # Synthetic noise is intentionally hard to beat;
+            # validity (step 7) is the hard gate.
+          fi
+
+      # ------------------------------------------------------------------ #
+      # 9. Short-stream edge case (< 1024 samples)                          #
+      # ------------------------------------------------------------------ #
+      - name: Short-stream edge case (512 samples)
+        run: |
+          sox -n -r 44100 -c 2 -b 16 /tmp/short.wav \
+              synth 0.0116 sine 440
+          flac --best /tmp/short.wav -o /tmp/short_baseline.flac
+          ./build/flacoutcpp --threads 1 \
+              /tmp/short_baseline.flac /tmp/short_opt.flac
+          flac --test /tmp/short_opt.flac
+          echo "Short-stream path OK"
+
+      # ------------------------------------------------------------------ #
+      # 10. Upload artifacts on failure for debugging                        #
+      # ------------------------------------------------------------------ #
+      - name: Upload FLAC files on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flac-debug-files
+          path: |
+            /tmp/test_baseline.flac
+            /tmp/test_opt.flac
+            /tmp/short_baseline.flac
+            /tmp/short_opt.flac

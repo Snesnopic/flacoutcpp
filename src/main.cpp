@@ -1,49 +1,111 @@
 #include <iostream>
 #include <string>
-#include "processor.hpp"
+#include <vector>
+#include <sstream>
+#include "flacoutcpp.hpp"
+
+static void print_usage(const char* prog) {
+    std::cerr
+        << "Usage: " << prog << " [options] <input.flac> [output.flac]\n"
+        << "Options:\n"
+        << "  -n, --no-metadata    Do not copy metadata from input to output\n"
+        << "  -t, --threads N      Limit parallel worker threads (default: all CPUs)\n"
+        << "  -w, --windows <list> Comma-separated list of apodization windows to use\n"
+        << "                       (default: all windows — maximum compression)\n"
+        << "Available window names:\n"
+        << "  rect, bartlett, bartletthann, blackman, blackmanharris, connes, flattop,\n"
+        << "  gauss025, gauss0125, hamming, hann, kaiserbessel, nuttall, triangle, welch,\n"
+        << "  tukey005, tukey010, tukey020, tukey050, tukey075, tukey090,\n"
+        << "  partialtukey2, partialtukey2_033, partialtukey2_067,\n"
+        << "  punchouttukey2_033, punchouttukey2_067\n";
+}
+
+// Split a comma-separated string into tokens.
+static std::vector<std::string> split_csv(const std::string& s) {
+    std::vector<std::string> out;
+    std::stringstream ss(s);
+    std::string tok;
+    while (std::getline(ss, tok, ',')) {
+        if (!tok.empty()) out.push_back(tok);
+    }
+    return out;
+}
 
 int main(int argc, char* argv[]) {
-    if (argc < 2) {
-        std::cerr << "Usage: flacoutcpp [options] <input.flac> [output.flac]\n";
-        std::cerr << "Options:\n";
-        std::cerr << "  -n, --no-metadata    Do not copy metadata from input to output\n";
-        return 1;
-    }
+    if (argc < 2) { print_usage(argv[0]); return 1; }
 
-    bool copy_metadata = true;
-    std::vector<std::string> args;
+    flacoutcpp::Config cfg;
+    std::vector<std::string> positional;
+
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
+
         if (arg == "-n" || arg == "--no-metadata") {
-            copy_metadata = false;
+            cfg.copy_metadata = false;
+
+        } else if (arg == "-w" || arg == "--windows") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: -w requires an argument.\n";
+                return 1;
+            }
+            ++i;
+            for (const auto& name : split_csv(argv[i])) {
+                auto wt = flacoutcpp::window_from_string(name);
+                if (wt == flacoutcpp::Window::COUNT) {
+                    std::cerr << "Warning: unrecognised window '" << name << "' — skipped.\n";
+                } else {
+                    cfg.windows.push_back(wt);
+                }
+            }
+
+        } else if (arg == "-t" || arg == "--threads") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: -t requires a number.\n";
+                return 1;
+            }
+            ++i;
+            cfg.max_threads = std::stoi(argv[i]);
+            if (cfg.max_threads < 1) cfg.max_threads = 1;
+
+        } else if (arg.substr(0, 2) == "--" || arg.substr(0, 1) == "-") {
+            std::cerr << "Unknown option: " << arg << "\n";
+            print_usage(argv[0]);
+            return 1;
+
         } else {
-            args.push_back(arg);
+            positional.push_back(arg);
         }
     }
 
-    if (args.empty()) {
-        std::cerr << "Error: No input file specified.\n";
+    if (positional.empty()) {
+        std::cerr << "Error: no input file specified.\n";
         return 1;
     }
 
-    const std::string input_file = args[0];
-    std::string output_file;
-    if (args.size() >= 2) {
-        output_file = args[1];
-    } else {
-        // Default output is input + ".optimized.flac"
-        output_file = input_file + ".optimized.flac";
+    const std::string input  = positional[0];
+    const std::string output = (positional.size() >= 2)
+                                 ? positional[1]
+                                 : input + ".optimized.flac";
+
+    if (cfg.windows.empty())
+        std::cout << "Windows: all (" << flacoutcpp::all_windows().size() << " functions)\n";
+    else {
+        std::cout << "Windows: ";
+        for (size_t i = 0; i < cfg.windows.size(); ++i) {
+            if (i) std::cout << ", ";
+            std::cout << window_to_name(cfg.windows[i]);
+        }
+        std::cout << "\n";
     }
 
-    std::cout << "Optimizing: " << input_file << " -> " << output_file << "\n";
-    if (!copy_metadata) std::cout << "Metadata copying is DISABLED.\n";
+    std::cout << "Optimising: " << input << " -> " << output << "\n";
+    if (!cfg.copy_metadata) std::cout << "Metadata copying disabled.\n";
 
-    Processor processor(input_file, output_file, copy_metadata);
-    if (!processor.process()) {
-        std::cerr << "Processing failed!\n";
+    if (!flacoutcpp::optimize(input, output, cfg)) {
+        std::cerr << "Optimisation failed.\n";
         return 1;
     }
 
-    std::cout << "Optimization complete.\n";
+    std::cout << "Done.\n";
     return 0;
 }

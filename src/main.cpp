@@ -50,8 +50,8 @@ int main(int argc, char* argv[]) {
             }
             ++i;
             for (const auto& name : split_csv(argv[i])) {
-                auto wt = flacoutcpp::window_from_string(name);
-                if (wt == flacoutcpp::Window::COUNT) {
+                auto wt = window_from_name(name);
+                if (wt == WindowType::COUNT) {
                     std::cerr << "Warning: unrecognised window '" << name << "' — skipped.\n";
                 } else {
                     cfg.windows.push_back(wt);
@@ -64,8 +64,7 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
             ++i;
-            cfg.max_threads = std::stoi(argv[i]);
-            if (cfg.max_threads < 1) cfg.max_threads = 1;
+            cfg.max_threads = static_cast<unsigned>(std::stoul(argv[i]));
 
         } else if (arg.substr(0, 2) == "--" || arg.substr(0, 1) == "-") {
             std::cerr << "Unknown option: " << arg << "\n";
@@ -88,7 +87,7 @@ int main(int argc, char* argv[]) {
                                  : input + ".optimized.flac";
 
     if (cfg.windows.empty())
-        std::cout << "Windows: all (" << flacoutcpp::all_windows().size() << " functions)\n";
+        std::cout << "Windows: all (" << all_window_types().size() << " functions)\n";
     else {
         std::cout << "Windows: ";
         for (size_t i = 0; i < cfg.windows.size(); ++i) {
@@ -101,7 +100,7 @@ int main(int argc, char* argv[]) {
     std::cout << "Optimising: " << input << " -> " << output << "\n";
     if (!cfg.copy_metadata) std::cout << "Metadata copying disabled.\n";
 
-    if (!flacoutcpp::optimize(input, output, cfg)) {
+    if (!flacoutcpp::optimise(input, output, cfg)) {
         std::cerr << "Optimisation failed.\n";
         return 1;
     }

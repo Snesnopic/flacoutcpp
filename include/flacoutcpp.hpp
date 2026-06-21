@@ -22,7 +22,8 @@
  * The library is header-only at this level; link against `libflacout_lib`.
  */
 
-#pragma once
+#ifndef FLACOUTCPP_HPP
+#define FLACOUTCPP_HPP
 
 #include <string>
 #include <vector>
@@ -64,7 +65,7 @@ struct Config {
      * The DP block-evaluation phase is embarrassingly parallel and scales
      * linearly with thread count.
      */
-    int max_threads = 0;
+    unsigned max_threads = 0;
 };
 
 /**
@@ -89,3 +90,5 @@ bool optimise(const std::string& input_path,
               const Config&      config = {});
 
 } // namespace flacoutcpp
+
+#endif // FLACOUTCPP_HPP

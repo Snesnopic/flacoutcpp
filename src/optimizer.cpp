@@ -104,7 +104,7 @@ WindowType window_from_name(const std::string& raw) {
 
 Optimizer::Optimizer(uint32_t channels, uint32_t bps,
                      std::vector<WindowType> windows,
-                     int max_threads)
+                     unsigned max_threads)
     : m_channels(channels), m_bps(bps), m_max_threads(max_threads)
 {
     if (windows.empty())
@@ -810,8 +810,8 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
 
     std::vector<BlockParams> cost_table(num_nodes * NUM_CANDS);
 
-    int nthreads = std::max(1, (int)std::thread::hardware_concurrency());
-    if (m_max_threads > 0) nthreads = std::min(nthreads, m_max_threads);
+    unsigned nthreads = std::max(1u, static_cast<unsigned>(std::thread::hardware_concurrency()));
+    if (m_max_threads > 0) nthreads = std::min(nthreads, (unsigned)m_max_threads);
 
     std::cout << "DP: " << num_nodes << " nodes × " << NUM_CANDS
               << " candidates = " << work.size() << " blocks on "

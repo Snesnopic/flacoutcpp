@@ -71,7 +71,7 @@ enum class WindowType : uint8_t {
 
 /**
  * @brief Parse a window type from its name (case-insensitive).
- * @param name  Human-readable window name (e.g. @c "hann", @c "blackman").
+ * @param raw  Human-readable window name (e.g. @c "hann", @c "blackman").
  * @return      The corresponding WindowType, or @c WindowType::COUNT if not found.
  */
 WindowType window_from_name(const std::string& raw);
@@ -169,7 +169,7 @@ public:
      */
     Optimizer(uint32_t channels, uint32_t bps,
               std::vector<WindowType> windows = {},
-              int max_threads = 0);
+              unsigned max_threads = 0);
 
     /**
      * @brief Find the optimal variable block-size partition for the stream.
@@ -190,7 +190,7 @@ public:
      * Verbatim, Fixed, LPC).  Picks the combination with the lowest bit cost.
      *
      * @param samples     Pointer to the first sample of this block.
-     * @param block_size  Number of samples.
+     * @param bsize  Number of samples.
      * @param bps         Bits per sample for this channel.
      * @param windows     Windows to test.
      * @return            Best SubframeParams found.
@@ -245,7 +245,7 @@ private:
     uint32_t              m_channels;
     uint32_t              m_bps;
     std::vector<WindowType> m_windows;
-    int                   m_max_threads; ///< 0 = use all logical CPUs.
+    unsigned              m_max_threads; ///< 0 = use all logical CPUs.
 
     /// @endcond
 };

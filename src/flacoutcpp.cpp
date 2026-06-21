@@ -3,12 +3,12 @@
 
 namespace flacoutcpp {
 
-bool optimize(const std::string& input, const std::string& output, const Config& cfg) {
+bool optimise(const std::string& input_path, const std::string& output_path, const Config& config) {
     ProcessorConfig pc;
-    pc.copy_metadata = cfg.copy_metadata;
-    pc.windows       = cfg.windows;
-    pc.max_threads   = cfg.max_threads;
-    Processor proc(input, output, pc);
+    pc.copy_metadata = config.copy_metadata;
+    pc.windows       = config.windows;
+    pc.max_threads   = config.max_threads;
+    Processor proc(input_path, output_path, pc);
     return proc.process();
 }
 

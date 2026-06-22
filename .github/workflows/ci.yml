@@ -71,7 +71,7 @@ jobs:
         run: |
           THREADS=$(nproc)
           echo "Using $THREADS threads"
-          time ./build/flacoutcpp --threads "$THREADS" \
+          time ./build/flacoutcpp -e --threads "$THREADS" \
               /tmp/test_baseline.flac /tmp/test_opt.flac
 
       # ------------------------------------------------------------------ #
@@ -109,7 +109,7 @@ jobs:
           sox -n -r 44100 -c 2 -b 16 /tmp/short.wav \
               synth 0.0116 sine 440
           flac --best /tmp/short.wav -o /tmp/short_baseline.flac
-          ./build/flacoutcpp --threads 1 \
+          ./build/flacoutcpp -e --threads 1 \
               /tmp/short_baseline.flac /tmp/short_opt.flac
           flac --test /tmp/short_opt.flac
           echo "Short-stream path OK"

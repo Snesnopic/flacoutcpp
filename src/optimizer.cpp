@@ -771,9 +771,11 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
                     else if (mode == 9)  { ch0[k] = L - R;    ch1[k] = R; }
                     else             { ch0[k] = (L+R)>>1; ch1[k] = L - R; }
                 }
-                uint32_t bps1 = m_bps, bps2 = (mode == 0) ? m_bps : m_bps + 1;
-                SubframeParams s0 = optimize_subframe(ch0.data(), (uint32_t)total_samples, bps1, m_windows, m_exhaustive);
-                SubframeParams s1 = optimize_subframe(ch1.data(), (uint32_t)total_samples, bps2, m_windows, m_exhaustive);
+                // mode 9 = right+side: ch0 is side (needs +1 bit), ch1 is right
+                uint32_t bps0 = (mode == 9) ? m_bps + 1 : m_bps;
+                uint32_t bps1 = (mode == 9) ? m_bps     : (mode == 0 ? m_bps : m_bps + 1);
+                SubframeParams s0 = optimize_subframe(ch0.data(), (uint32_t)total_samples, bps0, m_windows, m_exhaustive);
+                SubframeParams s1 = optimize_subframe(ch1.data(), (uint32_t)total_samples, bps1, m_windows, m_exhaustive);
                 if (s0.bits_cost + s1.bits_cost < best_bits) {
                     best_bits = s0.bits_cost + s1.bits_cost;
                     bp.stereo_mode  = mode;
@@ -1026,8 +1028,11 @@ BlockParams Optimizer::compute_block(
                     else if (mode == 9)  { ch0[k] = L - R;    ch1[k] = R;     }
                     else                 { ch0[k] = (L+R)>>1; ch1[k] = L - R; }
                 }
-                SubframeParams s0 = optimize_subframe(ch0.data(), block_size, m_bps,     m_windows, m_exhaustive);
-                SubframeParams s1 = optimize_subframe(ch1.data(), block_size, m_bps + 1, m_windows, m_exhaustive);
+                // mode 9 = right+side: ch0 is side (needs +1 bit), ch1 is right
+                uint32_t bps0 = (mode == 9) ? m_bps + 1 : m_bps;
+                uint32_t bps1 = (mode == 9) ? m_bps     : m_bps + 1;
+                SubframeParams s0 = optimize_subframe(ch0.data(), block_size, bps0, m_windows, m_exhaustive);
+                SubframeParams s1 = optimize_subframe(ch1.data(), block_size, bps1, m_windows, m_exhaustive);
                 uint32_t cost = s0.bits_cost + s1.bits_cost;
                 if (cost < best_bits) {
                     best_bits       = cost;

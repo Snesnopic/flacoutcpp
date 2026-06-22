@@ -12,24 +12,18 @@ jobs:
 
     steps:
       # ------------------------------------------------------------------ #
-      # 1. Checkout (including libFLAC submodule)                           #
+      # 1. Checkout + build                                                   #
       # ------------------------------------------------------------------ #
       - name: Checkout repository
         uses: actions/checkout@v6
         with:
           submodules: recursive
 
-      # ------------------------------------------------------------------ #
-      # 2. System dependencies                                               #
-      # ------------------------------------------------------------------ #
       - name: Install dependencies
         run: |
           sudo apt-get update -q
           sudo apt-get install -y cmake build-essential flac sox
 
-      # ------------------------------------------------------------------ #
-      # 3. Build (Release + march=native for the CI runner's CPU)           #
-      # ------------------------------------------------------------------ #
       - name: Configure CMake
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 
@@ -37,93 +31,143 @@ jobs:
         run: cmake --build build -j$(nproc)
 
       # ------------------------------------------------------------------ #
-      # 4. Generate synthetic test audio                                     #
-      #                                                                      #
-      # 0.5-second stereo file (22050 samples/ch) with sweep + noise mix.   #
-      # STEP=1024, 5 candidates: ~21 nodes -> ~80 work items.               #
-      # Should finish in a few minutes on a 2-core ubuntu-latest runner.    #
+      # 2. Generate test audio                                                #
+      #                                                                       #
+      # sine_stereo: 1 s, 44100 Hz, 16-bit, 2 ch — pure sine waves.         #
+      #   Highly compressible; used for hard compression-quality gates.       #
+      # noise_mono:  0.5 s, 44100 Hz, 16-bit, 1 ch — sine + noise mix.      #
+      #   Harder to compress; used for mono-path validity checks.             #
+      # short_stereo: 512 samples (< 1024) — exercises the short-stream path.#
       # ------------------------------------------------------------------ #
-      - name: Generate test WAV (0.5 s stereo 44.1 kHz 16-bit)
+      - name: Generate test audio
         run: |
-          sox -n -r 44100 -c 1 -b 16 /tmp/left.wav \
-              synth 0.5 sine 220:880 vol 0.6 \
-              synth 0.5 noise mix vol 0.4
-          sox -n -r 44100 -c 1 -b 16 /tmp/right.wav \
-              synth 0.5 sine 440:1760 vol 0.6 \
-              synth 0.5 noise mix vol 0.4
-          sox -M /tmp/left.wav /tmp/right.wav /tmp/test.wav
-          echo "WAV size: $(wc -c < /tmp/test.wav) bytes"
+          sox -n -r 44100 -c 2 -b 16 /tmp/sine_stereo.wav \
+              synth 1.0 sine 440 sine 880
+          sox -n -r 44100 -c 1 -b 16 /tmp/noise_mono.wav \
+              synth 0.5 sine 220:880 vol 0.7 synth 0.5 noise mix vol 0.3
+          sox -n -r 44100 -c 2 -b 16 /tmp/short_stereo.wav \
+              synth 0.0116 sine 440
+
+          flac --best /tmp/sine_stereo.wav  -o /tmp/sine_stereo_baseline.flac
+          flac --best /tmp/noise_mono.wav   -o /tmp/noise_mono_baseline.flac
+          flac --best /tmp/short_stereo.wav -o /tmp/short_baseline.flac
+
+          echo "sine_stereo baseline : $(wc -c < /tmp/sine_stereo_baseline.flac) bytes"
+          echo "noise_mono baseline  : $(wc -c < /tmp/noise_mono_baseline.flac) bytes"
+          echo "short_stereo baseline: $(wc -c < /tmp/short_baseline.flac) bytes"
 
       # ------------------------------------------------------------------ #
-      # 5. Encode baseline with flac --best                                  #
+      # 3. Heuristic mode (no -e flag) — stereo                              #
+      #                                                                       #
+      # Gate 1: flac --test must pass (PCM integrity via MD5).               #
+      # Gate 2: output must be ≤ flac --best on a pure sine wave.            #
+      #         A tool that does more work than flac must not produce a       #
+      #         larger file on trivially compressible audio.                  #
       # ------------------------------------------------------------------ #
-      - name: Encode baseline (flac --best)
+      - name: Heuristic mode — stereo sine validity + compression
         run: |
-          flac --best /tmp/test.wav -o /tmp/test_baseline.flac
-          BASELINE=$(wc -c < /tmp/test_baseline.flac)
-          echo "BASELINE=$BASELINE" >> "$GITHUB_ENV"
-          echo "Baseline: $BASELINE bytes"
+          ./build/flacoutcpp --threads $(nproc) \
+              /tmp/sine_stereo_baseline.flac /tmp/sine_stereo_heuristic.flac
+          flac --test /tmp/sine_stereo_heuristic.flac
+
+          BASELINE=$(wc -c < /tmp/sine_stereo_baseline.flac)
+          HEURISTIC=$(wc -c < /tmp/sine_stereo_heuristic.flac)
+          echo "Baseline:  $BASELINE bytes"
+          echo "Heuristic: $HEURISTIC bytes"
+
+          if [ "$HEURISTIC" -gt "$BASELINE" ]; then
+            echo "FAIL: heuristic ($HEURISTIC) > flac --best ($BASELINE) on pure sine"
+            exit 1
+          fi
+          echo "Heuristic beats flac --best by $((BASELINE - HEURISTIC)) bytes."
 
       # ------------------------------------------------------------------ #
-      # 6. Run flacoutcpp (full DP, all available threads)                  #
+      # 4. Heuristic mode — mono                                             #
+      #                                                                       #
+      # Exercises the mono code path (single-channel subframe logic).        #
+      # Gate: flac --test must pass.                                          #
       # ------------------------------------------------------------------ #
-      - name: Run flacoutcpp
+      - name: Heuristic mode — mono validity
         run: |
-          THREADS=$(nproc)
-          echo "Using $THREADS threads"
-          time ./build/flacoutcpp -e --threads "$THREADS" \
-              /tmp/test_baseline.flac /tmp/test_opt.flac
+          ./build/flacoutcpp --threads $(nproc) \
+              /tmp/noise_mono_baseline.flac /tmp/noise_mono_heuristic.flac
+          flac --test /tmp/noise_mono_heuristic.flac
+          echo "Mono heuristic: $(wc -c < /tmp/noise_mono_heuristic.flac) bytes (validity OK)"
 
       # ------------------------------------------------------------------ #
-      # 7. Verify output is a valid FLAC stream                             #
+      # 5. Exhaustive mode (-e) — stereo                                     #
+      #                                                                       #
+      # Gate 1: flac --test must pass.                                        #
+      # Gate 2: exhaustive ≤ heuristic.                                       #
+      #   Full search must never produce a larger file than heuristic search. #
+      # Gate 3: exhaustive ≤ flac --best on pure sine.                        #
       # ------------------------------------------------------------------ #
-      - name: Verify FLAC validity (flac --test)
+      - name: Exhaustive mode — stereo sine validity + compression
         run: |
-          flac --test /tmp/test_opt.flac
-          echo "FLAC bitstream is valid"
+          time ./build/flacoutcpp -e --threads $(nproc) \
+              /tmp/sine_stereo_baseline.flac /tmp/sine_stereo_exhaustive.flac
+          flac --test /tmp/sine_stereo_exhaustive.flac
+
+          BASELINE=$(wc -c  < /tmp/sine_stereo_baseline.flac)
+          HEURISTIC=$(wc -c < /tmp/sine_stereo_heuristic.flac)
+          EXHAUSTIVE=$(wc -c < /tmp/sine_stereo_exhaustive.flac)
+          echo "Baseline:   $BASELINE bytes"
+          echo "Heuristic:  $HEURISTIC bytes"
+          echo "Exhaustive: $EXHAUSTIVE bytes"
+
+          if [ "$EXHAUSTIVE" -gt "$HEURISTIC" ]; then
+            echo "FAIL: exhaustive ($EXHAUSTIVE) > heuristic ($HEURISTIC)"
+            exit 1
+          fi
+          if [ "$EXHAUSTIVE" -gt "$BASELINE" ]; then
+            echo "FAIL: exhaustive ($EXHAUSTIVE) > flac --best ($BASELINE) on pure sine"
+            exit 1
+          fi
+          echo "Exhaustive beats heuristic by $((HEURISTIC - EXHAUSTIVE)) bytes."
 
       # ------------------------------------------------------------------ #
-      # 8. Compression ratio report                                         #
+      # 6. Exhaustive mode — mono                                            #
+      #                                                                       #
+      # Gate: flac --test must pass.                                          #
       # ------------------------------------------------------------------ #
-      - name: Check compression ratio
+      - name: Exhaustive mode — mono validity
         run: |
-          BASELINE="${{ env.BASELINE }}"
-          OPTIMIZED=$(wc -c < /tmp/test_opt.flac)
-          echo "Baseline  (flac --best):  $BASELINE bytes"
-          echo "Optimized (flacoutcpp):   $OPTIMIZED bytes"
-          if [ "$OPTIMIZED" -le "$BASELINE" ]; then
-            DELTA=$(( (BASELINE - OPTIMIZED) * 100 / BASELINE ))
-            echo "flacoutcpp is ${DELTA}% smaller than flac --best"
-          else
-            DELTA=$(( (OPTIMIZED - BASELINE) * 100 / BASELINE ))
-            echo "WARNING: flacoutcpp is ${DELTA}% larger than flac --best"
-            # Synthetic noise is intentionally hard to beat;
-            # validity (step 7) is the hard gate.
+          ./build/flacoutcpp -e --threads $(nproc) \
+              /tmp/noise_mono_baseline.flac /tmp/noise_mono_exhaustive.flac
+          flac --test /tmp/noise_mono_exhaustive.flac
+
+          HEURISTIC=$(wc -c  < /tmp/noise_mono_heuristic.flac)
+          EXHAUSTIVE=$(wc -c < /tmp/noise_mono_exhaustive.flac)
+          echo "Mono heuristic:  $HEURISTIC bytes"
+          echo "Mono exhaustive: $EXHAUSTIVE bytes"
+
+          if [ "$EXHAUSTIVE" -gt "$HEURISTIC" ]; then
+            echo "FAIL: exhaustive ($EXHAUSTIVE) > heuristic ($HEURISTIC) on mono"
+            exit 1
           fi
 
       # ------------------------------------------------------------------ #
-      # 9. Short-stream edge case (< 1024 samples)                          #
+      # 7. Short-stream edge case (< 1024 samples)                          #
+      #                                                                       #
+      # Tests both modes; flac --test is the gate for each.                  #
       # ------------------------------------------------------------------ #
-      - name: Short-stream edge case (512 samples)
+      - name: Short-stream edge case
         run: |
-          sox -n -r 44100 -c 2 -b 16 /tmp/short.wav \
-              synth 0.0116 sine 440
-          flac --best /tmp/short.wav -o /tmp/short_baseline.flac
+          ./build/flacoutcpp --threads 1 \
+              /tmp/short_baseline.flac /tmp/short_heuristic.flac
+          flac --test /tmp/short_heuristic.flac
+
           ./build/flacoutcpp -e --threads 1 \
-              /tmp/short_baseline.flac /tmp/short_opt.flac
-          flac --test /tmp/short_opt.flac
-          echo "Short-stream path OK"
+              /tmp/short_baseline.flac /tmp/short_exhaustive.flac
+          flac --test /tmp/short_exhaustive.flac
+          echo "Short-stream: both modes OK"
 
       # ------------------------------------------------------------------ #
-      # 10. Upload artifacts on failure for debugging                        #
+      # 8. Upload artifacts on failure                                        #
       # ------------------------------------------------------------------ #
       - name: Upload FLAC files on failure
         if: failure()
         uses: actions/upload-artifact@v7
         with:
           name: flac-debug-files
-          path: |
-            /tmp/test_baseline.flac
-            /tmp/test_opt.flac
-            /tmp/short_baseline.flac
-            /tmp/short_opt.flac
+          path: /tmp/*.flac

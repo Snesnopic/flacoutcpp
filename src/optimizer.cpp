@@ -844,13 +844,15 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
                             compute_block(pcm_data, (uint64_t)node * STEP, CANDIDATES[ci]);
                     } else {
                         uint32_t bits = 0;
-                        uint32_t n_start = (uint32_t)node;
-                        uint32_t n_end = (uint32_t)(node + CANDIDATES[ci] / STEP);
+                        // granules are 16 samples each; nodes are STEP=1024 samples each
+                        static constexpr uint32_t GRANULE_SIZE = 16u;
+                        uint32_t g_start = (uint32_t)(node * (STEP / GRANULE_SIZE));
+                        uint32_t g_end   = g_start + CANDIDATES[ci] / GRANULE_SIZE;
                         if (m_channels == 1) {
-                            bits = estimate_lpc_bits_fast(0, n_start, n_end, m_bps);
+                            bits = estimate_lpc_bits_fast(0, g_start, g_end, m_bps);
                         } else {
-                            bits = estimate_lpc_bits_fast(0, n_start, n_end, m_bps) +
-                                   estimate_lpc_bits_fast(1, n_start, n_end, m_bps);
+                            bits = estimate_lpc_bits_fast(0, g_start, g_end, m_bps) +
+                                   estimate_lpc_bits_fast(1, g_start, g_end, m_bps);
                         }
                         BlockParams bp{};
                         bp.block_size = CANDIDATES[ci];

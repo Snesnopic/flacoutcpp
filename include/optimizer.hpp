@@ -170,7 +170,8 @@ public:
     Optimizer(uint32_t channels, uint32_t bps,
               std::vector<WindowType> windows = {},
               unsigned max_threads = 0,
-              bool exhaustive = false);
+              bool exhaustive = false,
+              bool verbose = true);
 
     /**
      * @brief Find the optimal variable block-size partition for the stream.
@@ -247,8 +248,9 @@ private:
     uint32_t              m_channels;
     uint32_t              m_bps;
     std::vector<WindowType> m_windows;
-    unsigned              m_max_threads; ///< 0 = use all logical CPUs.
-    bool                  m_exhaustive;  ///< True = full search, False = heuristic fast-path.
+    unsigned              m_max_threads;
+    bool                  m_exhaustive;
+    bool                  m_verbose;
 
     /// @endcond
 };

@@ -74,6 +74,16 @@ struct Config {
      * Can be extremely slow.
      */
     bool exhaustive = false;
+
+    /**
+     * @brief Print progress and statistics to stdout during the run.
+     *
+     * Set to @c false to suppress all output — useful when flacoutcpp is
+     * embedded as a library and the caller manages its own UI.
+     * Errors that cause the function to return @c false are also suppressed;
+     * the caller should rely on the return value to detect failures.
+     */
+    bool verbose = true;
 };
 
 /**

@@ -106,8 +106,9 @@ WindowType window_from_name(const std::string& raw) {
 Optimizer::Optimizer(uint32_t channels, uint32_t bps,
                      std::vector<WindowType> windows,
                      unsigned max_threads,
-                     bool exhaustive)
-    : m_channels(channels), m_bps(bps), m_max_threads(max_threads), m_exhaustive(exhaustive)
+                     bool exhaustive,
+                     bool verbose)
+    : m_channels(channels), m_bps(bps), m_max_threads(max_threads), m_exhaustive(exhaustive), m_verbose(verbose)
 {
     if (windows.empty()) {
         if (m_exhaustive) {
@@ -752,8 +753,9 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
     // (1024 samples), skip block-size selection entirely and emit one
     // block covering all samples (FLAC allows block sizes from 1 to 65535).
     if (total_samples < 1024) {
-        std::cout << "Short stream (" << total_samples << " samples): "
-                  << "using single block.\n";
+        if (m_verbose)
+            std::cout << "Short stream (" << total_samples << " samples): "
+                      << "using single block.\n";
         BlockParams bp{};
         bp.block_size = (uint32_t)total_samples;
         if (m_channels == 1) {
@@ -828,9 +830,10 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
     unsigned nthreads = std::max(1u, static_cast<unsigned>(std::thread::hardware_concurrency()));
     if (m_max_threads > 0) nthreads = std::min(nthreads, (unsigned)m_max_threads);
 
-    std::cout << "DP: " << num_nodes << " nodes × " << NUM_CANDS
-              << " candidates = " << work.size() << " blocks on "
-              << nthreads << " threads\n";
+    if (m_verbose)
+        std::cout << "DP: " << num_nodes << " nodes × " << NUM_CANDS
+                  << " candidates = " << work.size() << " blocks on "
+                  << nthreads << " threads\n";
 
     {
         std::atomic<size_t> next{0}, done{0};
@@ -863,7 +866,7 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
                         cost_table[node * NUM_CANDS + ci] = bp;
                     }
                     size_t d = done.fetch_add(1, std::memory_order_relaxed) + 1;
-                    if (d % 10 == 0 || d == work.size()) {
+                    if (m_verbose && (d % 10 == 0 || d == work.size())) {
                         std::lock_guard<std::mutex> lk(cout_mtx);
                         std::cout << "\r  " << d << "/" << work.size()
                                   << " (" << d * 100 / work.size() << "%)" << std::flush;
@@ -872,7 +875,7 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
             });
         }
         for (auto& th : threads) th.join();
-        std::cout << "\n";
+        if (m_verbose) std::cout << "\n";
     }
 
     // Remainder block
@@ -917,7 +920,7 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
         std::atomic<size_t> next{0}, done{0};
         std::mutex           cout_mtx;
         std::vector<std::thread> threads;
-        std::cout << "Optimizing " << path.size() << " selected blocks...\n";
+        if (m_verbose) std::cout << "Optimizing " << path.size() << " selected blocks...\n";
         for (int t = 0; t < nthreads; ++t) {
             threads.emplace_back([&]() {
                 for (;;) {
@@ -926,7 +929,7 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
                     auto [node, ci] = path[idx];
                     result[idx] = compute_block(pcm_data, (uint64_t)node * STEP, CANDIDATES[ci]);
                     size_t d = done.fetch_add(1, std::memory_order_relaxed) + 1;
-                    if (d % 10 == 0 || d == path.size()) {
+                    if (m_verbose && (d % 10 == 0 || d == path.size())) {
                         std::lock_guard<std::mutex> lk(cout_mtx);
                         std::cout << "\r  " << d << "/" << path.size() << std::flush;
                     }
@@ -934,7 +937,7 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
             });
         }
         for (auto& th : threads) th.join();
-        std::cout << "\n";
+        if (m_verbose) std::cout << "\n";
     } else {
         for (size_t idx = 0; idx < path.size(); ++idx) {
             auto [node, ci] = path[idx];
@@ -945,7 +948,7 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
     if (remainder > 0)
         result.back() = remainder_bp;
 
-    {
+    if (m_verbose) {
         std::map<uint32_t,int> bs_hist;
         for (const auto& bp : result) ++bs_hist[bp.block_size];
         std::cout << "DP done. Distribution:";

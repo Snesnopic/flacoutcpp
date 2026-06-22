@@ -42,6 +42,11 @@ struct ProcessorConfig {
      * @brief If true, performs full exhaustive search over all parameters.
      */
     bool exhaustive = false;
+
+    /**
+     * @brief If false, suppresses all stdout/stderr output.
+     */
+    bool verbose = true;
 };
 
 /**

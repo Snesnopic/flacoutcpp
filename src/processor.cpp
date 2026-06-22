@@ -74,7 +74,7 @@ bool Processor::process() {
     // --- Step 1: collect raw extra metadata blocks ----
     std::vector<std::vector<uint8_t>> extra_blocks;
     if (m_config.copy_metadata) {
-        if (!read_extra_metadata_blocks(extra_blocks))
+        if (!read_extra_metadata_blocks(extra_blocks) && m_config.verbose)
             std::cerr << "Warning: could not copy metadata from " << m_input << "\n";
     }
 
@@ -96,9 +96,10 @@ bool Processor::process() {
 
     if (!ok || m_pcm_data.empty() || m_total_samples == 0) return false;
 
-    std::cout << "Decoded " << m_total_samples << " samples ("
-              << m_channels << " ch, " << m_bps << " bps, "
-              << m_sample_rate << " Hz)\n";
+    if (m_config.verbose)
+        std::cout << "Decoded " << m_total_samples << " samples ("
+                  << m_channels << " ch, " << m_bps << " bps, "
+                  << m_sample_rate << " Hz)\n";
 
     // --- Step 2b: compute MD5 over interleaved little-endian PCM ----
     // The FLAC spec mandates MD5 over the raw audio (channel-interleaved,
@@ -117,11 +118,12 @@ bool Processor::process() {
     auto md5_digest = md5.digest();
 
     // --- Step 3: run optimiser ----
-    Optimizer opt(m_channels, m_bps, m_config.windows, m_config.max_threads, m_config.exhaustive);
+    Optimizer opt(m_channels, m_bps, m_config.windows, m_config.max_threads, m_config.exhaustive, m_config.verbose);
     std::vector<BlockParams> blocks = opt.find_optimal_block_partitioning(m_pcm_data);
 
     if (blocks.empty()) {
-        std::cerr << "Error: optimizer produced no blocks.\n";
+        if (m_config.verbose)
+            std::cerr << "Error: optimizer produced no blocks.\n";
         return false;
     }
 
@@ -137,7 +139,8 @@ bool Processor::process() {
     std::fstream out(m_output,
                      std::ios::binary | std::ios::out | std::ios::trunc);
     if (!out) {
-        std::cerr << "Error: cannot open output file: " << m_output << "\n";
+        if (m_config.verbose)
+            std::cerr << "Error: cannot open output file: " << m_output << "\n";
         return false;
     }
 
@@ -198,13 +201,15 @@ bool Processor::process() {
 
     out.flush();
     if (!out) {
-        std::cerr << "Error: write failed.\n";
+        if (m_config.verbose)
+            std::cerr << "Error: write failed.\n";
         return false;
     }
 
-    std::cout << "Wrote " << total_written << " bytes of audio data ("
-              << blocks.size() << " frames, min=" << min_bs
-              << " max=" << max_bs << " samples/frame).\n";
+    if (m_config.verbose)
+        std::cout << "Wrote " << total_written << " bytes of audio data ("
+                  << blocks.size() << " frames, min=" << min_bs
+                  << " max=" << max_bs << " samples/frame).\n";
     return true;
 }
 
@@ -231,9 +236,11 @@ FLAC__StreamDecoderWriteStatus Processor::write_callback(
 }
 
 void Processor::error_callback(
-    const FLAC__StreamDecoder*, FLAC__StreamDecoderErrorStatus status, void*)
+    const FLAC__StreamDecoder*, FLAC__StreamDecoderErrorStatus status, void* client_data)
 {
-    std::cerr << "Decoder error: " << FLAC__StreamDecoderErrorStatusString[status] << "\n";
+    auto* self = static_cast<Processor*>(client_data);
+    if (self->m_config.verbose)
+        std::cerr << "Decoder error: " << FLAC__StreamDecoderErrorStatusString[status] << "\n";
 }
 
 void Processor::metadata_callback(

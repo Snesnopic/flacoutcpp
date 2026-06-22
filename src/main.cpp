@@ -10,6 +10,7 @@ static void print_usage(const char* prog) {
         << "Options:\n"
         << "  -e, --exhaustive     Perform full exhaustive search (extremely slow)\n"
         << "  -n, --no-metadata    Do not copy metadata from input to output\n"
+        << "  -q, --quiet          Suppress all progress output\n"
         << "  -t, --threads N      Limit parallel worker threads (default: all CPUs)\n"
         << "  -w, --windows <list> Comma-separated list of apodization windows to use\n"
         << "                       (default: all windows — maximum compression)\n"
@@ -43,6 +44,9 @@ int main(int argc, char* argv[]) {
 
         if (arg == "-e" || arg == "--exhaustive") {
             cfg.exhaustive = true;
+
+        } else if (arg == "-q" || arg == "--quiet") {
+            cfg.verbose = false;
 
         } else if (arg == "-n" || arg == "--no-metadata") {
             cfg.copy_metadata = false;
@@ -95,25 +99,26 @@ int main(int argc, char* argv[]) {
                                  ? positional[1]
                                  : input + ".optimized.flac";
 
-    if (cfg.windows.empty())
-        std::cout << "Windows: all (" << all_window_types().size() << " functions)\n";
-    else {
-        std::cout << "Windows: ";
-        for (size_t i = 0; i < cfg.windows.size(); ++i) {
-            if (i) std::cout << ", ";
-            std::cout << window_to_name(cfg.windows[i]);
+    if (cfg.verbose) {
+        if (cfg.windows.empty())
+            std::cout << "Windows: all (" << all_window_types().size() << " functions)\n";
+        else {
+            std::cout << "Windows: ";
+            for (size_t i = 0; i < cfg.windows.size(); ++i) {
+                if (i) std::cout << ", ";
+                std::cout << window_to_name(cfg.windows[i]);
+            }
+            std::cout << "\n";
         }
-        std::cout << "\n";
+        std::cout << "Optimising: " << input << " -> " << output << "\n";
+        if (!cfg.copy_metadata) std::cout << "Metadata copying disabled.\n";
     }
 
-    std::cout << "Optimising: " << input << " -> " << output << "\n";
-    if (!cfg.copy_metadata) std::cout << "Metadata copying disabled.\n";
-
     if (!flacoutcpp::optimise(input, output, cfg)) {
-        std::cerr << "Optimisation failed.\n";
+        if (cfg.verbose) std::cerr << "Optimisation failed.\n";
         return 1;
     }
 
-    std::cout << "Done.\n";
+    if (cfg.verbose) std::cout << "Done.\n";
     return 0;
 }

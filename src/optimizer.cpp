@@ -7,6 +7,7 @@
 #include <future>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <map>
 #include <string>
 #include <thread>
@@ -408,8 +409,7 @@ uint32_t Optimizer::calculate_rice_cost(
                 }
                 // Bits needed: floor(log2(max_abs)) + 2  (1 for sign, 1 for the value itself)
                 int escape_bps = 1;
-                while ((1 << (escape_bps - 1)) <= max_abs) ++escape_bps;
-                if (escape_bps > 32) escape_bps = 32;
+                while (escape_bps < 32 && (1u << (escape_bps - 1)) <= (uint32_t)max_abs) ++escape_bps;
 
                 uint32_t n_residuals = end - first;
                 uint32_t escape_bits = 5u + (uint32_t)escape_bps * n_residuals;
@@ -834,6 +834,7 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
 
     {
         std::atomic<size_t> next{0}, done{0};
+        std::mutex           cout_mtx;
         std::vector<std::thread> threads;
         for (int t = 0; t < nthreads; ++t) {
             threads.emplace_back([&]() {
@@ -862,9 +863,11 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
                         cost_table[node * NUM_CANDS + ci] = bp;
                     }
                     size_t d = done.fetch_add(1, std::memory_order_relaxed) + 1;
-                    if (d % 10 == 0 || d == work.size())
+                    if (d % 10 == 0 || d == work.size()) {
+                        std::lock_guard<std::mutex> lk(cout_mtx);
                         std::cout << "\r  " << d << "/" << work.size()
                                   << " (" << d * 100 / work.size() << "%)" << std::flush;
+                    }
                 }
             });
         }
@@ -912,6 +915,7 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
     std::vector<BlockParams> result(path.size() + (remainder > 0 ? 1 : 0));
     if (!m_exhaustive) {
         std::atomic<size_t> next{0}, done{0};
+        std::mutex           cout_mtx;
         std::vector<std::thread> threads;
         std::cout << "Optimizing " << path.size() << " selected blocks...\n";
         for (int t = 0; t < nthreads; ++t) {
@@ -922,8 +926,10 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
                     auto [node, ci] = path[idx];
                     result[idx] = compute_block(pcm_data, (uint64_t)node * STEP, CANDIDATES[ci]);
                     size_t d = done.fetch_add(1, std::memory_order_relaxed) + 1;
-                    if (d % 10 == 0 || d == path.size())
+                    if (d % 10 == 0 || d == path.size()) {
+                        std::lock_guard<std::mutex> lk(cout_mtx);
                         std::cout << "\r  " << d << "/" << path.size() << std::flush;
+                    }
                 }
             });
         }

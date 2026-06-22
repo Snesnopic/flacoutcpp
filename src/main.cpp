@@ -68,7 +68,12 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
             ++i;
-            cfg.max_threads = static_cast<unsigned>(std::stoul(argv[i]));
+            try {
+                cfg.max_threads = static_cast<unsigned>(std::stoul(argv[i]));
+            } catch (const std::exception&) {
+                std::cerr << "Error: -t requires a positive integer, got '" << argv[i] << "'.\n";
+                return 1;
+            }
 
         } else if (arg.substr(0, 2) == "--" || arg.substr(0, 1) == "-") {
             std::cerr << "Unknown option: " << arg << "\n";

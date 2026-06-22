@@ -580,6 +580,7 @@ SubframeParams Optimizer::optimize_subframe(
     // ---- Mode 3: LPC with multi-window exhaustive search ----
     if (bsize >= 2) {
         std::vector<double> windowed(bsize);
+        std::vector<int32_t> residuals(bsize);
         float all_lpc[32][32]; // all_lpc[order-1][coeff]
 
         for (WindowType wt : windows) {
@@ -645,7 +646,6 @@ SubframeParams Optimizer::optimize_subframe(
                     if (overflow) continue; // can happen if cmax was underestimated; skip
 
                     // Compute residuals on ORIGINAL (non-windowed) samples
-                    std::vector<int32_t> residuals(bsize);
                     for (uint32_t i = 0; i < bsize; ++i) {
                         int32_t s = samples[i] >> wasted;
                         if ((uint32_t)i < (uint32_t)ord) {

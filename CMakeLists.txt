@@ -34,5 +34,6 @@ target_link_libraries(flacout_lib FLAC)
 # CLI executable
 add_executable(flacoutcpp src/main.cpp)
 target_link_libraries(flacoutcpp flacout_lib)
+target_compile_definitions(flacoutcpp PRIVATE FLACOUTCPP_VERSION="${PROJECT_VERSION}")
 
 install(TARGETS flacoutcpp DESTINATION bin)

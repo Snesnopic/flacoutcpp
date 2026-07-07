@@ -34,7 +34,7 @@ static std::vector<std::string> split_csv(const std::string& s) {
 }
 
 int main(int argc, char* argv[]) {
-    if (argc < 2) { print_usage(argv[0]); return 1; }
+    if (argc < 2) { print_usage(argv[0]); return EXIT_FAILURE; }
 
     flacoutcpp::Config cfg;
     std::vector<std::string> positional;
@@ -42,7 +42,15 @@ int main(int argc, char* argv[]) {
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
 
-        if (arg == "-e" || arg == "--exhaustive") {
+        if (arg == "--version") {
+            std::cout << FLACOUTCPP_VERSION << "\n";
+            return EXIT_SUCCESS;
+
+        } else if (arg == "-h" || arg == "--help") {
+            print_usage(argv[0]);
+            return EXIT_SUCCESS;
+
+        } else if (arg == "-e" || arg == "--exhaustive") {
             cfg.exhaustive = true;
 
         } else if (arg == "-q" || arg == "--quiet") {
@@ -54,7 +62,7 @@ int main(int argc, char* argv[]) {
         } else if (arg == "-w" || arg == "--windows") {
             if (i + 1 >= argc) {
                 std::cerr << "Error: -w requires an argument.\n";
-                return 1;
+                return EXIT_FAILURE;
             }
             ++i;
             for (const auto& name : split_csv(argv[i])) {
@@ -69,20 +77,20 @@ int main(int argc, char* argv[]) {
         } else if (arg == "-t" || arg == "--threads") {
             if (i + 1 >= argc) {
                 std::cerr << "Error: -t requires a number.\n";
-                return 1;
+                return EXIT_FAILURE;
             }
             ++i;
             try {
                 cfg.max_threads = static_cast<unsigned>(std::stoul(argv[i]));
             } catch (const std::exception&) {
                 std::cerr << "Error: -t requires a positive integer, got '" << argv[i] << "'.\n";
-                return 1;
+                return EXIT_FAILURE;
             }
 
         } else if (arg.substr(0, 2) == "--" || arg.substr(0, 1) == "-") {
             std::cerr << "Unknown option: " << arg << "\n";
             print_usage(argv[0]);
-            return 1;
+            return EXIT_FAILURE;
 
         } else {
             positional.push_back(arg);
@@ -91,7 +99,7 @@ int main(int argc, char* argv[]) {
 
     if (positional.empty()) {
         std::cerr << "Error: no input file specified.\n";
-        return 1;
+        return EXIT_FAILURE;
     }
 
     const std::string input  = positional[0];
@@ -116,9 +124,9 @@ int main(int argc, char* argv[]) {
 
     if (!flacoutcpp::optimise(input, output, cfg)) {
         if (cfg.verbose) std::cerr << "Optimisation failed.\n";
-        return 1;
+        return EXIT_FAILURE;
     }
 
     if (cfg.verbose) std::cout << "Done.\n";
-    return 0;
+    return EXIT_SUCCESS;
 }

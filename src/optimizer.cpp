@@ -623,6 +623,13 @@ SubframeParams Optimizer::optimize_subframe(
         std::vector<int32_t> shifted(bsize);
         for (uint32_t i = 0; i < bsize; ++i) shifted[i] = samples[i] >> wasted;
 
+        // precision set is constant for the whole subframe; build once
+        std::vector<int> precisions;
+        if (exhaustive) { for (int p = 8; p <= 15; ++p) precisions.push_back(p); }
+        else            { precisions = {12, 15}; }
+        const uint32_t min_prec  = (uint32_t)precisions.front();
+        const uint32_t hdr_fixed = 8u + (wasted ? (uint32_t)(1 + wasted) : 0u) + 4u + 5u;
+
         for (WindowType wt : windows) {
             apply_window(samples, bsize, wasted, wt, windowed.data());
 
@@ -641,6 +648,12 @@ SubframeParams Optimizer::optimize_subframe(
             compute_lpc_all_orders(autoc, all_lpc, max_order);
 
             for (int ord = 1; ord <= max_order; ++ord) {
+                // sound lower bound: fixed cost (header + warm-up + coeffs) alone,
+                // at the cheapest precision, since rice cost >= 0. it grows with
+                // order, so once it can't beat best neither can any higher order.
+                uint32_t hdr_min = hdr_fixed + (uint32_t)ord * (eff_bps + min_prec);
+                if (hdr_min >= best.bits_cost) break;
+
                 const float* lpc = all_lpc[ord - 1];
 
                 // Determine quantization shift from the magnitude of the largest coefficient.
@@ -656,14 +669,12 @@ SubframeParams Optimizer::optimize_subframe(
                     log2cmax = (int)std::floor(std::log2(cmax));
                 // else cmax < 1 → log2cmax ≤ -1, but we keep it at 0 so shift stays high.
 
-                std::vector<int> precisions;
-                if (exhaustive) {
-                    for (int p = 8; p <= 15; ++p) precisions.push_back(p);
-                } else {
-                    precisions = {12, 15};
-                }
-
                 for (int prec : precisions) {
+                    // fixed cost is a lower bound on this candidate (rice >= 0);
+                    // grows with precision, so break once it can't beat best.
+                    uint32_t hdr = hdr_fixed + (uint32_t)ord * (eff_bps + (uint32_t)prec);
+                    if (hdr >= best.bits_cost) break;
+
                     // shift = (prec-1) - log2cmax - 1
                     // = prec - log2cmax - 2
                     // Ensures quantized coefficient = round(coeff * 2^shift) fits in [-(2^(prec-1)), 2^(prec-1)-1].
@@ -697,11 +708,6 @@ SubframeParams Optimizer::optimize_subframe(
                             residuals[i] = s - (int32_t)(pred >> shift);
                         }
                     }
-
-                    // Header overhead
-                    uint32_t hdr = 8u + (wasted ? (uint32_t)(1 + wasted) : 0u);
-                    hdr += (uint32_t)ord * eff_bps;           // warm-up samples (verbatim)
-                    hdr += 4u + 5u + (uint32_t)(ord * prec); // precision(4) + shift(5) + coeffs
 
                     SubframeParams cur{};
                     cur.mode          = 3;

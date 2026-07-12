@@ -363,72 +363,107 @@ void Optimizer::compute_lpc_coefficients(const double* autoc, float* out, int or
 // Rice cost
 // ============================================================
 
+// sum(u_i >> k) is additive over disjoint ranges, so sums are computed once at the finest partition order and folded upward instead of rescanning per order.
 uint32_t Optimizer::calculate_rice_cost(
     const int32_t* residuals, uint32_t block_size,
     uint32_t order, SubframeParams* out_params)
 {
+    static constexpr int NUM_K = 15;
+    static constexpr int MAX_PARTS = 256; // 1 << 8
+
+    // Valid partition orders form a contiguous prefix [0, max_p_order]
+    // since 2^p | block_size implies 2^(p-1) | block_size.
+    int max_p_order = 0;
+    for (int p = 1; p <= 8; ++p) {
+        if (block_size % (1u << p) != 0) break;
+        max_p_order = p;
+    }
+
+    uint32_t num_parts = 1u << max_p_order;
+    uint32_t p_size    = block_size / num_parts;
+
+    uint64_t sums[MAX_PARTS][NUM_K];
+    uint32_t n_res[MAX_PARTS];
+    uint32_t max_abs_arr[MAX_PARTS];
+
+    for (uint32_t p = 0; p < num_parts; ++p) {
+        uint32_t start = p * p_size;
+        uint32_t end   = start + p_size;
+        uint32_t first = std::max(start, order); // skip warm-up in partition 0
+
+        uint64_t* s = sums[p];
+        for (int k = 0; k < NUM_K; ++k) s[k] = 0;
+        uint32_t mabs = 0;
+        for (uint32_t i = first; i < end; ++i) {
+            int32_t  r = residuals[i];
+            uint32_t u = (uint32_t)((r << 1) ^ (r >> 31));
+            for (int k = 0; k < NUM_K; ++k) s[k] += (u >> k);
+            uint32_t a = (uint32_t)(r < 0 ? ~r : r);
+            if (a > mabs) mabs = a;
+        }
+        n_res[p]        = (first < end) ? (end - first) : 0;
+        max_abs_arr[p]  = mabs;
+    }
+
     uint32_t best_total = std::numeric_limits<uint32_t>::max();
     int      best_porder = 0;
-    int      best_ks[256] = {};
+    int      best_ks[MAX_PARTS] = {};
 
-    for (int p_order = 0; p_order <= 8; ++p_order) {
-        uint32_t num_parts = 1u << p_order;
-        if (block_size % num_parts != 0) continue;
+    uint32_t cur_num_parts = num_parts;
+    for (int p_order = max_p_order; p_order >= 0; --p_order) {
+        uint32_t total = 4 * cur_num_parts; // 4 bits rice-param per partition (method 0)
+        int      ks[MAX_PARTS];
 
-        uint32_t p_size = block_size / num_parts;
-        // 4 bits rice-param per partition (method 0)
-        uint32_t total = 4 * num_parts;
-        int      ks[256];
-
-        for (uint32_t p = 0; p < num_parts; ++p) {
-            uint32_t start = p * p_size;
-            uint32_t end   = start + p_size;
-            uint32_t first = std::max(start, order); // skip warm-up in partition 0
+        for (uint32_t p = 0; p < cur_num_parts; ++p) {
+            uint32_t   n = n_res[p];
+            uint64_t*  s = sums[p];
 
             uint32_t best_k_bits = std::numeric_limits<uint32_t>::max();
             int      best_k = 0;
 
             // --- Try Rice parameters k = 0..14 ---
-            for (int k = 0; k < 15; ++k) {
-                uint32_t bits = 0;
-                for (uint32_t i = first; i < end; ++i) {
-                    uint32_t u = (uint32_t)((residuals[i] << 1) ^ (residuals[i] >> 31));
-                    bits += (u >> k) + 1 + k;
-                    if (bits >= best_k_bits) break; // prune
-                }
+            for (int k = 0; k < NUM_K; ++k) {
+                uint32_t bits = (uint32_t)((uint64_t)n * (1 + k) + s[k]);
                 if (bits < best_k_bits) { best_k_bits = bits; best_k = k; }
             }
 
             // --- Try Rice escape code (k=15): verbatim residuals ---
             // k=15 means: 4-bit marker + 5-bit bps + bps bits per residual.
-            // Find the minimum bits-per-sample needed to represent all residuals.
             {
-                int32_t max_abs = 0;
-                for (uint32_t i = first; i < end; ++i) {
-                    int32_t a = residuals[i] < 0 ? ~residuals[i] : residuals[i];
-                    if (a > max_abs) max_abs = a;
-                }
-                // Bits needed: floor(log2(max_abs)) + 2  (1 for sign, 1 for the value itself)
+                uint32_t max_abs = max_abs_arr[p];
                 int escape_bps = 1;
-                while (escape_bps < 32 && (1u << (escape_bps - 1)) <= (uint32_t)max_abs) ++escape_bps;
+                while (escape_bps < 32 && (1u << (escape_bps - 1)) <= max_abs) ++escape_bps;
 
-                uint32_t n_residuals = end - first;
-                uint32_t escape_bits = 5u + (uint32_t)escape_bps * n_residuals;
+                uint32_t escape_bits = 5u + (uint32_t)escape_bps * n;
                 if (escape_bits < best_k_bits) {
                     best_k_bits = escape_bits;
                     best_k = 15 + (escape_bps << 8); // encode bps in high bits for later
                 }
             }
 
-            total += best_k_bits;
-            ks[p]  = best_k;
+            total  += best_k_bits;
+            ks[p]   = best_k;
         }
 
-        if (total < best_total) {
+        // '<=' since we iterate p_order descending: keeps the smallest p_order on a tie, same as before
+        if (total <= best_total) {
             best_total  = total;
             best_porder = p_order;
-            std::memcpy(best_ks, ks, (1u << p_order) * sizeof(int));
+            std::memcpy(best_ks, ks, cur_num_parts * sizeof(int));
         }
+
+        if (p_order == 0) break;
+
+        // Fold pairs of partitions up to the next coarser order.
+        uint32_t next_num_parts = cur_num_parts / 2;
+        for (uint32_t p = 0; p < next_num_parts; ++p) {
+            uint32_t left = 2 * p, right = 2 * p + 1;
+            n_res[p]       = n_res[left] + n_res[right];
+            max_abs_arr[p] = std::max(max_abs_arr[left], max_abs_arr[right]);
+            for (int k = 0; k < NUM_K; ++k)
+                sums[p][k] = sums[left][k] + sums[right][k];
+        }
+        cur_num_parts = next_num_parts;
     }
 
     if (out_params) {
@@ -584,6 +619,10 @@ SubframeParams Optimizer::optimize_subframe(
         std::vector<int32_t> residuals(bsize);
         float all_lpc[32][32]; // all_lpc[order-1][coeff]
 
+        // hoisted: samples[i] >> wasted was re-read for every window/order/precision combo below
+        std::vector<int32_t> shifted(bsize);
+        for (uint32_t i = 0; i < bsize; ++i) shifted[i] = samples[i] >> wasted;
+
         for (WindowType wt : windows) {
             apply_window(samples, bsize, wasted, wt, windowed.data());
 
@@ -648,13 +687,13 @@ SubframeParams Optimizer::optimize_subframe(
 
                     // Compute residuals on ORIGINAL (non-windowed) samples
                     for (uint32_t i = 0; i < bsize; ++i) {
-                        int32_t s = samples[i] >> wasted;
+                        int32_t s = shifted[i];
                         if ((uint32_t)i < (uint32_t)ord) {
                             residuals[i] = s;
                         } else {
                             int64_t pred = 0;
                             for (int j = 0; j < ord; ++j)
-                                pred += (int64_t)qc[j] * (int64_t)(samples[i-1-j] >> wasted);
+                                pred += (int64_t)qc[j] * (int64_t)shifted[i-1-j];
                             residuals[i] = s - (int32_t)(pred >> shift);
                         }
                     }

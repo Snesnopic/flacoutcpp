@@ -1056,38 +1056,56 @@ BlockParams Optimizer::compute_block(
             modes_to_test = {best_mode};
         }
 
-        for (int mode : modes_to_test) {
-            if (mode == 0) {
-                SubframeParams s0 = optimize_subframe(&pcm_data[0][sample_start], block_size, m_bps, m_windows, m_exhaustive);
-                SubframeParams s1 = optimize_subframe(&pcm_data[1][sample_start], block_size, m_bps, m_windows, m_exhaustive);
-                uint32_t cost = s0.bits_cost + s1.bits_cost;
-                if (cost < best_bits) {
-                    best_bits       = cost;
-                    bp.stereo_mode  = 0;
-                    bp.subframes[0] = s0;
-                    bp.subframes[1] = s1;
-                }
+        // the 4 stereo modes draw from only 4 distinct channel signals; S=L-R
+        // alone appears in modes 8/9/10, so optimize each signal at most once.
+        enum { SIG_L = 0, SIG_R, SIG_S, SIG_M };
+        bool           have[4] = { false, false, false, false };
+        SubframeParams cache[4];
+
+        auto get_sig = [&](int sig) -> const SubframeParams& {
+            if (have[sig]) return cache[sig];
+            if (sig == SIG_L) {
+                cache[sig] = optimize_subframe(&pcm_data[0][sample_start], block_size, m_bps, m_windows, m_exhaustive);
+            } else if (sig == SIG_R) {
+                cache[sig] = optimize_subframe(&pcm_data[1][sample_start], block_size, m_bps, m_windows, m_exhaustive);
             } else {
-                std::vector<int32_t> ch0(block_size), ch1(block_size);
-                for (uint32_t k = 0; k < block_size; ++k) {
-                    int32_t L = pcm_data[0][sample_start + k];
-                    int32_t R = pcm_data[1][sample_start + k];
-                    if      (mode == 8)  { ch0[k] = L;        ch1[k] = L - R; }
-                    else if (mode == 9)  { ch0[k] = L - R;    ch1[k] = R;     }
-                    else                 { ch0[k] = (L+R)>>1; ch1[k] = L - R; }
+                std::vector<int32_t> ch(block_size);
+                uint32_t bps_s;
+                if (sig == SIG_S) {
+                    for (uint32_t k = 0; k < block_size; ++k)
+                        ch[k] = pcm_data[0][sample_start + k] - pcm_data[1][sample_start + k];
+                    bps_s = m_bps + 1;
+                } else { // SIG_M
+                    for (uint32_t k = 0; k < block_size; ++k)
+                        ch[k] = (pcm_data[0][sample_start + k] + pcm_data[1][sample_start + k]) >> 1;
+                    bps_s = m_bps;
                 }
-                // mode 9 = right+side: ch0 is side (needs +1 bit), ch1 is right
-                uint32_t bps0 = (mode == 9) ? m_bps + 1 : m_bps;
-                uint32_t bps1 = (mode == 9) ? m_bps     : m_bps + 1;
-                SubframeParams s0 = optimize_subframe(ch0.data(), block_size, bps0, m_windows, m_exhaustive);
-                SubframeParams s1 = optimize_subframe(ch1.data(), block_size, bps1, m_windows, m_exhaustive);
-                uint32_t cost = s0.bits_cost + s1.bits_cost;
-                if (cost < best_bits) {
-                    best_bits       = cost;
-                    bp.stereo_mode  = mode;
-                    bp.subframes[0] = s0;
-                    bp.subframes[1] = s1;
-                }
+                cache[sig] = optimize_subframe(ch.data(), block_size, bps_s, m_windows, m_exhaustive);
+            }
+            have[sig] = true;
+            return cache[sig];
+        };
+
+        // (ch0, ch1) signal pair per stereo mode
+        auto mode_sigs = [](int mode) -> std::pair<int,int> {
+            switch (mode) {
+                case 0:  return { SIG_L, SIG_R };
+                case 8:  return { SIG_L, SIG_S };
+                case 9:  return { SIG_S, SIG_R };
+                default: return { SIG_M, SIG_S }; // mode 10
+            }
+        };
+
+        for (int mode : modes_to_test) {
+            auto [sig0, sig1] = mode_sigs(mode);
+            const SubframeParams& s0 = get_sig(sig0);
+            const SubframeParams& s1 = get_sig(sig1);
+            uint32_t cost = s0.bits_cost + s1.bits_cost;
+            if (cost < best_bits) {
+                best_bits       = cost;
+                bp.stereo_mode  = mode;
+                bp.subframes[0] = s0;
+                bp.subframes[1] = s1;
             }
         }
     }

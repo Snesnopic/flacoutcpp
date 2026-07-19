@@ -372,10 +372,16 @@ uint32_t Optimizer::calculate_rice_cost(
     static constexpr int MAX_PARTS = 256; // 1 << 8
 
     // Valid partition orders form a contiguous prefix [0, max_p_order]
-    // since 2^p | block_size implies 2^(p-1) | block_size.
+    // since 2^p | block_size implies 2^(p-1) | block_size. Also cap so the
+    // finest partition is never smaller than order: per the FLAC format,
+    // only partition 0 may have fewer than p_size residuals (its count is
+    // p_size - order); every other partition is always exactly p_size long.
+    // A decoder never re-derives "warm-up spilled into partition 1" — that's
+    // purely a bitstream desync if we choose a partition order that fine.
     int max_p_order = 0;
     for (int p = 1; p <= 8; ++p) {
         if (block_size % (1u << p) != 0) break;
+        if ((block_size >> p) < order) break;
         max_p_order = p;
     }
 
@@ -405,36 +411,39 @@ uint32_t Optimizer::calculate_rice_cost(
         max_abs_arr[p]  = mabs;
     }
 
-    uint32_t best_total = std::numeric_limits<uint32_t>::max();
+    uint64_t best_total = std::numeric_limits<uint64_t>::max();
     int      best_porder = 0;
     int      best_ks[MAX_PARTS] = {};
 
     uint32_t cur_num_parts = num_parts;
     for (int p_order = max_p_order; p_order >= 0; --p_order) {
-        uint32_t total = 4 * cur_num_parts; // 4 bits rice-param per partition (method 0)
+        uint64_t total = 4 * cur_num_parts; // 4 bits rice-param per partition (method 0)
         int      ks[MAX_PARTS];
 
         for (uint32_t p = 0; p < cur_num_parts; ++p) {
             uint32_t   n = n_res[p];
             uint64_t*  s = sums[p];
 
-            uint32_t best_k_bits = std::numeric_limits<uint32_t>::max();
+            uint64_t best_k_bits = std::numeric_limits<uint64_t>::max();
             int      best_k = 0;
 
             // --- Try Rice parameters k = 0..14 ---
             for (int k = 0; k < NUM_K; ++k) {
-                uint32_t bits = (uint32_t)((uint64_t)n * (1 + k) + s[k]);
+                uint64_t bits = (uint64_t)n * (1 + k) + s[k];
                 if (bits < best_k_bits) { best_k_bits = bits; best_k = k; }
             }
 
             // --- Try Rice escape code (k=15): verbatim residuals ---
             // k=15 means: 4-bit marker + 5-bit bps + bps bits per residual.
-            {
+            // The bps field is 5 bits, so residuals wider than 31 bits cannot be
+            // represented by escape at all; skip it so normal Rice (which has no
+            // such limit) is chosen instead.
+            if (max_abs_arr[p] < (1u << 30)) {
                 uint32_t max_abs = max_abs_arr[p];
                 int escape_bps = 1;
-                while (escape_bps < 32 && (1u << (escape_bps - 1)) <= max_abs) ++escape_bps;
+                while (escape_bps < 31 && (1u << (escape_bps - 1)) <= max_abs) ++escape_bps;
 
-                uint32_t escape_bits = 5u + (uint32_t)escape_bps * n;
+                uint64_t escape_bits = 5ull + (uint64_t)escape_bps * n;
                 if (escape_bits < best_k_bits) {
                     best_k_bits = escape_bits;
                     best_k = 15 + (escape_bps << 8); // encode bps in high bits for later
@@ -470,7 +479,9 @@ uint32_t Optimizer::calculate_rice_cost(
         out_params->rice_partition_order = best_porder;
         std::memcpy(out_params->rice_k, best_ks, (1u << best_porder) * sizeof(int));
     }
-    return best_total;
+    return best_total > std::numeric_limits<uint32_t>::max()
+         ? std::numeric_limits<uint32_t>::max()
+         : (uint32_t)best_total;
 }
 
 

@@ -319,7 +319,7 @@ void FrameWriter::write_residual(
             // The escape_bps is stored in the upper bits of raw_k (see optimizer.cpp).
             int escape_bps = raw_k >> 8;
             if (escape_bps < 1)  escape_bps = 1;
-            if (escape_bps > 32) escape_bps = 32;
+            if (escape_bps > 31) escape_bps = 31; // 5-bit bps field holds 0..31
             bw.write_bits(15u, 4);          // 4-bit escape marker
             bw.write_bits((uint64_t)escape_bps, 5); // 5-bit bits-per-sample
             for (uint32_t i = first; i < end; ++i)

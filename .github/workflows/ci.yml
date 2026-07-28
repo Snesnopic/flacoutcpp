@@ -163,7 +163,47 @@ jobs:
           echo "Short-stream: both modes OK"
 
       # ------------------------------------------------------------------ #
-      # 8. Upload artifacts on failure                                        #
+      # 8. 24-bit edge case                                                   #
+      #                                                                       #
+      # Correlated 24-bit stereo noise pushes the LPC search toward high      #
+      # orders + escape-coded residuals + fine Rice partition orders at       #
+      # once — the exact combination that produced an invalid (LOST_SYNC)     #
+      # bitstream before the partition-order/predictor-order fix.             #
+      # Gate 1: flac --test must pass in both modes (catches LOST_SYNC).      #
+      # Gate 2: exhaustive ≤ heuristic (catches the 64-bit overflow that       #
+      #         made the encoder pick a catastrophically bloated encoding —   #
+      #         still a *valid* stream, so gate 1 alone would miss it).       #
+      # ------------------------------------------------------------------ #
+      - name: Generate 24-bit test audio
+        run: |
+          sox -n -r 96000 -c 2 -b 24 /tmp/noise24.wav \
+              synth 0.2 whitenoise vol 0.9
+          flac --best /tmp/noise24.wav -o /tmp/noise24_baseline.flac
+          echo "noise24 baseline: $(wc -c < /tmp/noise24_baseline.flac) bytes"
+
+      - name: 24-bit edge case
+        run: |
+          ./build/flacoutcpp --threads $(nproc) \
+              /tmp/noise24_baseline.flac /tmp/noise24_heuristic.flac
+          flac --test /tmp/noise24_heuristic.flac
+
+          time ./build/flacoutcpp -e --threads $(nproc) \
+              /tmp/noise24_baseline.flac /tmp/noise24_exhaustive.flac
+          flac --test /tmp/noise24_exhaustive.flac
+
+          HEURISTIC=$(wc -c  < /tmp/noise24_heuristic.flac)
+          EXHAUSTIVE=$(wc -c < /tmp/noise24_exhaustive.flac)
+          echo "24-bit heuristic:  $HEURISTIC bytes"
+          echo "24-bit exhaustive: $EXHAUSTIVE bytes"
+
+          if [ "$EXHAUSTIVE" -gt "$HEURISTIC" ]; then
+            echo "FAIL: exhaustive ($EXHAUSTIVE) > heuristic ($HEURISTIC) on 24-bit"
+            exit 1
+          fi
+          echo "24-bit: both modes OK"
+
+      # ------------------------------------------------------------------ #
+      # 9. Upload artifacts on failure                                        #
       # ------------------------------------------------------------------ #
       - name: Upload FLAC files on failure
         if: failure()

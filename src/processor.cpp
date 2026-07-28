@@ -4,6 +4,7 @@
 #include "md5.hpp"
 #include "FLAC/stream_decoder.h"
 #include <algorithm>
+#include <cstdio>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -74,7 +75,7 @@ bool Processor::process() {
     // --- Step 1: collect raw extra metadata blocks ----
     std::vector<std::vector<uint8_t>> extra_blocks;
     if (m_config.copy_metadata) {
-        if (!read_extra_metadata_blocks(extra_blocks) && m_config.verbose)
+        if (!read_extra_metadata_blocks(extra_blocks))
             std::cerr << "Warning: could not copy metadata from " << m_input << "\n";
     }
 
@@ -122,8 +123,7 @@ bool Processor::process() {
     std::vector<BlockParams> blocks = opt.find_optimal_block_partitioning(m_pcm_data);
 
     if (blocks.empty()) {
-        if (m_config.verbose)
-            std::cerr << "Error: optimizer produced no blocks.\n";
+        std::cerr << "Error: optimizer produced no blocks.\n";
         return false;
     }
 
@@ -134,13 +134,17 @@ bool Processor::process() {
         max_bs = std::max(max_bs, b.block_size);
     }
 
-    // --- Step 4: open output file and write header ----
+    // --- Step 4: open a temporary output file and write header ----
+    // Written to m_output + ".partial" and renamed into place only after a
+    // fully successful write, so a failure or crash partway through never
+    // leaves a corrupt/truncated file at m_output (nor clobbers a pre-existing
+    // file there before we know we can replace it).
     // We need seekp() later to update STREAMINFO, so use fstream.
-    std::fstream out(m_output,
+    const std::string tmp_output = m_output + ".partial";
+    std::fstream out(tmp_output,
                      std::ios::binary | std::ios::out | std::ios::trunc);
     if (!out) {
-        if (m_config.verbose)
-            std::cerr << "Error: cannot open output file: " << m_output << "\n";
+        std::cerr << "Error: cannot open output file: " << tmp_output << "\n";
         return false;
     }
 
@@ -201,8 +205,16 @@ bool Processor::process() {
 
     out.flush();
     if (!out) {
-        if (m_config.verbose)
-            std::cerr << "Error: write failed.\n";
+        std::cerr << "Error: write failed.\n";
+        out.close();
+        std::remove(tmp_output.c_str());
+        return false;
+    }
+    out.close();
+
+    if (std::rename(tmp_output.c_str(), m_output.c_str()) != 0) {
+        std::cerr << "Error: could not finalize output file: " << m_output << "\n";
+        std::remove(tmp_output.c_str());
         return false;
     }
 
@@ -236,11 +248,9 @@ FLAC__StreamDecoderWriteStatus Processor::write_callback(
 }
 
 void Processor::error_callback(
-    const FLAC__StreamDecoder*, FLAC__StreamDecoderErrorStatus status, void* client_data)
+    const FLAC__StreamDecoder*, FLAC__StreamDecoderErrorStatus status, void*)
 {
-    auto* self = static_cast<Processor*>(client_data);
-    if (self->m_config.verbose)
-        std::cerr << "Decoder error: " << FLAC__StreamDecoderErrorStatusString[status] << "\n";
+    std::cerr << "Decoder error: " << FLAC__StreamDecoderErrorStatusString[status] << "\n";
 }
 
 void Processor::metadata_callback(

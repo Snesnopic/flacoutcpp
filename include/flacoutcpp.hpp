@@ -78,10 +78,10 @@ struct Config {
     /**
      * @brief Print progress and statistics to stdout during the run.
      *
-     * Set to @c false to suppress all output — useful when flacoutcpp is
-     * embedded as a library and the caller manages its own UI.
-     * Errors that cause the function to return @c false are also suppressed;
-     * the caller should rely on the return value to detect failures.
+     * Set to @c false to suppress progress/statistics output — useful when
+     * flacoutcpp is embedded as a library and the caller manages its own UI.
+     * Errors are always printed to stderr regardless of this setting, since
+     * the boolean return value alone does not say *why* encoding failed.
      */
     bool verbose = true;
 };

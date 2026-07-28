@@ -44,7 +44,8 @@ struct ProcessorConfig {
     bool exhaustive = false;
 
     /**
-     * @brief If false, suppresses all stdout/stderr output.
+     * @brief If false, suppresses progress/statistics stdout output.
+     * Errors always go to stderr regardless of this setting.
      */
     bool verbose = true;
 };

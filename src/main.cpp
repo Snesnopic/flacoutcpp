@@ -123,7 +123,7 @@ int main(int argc, char* argv[]) {
     }
 
     if (!flacoutcpp::optimise(input, output, cfg)) {
-        if (cfg.verbose) std::cerr << "Optimisation failed.\n";
+        std::cerr << "Optimisation failed.\n";
         return EXIT_FAILURE;
     }
 

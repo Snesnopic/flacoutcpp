@@ -576,7 +576,10 @@ uint32_t Optimizer::estimate_subframe_cost(
     }
 
     header += (uint32_t)order * (uint32_t)(bps - wasted); // warm-up samples
-    return header + calculate_rice_cost(residuals.data(), bsize, order, out);
+    // +6: residual block header (2-bit coding method + 4-bit partition order),
+    // written once per subframe by write_residual but not part of the
+    // per-partition cost calculate_rice_cost returns.
+    return header + 6u + calculate_rice_cost(residuals.data(), bsize, order, out);
 }
 
 // ============================================================
@@ -729,7 +732,9 @@ SubframeParams Optimizer::optimize_subframe(
                     std::memcpy(cur.q_coeffs, qc, ord * sizeof(int32_t));
 
                     uint32_t rice = calculate_rice_cost(residuals.data(), bsize, (uint32_t)ord, &cur);
-                    try_update(cur, hdr + rice);
+                    // +6: residual block header (2-bit coding method + 4-bit
+                    // partition order), see estimate_subframe_cost for detail.
+                    try_update(cur, hdr + 6u + rice);
                 }
             }
 

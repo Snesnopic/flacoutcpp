@@ -458,48 +458,63 @@ static inline uint32_t zigzag(int32_t r) {
 // Quantized-LPC residuals for one candidate, over already-wasted-bit-shifted
 // samples.
 //
-// The taps are on the outside and the sample index on the inside. The textbook
-// order — accumulate one `pred` per sample by looping over j — walks `shifted`
-// backwards with a runtime trip count into a serial int64 accumulator, which
-// does not vectorize. Swapping the loops makes both streams unit-stride with no
-// loop-carried dependency, so each tap becomes a widening multiply-accumulate
-// across several samples at once.
+// Register-blocked: a fixed batch of consecutive output samples is held in
+// accumulators while the tap loop runs over all `ord` coefficients, so the
+// partial sums never reach memory at all.
 //
-// Integer addition is associative, so reordering the accumulation is exact:
-// every partial product is the same and so is the sum. Tiled so the int64
-// partials stay in L1 instead of streaming a bsize-sized array `ord` times.
+// The obvious alternatives both lose. One `pred` per sample accumulated over j
+// walks the history backwards into a serial int64 chain that will not
+// vectorize. Hoisting the taps outside and streaming a `pred[]` array
+// vectorizes, but then every tap reloads and rewrites that whole array — with
+// ord up to 32 the array moves through the load/store units 32 times, and the
+// profile showed exactly that: 90 memory ops in the inner loop and not a single
+// widening multiply-accumulate.
 //
-// `pred` is caller-supplied scratch of at least min(tile, bsize) elements; it is
-// passed in rather than allocated here because this runs millions of times per
-// subframe.
+// Blocking the output dimension gets both properties: BLOCK independent
+// accumulators give the vectorizer something to work with, and they stay in
+// registers across the whole tap loop, so per tap the only memory traffic is
+// reading the sample history.
+//
+// Integer addition is associative, so this is exact — same partial products,
+// same sum, and in fact the same order as the original scalar version.
 static void compute_lpc_residuals(
     const int32_t* shifted, uint32_t bsize,
-    const int32_t* qc, int ord, int shift,
-    int64_t* pred, uint32_t tile, int32_t* residuals)
+    const int32_t* qc, int ord, int shift, int32_t* residuals)
 {
-    assert(ord >= 1); // tap 0 initialises each tile; there is no zeroing pass
-    for (uint32_t t = (uint32_t)ord; t < bsize; t += tile) {
-        const uint32_t n = std::min(tile, bsize - t);
-        // Tap 0 initialises the tile rather than zeroing it first. Zeroing was
-        // its own pass over an 8-byte-per-sample buffer, which for low orders
-        // cost as much as the accumulation it was preparing for.
-        {
-            const int64_t  c   = qc[0];
-            const int32_t* src = shifted + t - 1;
-            for (uint32_t x = 0; x < n; ++x)
-                pred[x] = c * (int64_t)src[x];
-        }
-        for (int j = 1; j < ord; ++j) {
+    assert(ord >= 1);
+
+    // 8 int64 accumulators = 4 128-bit registers, which leaves plenty spare for
+    // the sample history and coefficients on both NEON (32) and SSE2 (16).
+    constexpr uint32_t BLOCK = 16;
+
+    uint32_t i = (uint32_t)ord;
+    for (; i + BLOCK <= bsize; i += BLOCK) {
+        int64_t acc[BLOCK] = {};
+        for (int j = 0; j < ord; ++j) {
             const int64_t  c   = qc[j];
-            const int32_t* src = shifted + t - 1 - j;
-            for (uint32_t x = 0; x < n; ++x)
-                pred[x] += c * (int64_t)src[x];
+            const int32_t* src = shifted + i - 1 - j;
+            // Must be unrolled, or acc[] is indexed dynamically and spills.
+#if defined(__clang__)
+#  pragma unroll
+#elif defined(__GNUC__)
+#  pragma GCC unroll 16
+#endif
+            for (uint32_t k = 0; k < BLOCK; ++k) acc[k] += c * (int64_t)src[k];
         }
-        for (uint32_t x = 0; x < n; ++x)
-            residuals[t + x] = shifted[t + x] - (int32_t)(pred[x] >> shift);
+        for (uint32_t k = 0; k < BLOCK; ++k)
+            residuals[i + k] = shifted[i + k] - (int32_t)(acc[k] >> shift);
     }
+
+    // Tail: fewer than BLOCK samples left.
+    for (; i < bsize; ++i) {
+        int64_t p = 0;
+        for (int j = 0; j < ord; ++j)
+            p += (int64_t)qc[j] * (int64_t)shifted[i - 1 - j];
+        residuals[i] = shifted[i] - (int32_t)(p >> shift);
+    }
+
     // Warm-up samples are stored verbatim.
-    for (int i = 0; i < ord; ++i) residuals[i] = shifted[i];
+    for (int k = 0; k < ord; ++k) residuals[k] = shifted[k];
 }
 
 // sum(u_i >> k) is additive over disjoint ranges, so sums are computed once at the finest partition order and folded upward instead of rescanning per order.
@@ -865,11 +880,6 @@ SubframeParams Optimizer::optimize_subframe(
         std::vector<int32_t> residuals(bsize);
         float all_lpc[32][32]; // all_lpc[order-1][coeff]
 
-        // Scratch for the tiled prediction accumulator (see the residual loop
-        // below). Sized so one tile of int64 partials stays L1-resident.
-        static constexpr uint32_t PRED_TILE = 1024;
-        std::vector<int64_t> pred(std::min(PRED_TILE, bsize));
-
         // hoisted: samples[i] >> wasted was re-read for every window/order/precision combo below
         std::vector<int32_t> shifted(bsize);
         for (uint32_t i = 0; i < bsize; ++i) shifted[i] = samples[i] >> wasted;
@@ -956,7 +966,7 @@ SubframeParams Optimizer::optimize_subframe(
                 INSTR(g_instr.residual_calls.fetch_add(1, std::memory_order_relaxed));
                 INSTR(g_instr.residual_macs.fetch_add((uint64_t)(bsize - ord) * ord, std::memory_order_relaxed));
                 compute_lpc_residuals(shifted.data(), bsize, qc, ord, shift,
-                                      pred.data(), PRED_TILE, residuals.data());
+                                      residuals.data());
 
                 // Cost only — no out-params. Filling in a SubframeParams
                 // here would zero and populate ~1.3 KB (rice_k[256] alone is
@@ -1078,7 +1088,7 @@ SubframeParams Optimizer::optimize_subframe(
         // per-candidate parameter bookkeeping.
         if (bl_ord > 0) {
             compute_lpc_residuals(shifted.data(), bsize, bl_qc, bl_ord, bl_shift,
-                                  pred.data(), PRED_TILE, residuals.data());
+                                  residuals.data());
             SubframeParams cur{};
             cur.mode          = 3;
             cur.order         = bl_ord;

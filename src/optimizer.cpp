@@ -1,4 +1,5 @@
 #include "optimizer.hpp"
+#include "frame_writer.hpp"
 #include <algorithm>
 #if defined(_MSC_VER) && !defined(__clang__)
 #include <intrin.h>
@@ -25,7 +26,7 @@ struct InstrCounters {
     std::atomic<uint64_t> order_pruned_break{0};// orders skipped by hdr_min break
     std::atomic<uint64_t> prec_iters{0};        // (window,order,prec) entered
     std::atomic<uint64_t> prec_pruned_break{0};
-    std::atomic<uint64_t> overflow_skips{0};
+    std::atomic<uint64_t> overflow_skips{0};    // candidates with >=1 clamped tap (kept, not skipped)
     std::atomic<uint64_t> residual_calls{0};    // residual loops actually run
     std::atomic<uint64_t> residual_delta{0};    // of which: precision-ladder delta updates
     std::atomic<uint64_t> residual_macs{0};     // int64 multiply-accumulates (full computes only)
@@ -51,7 +52,7 @@ struct InstrCounters {
                      (unsigned long long)order_iters, (unsigned long long)order_pruned_break);
         std::fprintf(stderr, "(win,ord,prec) entered  : %llu   pruned-by-break: %llu\n",
                      (unsigned long long)prec_iters, (unsigned long long)prec_pruned_break);
-        std::fprintf(stderr, "overflow skips          : %llu\n", (unsigned long long)overflow_skips);
+        std::fprintf(stderr, "overflow clamps         : %llu\n", (unsigned long long)overflow_skips);
         std::fprintf(stderr, "residual loops run      : %llu   (delta updates: %llu)\n",
                      (unsigned long long)residual_calls, (unsigned long long)residual_delta);
         std::fprintf(stderr, "residual MACs           : %llu\n", (unsigned long long)residual_macs);
@@ -173,13 +174,14 @@ WindowType window_from_name(const std::string& raw) {
 // Optimizer constructor
 // ============================================================
 
-Optimizer::Optimizer(uint32_t channels, uint32_t bps,
+Optimizer::Optimizer(uint32_t channels, uint32_t bps, uint32_t sample_rate,
                      std::vector<WindowType> windows,
                      unsigned max_threads,
                      bool exhaustive,
                      bool verbose,
                      unsigned max_candidates)
-    : m_channels(channels), m_bps(bps), m_max_threads(max_threads),
+    : m_channels(channels), m_bps(bps), m_sample_rate(sample_rate),
+      m_max_threads(max_threads),
       m_exhaustive(exhaustive), m_verbose(verbose), m_max_candidates(max_candidates)
 {
     if (windows.empty()) {
@@ -587,18 +589,20 @@ static void compute_lpc_residuals(
 
 // Precision-ladder delta update. When the ladder steps prec -> prec+1 the
 // quantization target doubles exactly (v = lpc[j] * 2^shift, and shift grows
-// by one), so the new coefficients are qc'[j] = 2*qc[j] + d[j] with
-// d[j] = round(2v) - 2*round(v) in {-1, 0, 1} — about half of them zero.
-// The new prediction is therefore
+// by one), so the new coefficients are qc'[j] = 2*qc[j] + d[j] where d[j] is
+// a small integer near zero (exactly {-1,0,1} under independent rounding;
+// error feedback spreads it slightly wider) — many of them zero. The new
+// prediction is therefore
 //
 //     pred'[i] = 2*pred[i] + sum over nonzero d of d[j]*shifted[i-1-j]
 //
-// which replaces a full ord-tap widening multiply-accumulate with add/subs
-// over ~ord/2 taps, accumulated in int32 (twice the SIMD width): the
-// correction is bounded by ord * max|sample| <= 32 * 2^25 < 2^31, and the
-// caller guards eff_bps so that bound holds. pred itself is the exact integer
-// dot product of the new coefficients — no error accumulates across steps —
-// so the residuals are bit-identical to a full recompute.
+// which replaces a full ord-tap widening multiply-accumulate with int32
+// multiplies over the nonzero taps (twice the SIMD width of the int64 loop):
+// every partial sum of the correction is bounded by sum|d| * max|sample|,
+// and the caller only takes this path when that is < 2^31. pred itself is
+// the exact integer dot product of the new coefficients — no error
+// accumulates across steps — so the residuals are bit-identical to a full
+// recompute.
 static void update_lpc_residuals_delta(
     const int32_t* shifted, uint32_t bsize,
     const int32_t* d, int ord, int shift,
@@ -924,6 +928,93 @@ uint32_t Optimizer::calculate_rice_cost(
 
 
 // ============================================================
+// Coefficient quantization
+// ============================================================
+
+// Quantize LPC coefficients to `precision` bits (sign included), mirroring
+// FLAC__lpc_quantize_coefficients in third_party/libflac/src/libFLAC/lpc.c.
+// The two must stay in agreement or we build different predictors than the
+// format's reference encoder for the same (window, order, precision).
+//
+// Error feedback: each tap's rounding shortfall is carried into the next tap,
+// so the running sum of quantization errors stays within half an LSB. That
+// shapes the coefficient noise high-pass (a (1 - z^-1) character), where audio
+// has the least energy, instead of leaving it white — measurably better
+// predictors than rounding each tap in isolation.
+//
+// Out-of-range taps are clamped into [qmin, qmax], not treated as failure: a
+// clamped predictor is legal and may still be the best available at this
+// order. A negative shift is not representable in the format, so that branch
+// scales the coefficients down instead and emits shift = 0.
+//
+// Returns false only when no usable quantization exists (all-zero
+// coefficients, or shift below the 5-bit field's minimum). `*clamped` reports
+// whether any tap was clamped, for instrumentation.
+// floor(log2(max|lpc[j]|)), or INT32_MIN when the coefficients are all zero.
+// Computed via frexp so it may be negative when every coefficient is below 1
+// in magnitude — which *raises* the shift and quantizes more finely. Split
+// out of quantize_lpc_coeffs because it is precision-invariant: the ladder
+// sweeps 8 precisions per candidate and only this part can be hoisted.
+static int lpc_log2cmax(const float* lpc, int order)
+{
+    double cmax = 0.0;
+    for (int j = 0; j < order; ++j)
+        cmax = std::max(cmax, std::abs((double)lpc[j]));
+    if (cmax <= 0.0) return std::numeric_limits<int32_t>::min();
+    int e;
+    (void)std::frexp(cmax, &e);
+    return e - 1;
+}
+
+static bool quantize_lpc_coeffs(const float* lpc, int order, int precision,
+                                int log2cmax,
+                                int32_t* qc, int* out_shift, bool* clamped)
+{
+    if (log2cmax == std::numeric_limits<int32_t>::min())
+        return false; // all-zero coefficients
+
+    const int32_t qmax = (1 << (precision - 1)) - 1;
+    const int32_t qmin = -(1 << (precision - 1));
+
+    // 5-bit signed shift field in the subframe header.
+    constexpr int max_shiftlimit = 15;
+    constexpr int min_shiftlimit = -max_shiftlimit - 1;
+
+    int shift = (precision - 1) - log2cmax - 1;
+
+    if (shift > max_shiftlimit)
+        shift = max_shiftlimit;
+    else if (shift < min_shiftlimit)
+        return false;
+
+    *clamped = false;
+    double error = 0.0;
+    if (shift >= 0) {
+        for (int j = 0; j < order; ++j) {
+            error += (double)lpc[j] * (double)(1 << shift);
+            int32_t q = (int32_t)std::lround(error);
+            if (q > qmax)      { q = qmax; *clamped = true; }
+            else if (q < qmin) { q = qmin; *clamped = true; }
+            error -= q;
+            qc[j] = q;
+        }
+    } else {
+        const int nshift = -shift;
+        for (int j = 0; j < order; ++j) {
+            error += (double)lpc[j] / (double)(1 << nshift);
+            int32_t q = (int32_t)std::lround(error);
+            if (q > qmax)      { q = qmax; *clamped = true; }
+            else if (q < qmin) { q = qmin; *clamped = true; }
+            error -= q;
+            qc[j] = q;
+        }
+        shift = 0;
+    }
+    *out_shift = shift;
+    return true;
+}
+
+// ============================================================
 // Subframe cost (fast path — single window, used by old DP shim)
 // ============================================================
 
@@ -977,24 +1068,15 @@ uint32_t Optimizer::estimate_subframe_cost(
         float lpc[32];
         compute_lpc_coefficients(autoc, lpc, order);
 
-        // Compute shift from max coefficient magnitude (same formula as optimize_subframe)
-        double cmax = 1e-10;
-        for (int j = 0; j < order; ++j)
-            cmax = std::max(cmax, std::abs((double)lpc[j]));
-        int log2cmax = (cmax >= 1.0) ? (int)std::floor(std::log2(cmax)) : 0;
-        int shift = precision - log2cmax - 2;
-        if (shift < 0)  shift = 0;
-        if (shift > 14) shift = 14;
-
         int32_t qc[32];
-        int32_t maxq = (1 << (precision-1)) - 1;
-        int32_t minq = -(1 << (precision-1));
-        for (int j = 0; j < order; ++j) {
-            double v = lpc[j] * (double)(1 << shift);
-            int32_t qi = (int32_t)std::round(v);
-            if (qi > maxq) qi = maxq;
-            if (qi < minq) qi = minq;
-            qc[j] = qi;
+        int  shift   = 0;
+        bool clamped = false;
+        if (!quantize_lpc_coeffs(lpc, order, precision, lpc_log2cmax(lpc, order),
+                                 qc, &shift, &clamped)) {
+            // Degenerate coefficients — a zero predictor keeps the old
+            // behaviour (residual == signal) without a special-cased return.
+            std::memset(qc, 0, (size_t)order * sizeof(int32_t));
+            shift = 0;
         }
         if (out) {
             out->lpc_shift = shift;
@@ -1121,24 +1203,16 @@ SubframeParams Optimizer::optimize_subframe(
             INSTR(g_instr.order_iters.fetch_add(1, std::memory_order_relaxed));
             INSTR(g_instr.win_order_hist[ord].fetch_add(1, std::memory_order_relaxed));
 
-            // Determine quantization shift from the magnitude of the largest coefficient.
-            // This matches the libFLAC approach: shift = precision - floor(log2(max_coeff)) - 2
-            // so that quantized(max_coeff) < 2^(precision-1) without clipping.
-            double cmax = 1e-10;
-            for (int j = 0; j < ord; ++j)
-                cmax = std::max(cmax, std::abs((double)lpc[j]));
-
-            // floor(log2(cmax)) gives the position of the highest set bit.
-            int log2cmax = 0;
-            if (cmax >= 1.0)
-                log2cmax = (int)std::floor(std::log2(cmax));
-            // else cmax < 1 -> log2cmax <= -1, but we keep it at 0 so shift stays high.
+            // Precision-invariant: hoisted out of the ladder below.
+            const int log2cmax = lpc_log2cmax(lpc, ord);
 
             // Precision-ladder delta state: prev_qc/prev_shift describe the
             // coefficients pred[] currently holds the dot products of.
-            // int32 correction accumulation needs ord * max|sample| < 2^31;
-            // |sample| <= 2^(eff_bps-1) and ord <= 32, so eff_bps <= 26 is safe.
-            const bool delta_ok  = eff_bps <= 26;
+            // The int32 correction accumulator needs every partial sum within
+            // sum|d| * max|sample| < 2^31, with |sample| <= 2^(eff_bps-1) —
+            // checked per step below once sum|d| is known.
+            const int64_t max_sum_abs_d =
+                (eff_bps <= 31) ? (int64_t)(INT32_MAX >> (eff_bps - 1)) : 0;
             bool       have_pred = false;
             int        prev_shift = 0;
             int32_t    prev_qc[32];
@@ -1157,43 +1231,35 @@ SubframeParams Optimizer::optimize_subframe(
                 }
                 INSTR(g_instr.prec_iters.fetch_add(1, std::memory_order_relaxed));
 
-                // shift = (prec-1) - log2cmax - 1
-                // = prec - log2cmax - 2
-                // Ensures quantized coefficient = round(coeff * 2^shift) fits in [-(2^(prec-1)), 2^(prec-1)-1].
-                int shift = prec - log2cmax - 2;
-                if (shift < 0)  shift = 0;
-                if (shift > 14) shift = 14; // 5-bit signed: max positive value = 15, but 14 is safe
-
-                int32_t maxq = (1 << (prec-1)) - 1;
-                int32_t minq = -(1 << (prec-1));
-
-                // Quantize
+                // Quantize with error feedback (mirrors libFLAC; see
+                // quantize_lpc_coeffs). Out-of-range taps are clamped, not
+                // discarded — a clamped predictor may still win this order.
                 int32_t qc[32];
-                bool overflow = false;
-                for (int j = 0; j < ord; ++j) {
-                    double  v  = (double)lpc[j] * (double)(1 << shift);
-                    int32_t qi = (int32_t)std::round(v);
-                    if (qi > maxq || qi < minq) { overflow = true; break; }
-                    qc[j] = qi;
-                }
-                if (overflow) { INSTR(g_instr.overflow_skips.fetch_add(1, std::memory_order_relaxed)); continue; }
+                int     shift   = 0;
+                bool    clamped = false;
+                if (!quantize_lpc_coeffs(lpc, ord, prec, log2cmax, qc, &shift, &clamped))
+                    continue; // degenerate coefficients, no usable quantization
+                if (clamped) { INSTR(g_instr.overflow_skips.fetch_add(1, std::memory_order_relaxed)); }
 
                 INSTR(g_instr.residual_calls.fetch_add(1, std::memory_order_relaxed));
 
                 // One ladder step up from the coefficients pred[] was built
-                // for: apply the {-1,0,1} correction instead of recomputing.
-                // d[j] = round(2v) - 2*round(v) is in {-1,0,1} by construction
-                // whenever neither rounding clamped, and clamping skips the
-                // candidate above — the check is pure belt-and-braces.
+                // for: apply the small integer correction d[j] = qc[j] -
+                // 2*prev_qc[j] instead of recomputing. With error feedback in
+                // the quantizer the per-tap errors can exceed half an LSB, so
+                // d[j] lands in a small range around zero rather than strictly
+                // {-1,0,1}; the kernel multiplies by d[j] so any magnitude is
+                // exact — the only gate is the int32 accumulator bound, which
+                // caps sum|d| (a clamped tap can blow d up arbitrarily).
                 bool delta_done = false;
-                if (delta_ok && have_pred && shift == prev_shift + 1) {
+                if (have_pred && shift == prev_shift + 1) {
                     int32_t d[32];
-                    bool small = true;
+                    int64_t sum_abs_d = 0;
                     for (int j = 0; j < ord; ++j) {
                         d[j] = qc[j] - 2 * prev_qc[j];
-                        if (d[j] < -1 || d[j] > 1) { small = false; break; }
+                        sum_abs_d += std::abs((int64_t)d[j]);
                     }
-                    if (small) {
+                    if (sum_abs_d <= max_sum_abs_d) {
                         INSTR(g_instr.residual_delta.fetch_add(1, std::memory_order_relaxed));
                         update_lpc_residuals_delta(shifted.data(), bsize, d, ord,
                                                    shift, pred.data(), residuals.data());
@@ -1384,11 +1450,13 @@ uint32_t Optimizer::estimate_lpc_bits_fast(
     for (int i = 0; i < 8; ++i) err -= (double)coeffs[i] * autoc[i+1];
 
     uint32_t bsize = (n_end - n_start) * 16;
-    if (err <= 0) return 16 + (uint32_t)bps;
+    // +8: subframe header. Frame-level overhead is priced by the DP itself
+    // via FrameWriter::frame_bits, so it must not be baked in here too.
+    if (err <= 0) return 8 + (uint32_t)bps;
 
     double bps_est = 0.5 * std::log2(2.0 * M_PI * M_E * (err / bsize));
     if (bps_est < 1.0) bps_est = 1.0;
-    return 16u + (uint32_t)(bsize * bps_est);
+    return 8u + (uint32_t)(bsize * bps_est);
 }
 
 // ============================================================
@@ -1464,7 +1532,9 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
     // Candidates: {4096, 8192, 16384} with STEP = GCD = 4096.
     // Node i = position i*STEP in the audio.
     // Edge (i→j) = one FLAC frame covering [i*STEP, j*STEP).
-    // Cost = FRAME_OVERHEAD + exact bits from optimize_subframe (no estimates).
+    // Cost = FrameWriter::frame_bits: the exact encoded frame size, header
+    // (including the UTF-8 sample number, which grows with stream position),
+    // subframe payload, byte-alignment pad, and CRCs.
     //
     // Phase 1: build all N×K work items, evaluate ALL in parallel with a
     //          flat thread pool.  All compute_block() calls are independent
@@ -1475,8 +1545,7 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
 
     static const uint32_t CANDIDATES[]   = { 1024, 2048, 4096, 8192, 16384 };
     static const size_t   NUM_CANDS      = std::size(CANDIDATES);
-    static constexpr uint32_t STEP           = 1024u; // GCD of all candidates
-    static constexpr uint32_t FRAME_OVERHEAD = 200u;  // bits per FLAC frame header
+    static constexpr uint32_t STEP = 1024u; // GCD of all candidates
 
     const size_t   num_nodes = total_samples / STEP;
     const uint32_t remainder = (uint32_t)(total_samples % STEP);
@@ -1572,8 +1641,10 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
             size_t j = i + CANDIDATES[c] / STEP;
             if (j > num_nodes) continue;
             if ((uint64_t)i * STEP + CANDIDATES[c] > total_samples) continue;
-            uint64_t cost = dp[i] + FRAME_OVERHEAD
-                          + cost_table[i * NUM_CANDS + c].total_bits;
+            uint64_t cost = dp[i] + FrameWriter::frame_bits(
+                                        (uint64_t)i * STEP, CANDIDATES[c],
+                                        m_sample_rate,
+                                        cost_table[i * NUM_CANDS + c].total_bits);
             if (cost < dp[j]) {
                 dp[j]        = cost;
                 dp_parent[j] = (int)i;

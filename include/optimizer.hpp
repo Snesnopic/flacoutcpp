@@ -164,13 +164,14 @@ public:
      *
      * @param channels     Number of audio channels (1 or 2).
      * @param bps          Bits per sample (e.g. 16, 24).
+     * @param sample_rate  Stream sample rate in Hz (prices frame headers in the DP).
      * @param windows      Apodization windows to test.  Empty → all 26 windows.
      * @param max_threads  Worker thread limit.  0 → all logical CPUs.
      * @param max_candidates  Ranked-search budget: the number of
      *        (window, order) pairs fully evaluated per subframe.  0 (default)
      *        evaluates every pair, which is the exhaustive behaviour.
      */
-    Optimizer(uint32_t channels, uint32_t bps,
+    Optimizer(uint32_t channels, uint32_t bps, uint32_t sample_rate,
               std::vector<WindowType> windows = {},
               unsigned max_threads = 0,
               bool exhaustive = false,
@@ -260,6 +261,7 @@ private:
     // --- Member state -------------------------------------------------------
     uint32_t              m_channels;
     uint32_t              m_bps;
+    uint32_t              m_sample_rate;
     std::vector<WindowType> m_windows;
     unsigned              m_max_threads;
     bool                  m_exhaustive;

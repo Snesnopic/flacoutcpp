@@ -46,6 +46,26 @@ public:
     );
 
     /**
+     * @brief Exact encoded size of one frame, in bits: header + payload + footer.
+     *
+     * Mirrors write_frame — the two must be changed together, or the DP
+     * optimizes a different cost than the stream actually pays.
+     *
+     * @param start_sample  Absolute sample index of the frame's first sample
+     *                      (sets the UTF-8 sample-number length).
+     * @param block_size    Samples in the frame (sets the blocksize code and
+     *                      any trailing blocksize bytes).
+     * @param sample_rate   Stream sample rate in Hz (sets any trailing bytes).
+     * @param payload_bits  Total subframe bits, exact or estimated. The frame
+     *                      header is whole bytes, so the footer's pad to a byte
+     *                      boundary depends only on this value — which is why
+     *                      it is a parameter rather than a header-only return.
+     * @return              Total frame size in bits.
+     */
+    static uint32_t frame_bits(uint64_t start_sample, uint32_t block_size,
+                               uint32_t sample_rate, uint32_t payload_bits);
+
+    /**
      * @brief Serialize the 38-byte STREAMINFO metadata block.
      * 
      * @param is_last       True if this is the final metadata block before audio frames.

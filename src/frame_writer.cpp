@@ -65,6 +65,39 @@ static uint8_t samplerate_code(uint32_t sr, uint32_t& extra_val, int& extra_bits
     }
 }
 
+// Byte length of FLAC's extended UTF-8 coding for sample numbers (up to 36
+// bits, 7-byte form). Must match BitWriter::write_utf8.
+static uint32_t utf8_len(uint64_t v) {
+    if (v < 0x80ULL)        return 1;
+    if (v < 0x800ULL)       return 2;
+    if (v < 0x10000ULL)     return 3;
+    if (v < 0x200000ULL)    return 4;
+    if (v < 0x4000000ULL)   return 5;
+    if (v < 0x80000000ULL)  return 6;
+    return 7;
+}
+
+uint32_t FrameWriter::frame_bits(uint64_t start_sample, uint32_t block_size,
+                                 uint32_t sample_rate, uint32_t payload_bits)
+{
+    uint32_t extra_val; int bs_extra_bits, sr_extra_bits;
+    (void)blocksize_code(block_size, extra_val, bs_extra_bits);
+    (void)samplerate_code(sample_rate, extra_val, sr_extra_bits);
+
+    // sync+reserved+blocking(16) + bs code(4) + sr code(4)
+    // + channel assignment(4) + bps(3) + reserved(1) = 32
+    uint32_t bits = 32u
+                  + 8u * utf8_len(start_sample)
+                  + (uint32_t)bs_extra_bits
+                  + (uint32_t)sr_extra_bits
+                  + 8u;                              // CRC-8
+    // The header is a whole number of bytes by construction, so the footer's
+    // pad to a byte boundary depends only on the payload.
+    bits += payload_bits + (8u - payload_bits % 8u) % 8u;
+    bits += 16u;                                     // CRC-16
+    return bits;
+}
+
 uint8_t FrameWriter::encode_bps(uint32_t bps) {
     switch (bps) {
         case 8:  return 0x1;

@@ -4,6 +4,7 @@
 #include "md5.hpp"
 #include "FLAC/stream_decoder.h"
 #include <algorithm>
+#include <cassert>
 #include <cstdio>
 #include <fstream>
 #include <iostream>
@@ -119,7 +120,7 @@ bool Processor::process() {
     auto md5_digest = md5.digest();
 
     // --- Step 3: run optimiser ----
-    Optimizer opt(m_channels, m_bps, m_config.windows, m_config.max_threads,
+    Optimizer opt(m_channels, m_bps, m_sample_rate, m_config.windows, m_config.max_threads,
                   m_config.exhaustive, m_config.verbose, m_config.max_candidates);
     std::vector<BlockParams> blocks = opt.find_optimal_block_partitioning(m_pcm_data);
 
@@ -183,6 +184,14 @@ bool Processor::process() {
     for (const auto& block : blocks) {
         auto frame_bytes = fw.write_frame(
             block, m_pcm_data, sample_number, m_sample_rate, m_bps);
+
+        // Debug builds: the optimizer's predicted frame size must equal what
+        // the writer actually emitted, or the DP is optimizing a cost the
+        // stream does not pay. (block.total_bits is exact here — every block
+        // in the final sequence came from compute_block.)
+        assert(frame_bytes.size() * 8 ==
+               FrameWriter::frame_bits(sample_number, block.block_size,
+                                       m_sample_rate, block.total_bits));
 
         out.write(reinterpret_cast<const char*>(frame_bytes.data()),
                   (std::streamsize)frame_bytes.size());

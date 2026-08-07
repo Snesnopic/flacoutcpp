@@ -31,20 +31,23 @@ time_one() { # binary, args...  -> seconds on stdout
 # and required for scheduling changes, whose tail effects need enough DP nodes
 # to show up at all.
 case "${BENCH_SET:-quick}" in
-  quick) CASES=("-e micro" "-e micro_s24") ;;
-  full)  CASES=("-e stereo_1s" "-e mono_2s" "-e s24_2s" "stereo_4s") ;;
+  quick)  CASES=("-e micro" "-e micro_s24") ;;
+  full)   CASES=("-e stereo_1s" "-e mono_2s" "-e s24_2s" "stereo_4s") ;;
   # Real music, if you dropped some into fixtures/ (see README). The synthetic
   # fixtures are fine for timing, but anything that trades compression for speed
   # has to be judged on real content — their noise floor does not behave like
   # music. Missing fixtures are skipped, so this is safe to run either way.
-  music) CASES=("-e music_3s" "-e music_20s") ;;
-  *)     echo "error: BENCH_SET must be 'quick', 'full' or 'music'" >&2; exit 2 ;;
+  music)  CASES=("-e music_3s" "-e music_20s") ;;
+  ranked) CASES=("-c 8 music_3s" "-c 8 music_20s") ;;
+  *)      echo "error: BENCH_SET must be 'quick', 'full', 'music' or 'ranked'" >&2; exit 2 ;;
 esac
 
 printf '%-16s %10s %10s %8s   %s\n' CASE "$(basename "$A")" "$(basename "$B")" SPEEDUP OUTPUT
 for case in "${CASES[@]}"; do
+  # Last word is the fixture; everything before it is encoder flags.
   set -- $case
-  if [ "$1" = "-e" ]; then flags=-e; fixture=$2; else flags=""; fixture=$1; fi
+  fixture=${!#}
+  flags=${case% $fixture}; [ "$flags" = "$fixture" ] && flags=""
   [ -f "$FIX/$fixture.flac" ] || { echo "  skip $fixture (missing fixture)"; continue; }
 
   ta=999; tb=999
@@ -55,6 +58,6 @@ for case in "${CASES[@]}"; do
     tb=$(awk -v x="$tb" -v y="$t" 'BEGIN{print (y<x)?y:x}')
   done
   cmp -s "$TMP/a.flac" "$TMP/b.flac" && same=identical || same="DIFFERS ($(wc -c <"$TMP/a.flac"|tr -d ' ') -> $(wc -c <"$TMP/b.flac"|tr -d ' '))"
-  awk -v n="${flags:+-e }$fixture" -v a="$ta" -v b="$tb" -v s="$same" \
+  awk -v n="${flags:+$flags }$fixture" -v a="$ta" -v b="$tb" -v s="$same" \
       'BEGIN{printf "%-16s %9.2fs %9.2fs %7.2fx   %s\n", n, a, b, a/b, s}'
 done

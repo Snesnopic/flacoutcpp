@@ -29,6 +29,8 @@ struct InstrCounters {
     std::atomic<uint64_t> rice_scan_samples{0}; // residuals scanned in sums pass
     std::atomic<uint64_t> rice_k_ops{0};        // (u>>k) accumulations
     std::atomic<uint64_t> rice_fold_ops{0};
+    std::atomic<uint64_t> rice_chunk_fast{0};  // 32-bit lane accumulation held
+    std::atomic<uint64_t> rice_chunk_slow{0};  // OR proved it could wrap; redone in 64-bit
     std::atomic<uint64_t> autoc_macs{0};
     std::atomic<uint64_t> window_samples{0};
     std::atomic<uint64_t> win_order_hist[33]{};
@@ -52,6 +54,11 @@ struct InstrCounters {
         std::fprintf(stderr, "rice residuals scanned  : %llu\n", (unsigned long long)rice_scan_samples);
         std::fprintf(stderr, "rice (u>>k) ops         : %llu\n", (unsigned long long)rice_k_ops);
         std::fprintf(stderr, "rice fold ops           : %llu\n", (unsigned long long)rice_fold_ops);
+        {
+            unsigned long long f = rice_chunk_fast, sl = rice_chunk_slow;
+            std::fprintf(stderr, "rice chunks fast/slow   : %llu / %llu (%.4f%% fell back)\n",
+                         f, sl, (f + sl) ? 100.0 * (double)sl / (double)(f + sl) : 0.0);
+        }
         std::fprintf(stderr, "WINNING order histogram:\n");
         for (int i = 1; i <= 32; ++i)
             if (best_order_hist[i]) std::fprintf(stderr, "   ord %2d: %llu\n", i, (unsigned long long)best_order_hist[i]);
@@ -461,10 +468,19 @@ static void compute_lpc_residuals(
     const int32_t* qc, int ord, int shift,
     int64_t* pred, uint32_t tile, int32_t* residuals)
 {
+    assert(ord >= 1); // tap 0 initialises each tile; there is no zeroing pass
     for (uint32_t t = (uint32_t)ord; t < bsize; t += tile) {
         const uint32_t n = std::min(tile, bsize - t);
-        for (uint32_t x = 0; x < n; ++x) pred[x] = 0;
-        for (int j = 0; j < ord; ++j) {
+        // Tap 0 initialises the tile rather than zeroing it first. Zeroing was
+        // its own pass over an 8-byte-per-sample buffer, which for low orders
+        // cost as much as the accumulation it was preparing for.
+        {
+            const int64_t  c   = qc[0];
+            const int32_t* src = shifted + t - 1;
+            for (uint32_t x = 0; x < n; ++x)
+                pred[x] = c * (int64_t)src[x];
+        }
+        for (int j = 1; j < ord; ++j) {
             const int64_t  c   = qc[j];
             const int32_t* src = shifted + t - 1 - j;
             for (uint32_t x = 0; x < n; ++x)
@@ -519,36 +535,40 @@ uint32_t Optimizer::calculate_rice_cost(
         uint64_t* s = sums[p];
         for (int k = 0; k < NUM_K; ++k) s[k] = 0;
 
-        // Pass 1: zigzag-fold and take the maximum. Folded u is 2*|r| for r>=0
-        // and 2*|r|-1 for r<0, so the |r| the escape-code path wants is u>>1 —
-        // no separate max-abs reduction needed. This loop is a plain max
-        // reduction over unit-stride data and vectorizes on its own.
-        uint32_t mu = 0;
-        for (uint32_t i = first; i < end; ++i) {
-            uint32_t u = zigzag(residuals[i]);
-            if (u > mu) mu = u;
-        }
-        uint32_t mabs = mu >> 1;
-
-        // Pass 2: the 15 partial sums. Accumulating in 32-bit lanes lets each
-        // (s[k] += u >> k) become a single shift-right-and-accumulate, four
-        // residuals at a time, instead of 15 dependent 64-bit adds per
-        // residual. 32-bit lanes can only absorb 0xFFFFFFFF/mu residuals before
-        // s[0] (the largest of the 15) could wrap, so the range is walked in
-        // chunks of that size and widened into the 64-bit sums between chunks.
-        // For real audio mu is small enough that `cap` exceeds any legal block
-        // size and the widening happens exactly once.
-        const uint32_t cap = mu ? (uint32_t)std::min<uint64_t>(0xFFFFFFFFull / mu,
-                                                               0xFFFFFFFFull)
-                                : 0xFFFFFFFFu;
+        // One pass computing both the magnitude bound and the 15 partial sums.
+        //
+        // The bound is an OR of every folded residual, not a maximum. Only the
+        // position of its highest set bit is ever used — `< (1u << 30)` and the
+        // escape-code bit-width search below both depend on nothing else — and
+        // OR has the same highest set bit as max, because every u contributes
+        // its bits. OR is also what makes the overflow test below cheap: since
+        // each u's bits are a subset of the OR, u <= or_all, so `count * or_all`
+        // bounds the accumulated sum. Folded u is 2*|r| for r>=0 and 2*|r|-1
+        // for r<0, so the |r| the escape path wants is u >> 1.
+        //
+        // Accumulating in 32-bit lanes lets each (s[k] += u >> k) become a
+        // single shift-right-and-accumulate over four residuals at a time,
+        // rather than 15 dependent 64-bit adds per residual. 32-bit lanes hold
+        // at most 0xFFFFFFFF, so the range is walked in fixed chunks and widened
+        // into the 64-bit sums between them. The chunk bound cannot be computed
+        // up front without a separate maximum pass, so instead each chunk is
+        // accumulated optimistically and re-run in 64-bit on the rare occasion
+        // the OR proves it could have wrapped.
+        static constexpr uint32_t CHUNK = 1024;
+        uint32_t or_all = 0;
         for (uint32_t base = first; base < end; ) {
-            const uint32_t stop = (cap >= end - base) ? end : base + cap;
+            const uint32_t stop = std::min(base + CHUNK, end);
+            const uint32_t cnt  = stop - base;
+            uint32_t or_chunk = 0;
+            uint32_t part[NUM_K];
             uint32_t i = base;
 #if FLACOUT_HAVE_VECEXT
             u32x4 acc[NUM_K] = {};
+            u32x4 orv = {};
             for (; i + 4 <= stop; i += 4) {
                 const u32x4 u = { zigzag(residuals[i]),     zigzag(residuals[i + 1]),
                                   zigzag(residuals[i + 2]), zigzag(residuals[i + 3]) };
+                orv |= u;
                 // Must be fully unrolled: `k` has to be a constant for each
                 // shift to fold into the accumulate.
 #  if defined(__clang__)
@@ -561,20 +581,37 @@ uint32_t Optimizer::calculate_rice_cost(
             uint32_t tail[NUM_K] = {};
             for (; i < stop; ++i) {
                 const uint32_t u = zigzag(residuals[i]);
+                or_chunk |= u;
                 for (int k = 0; k < NUM_K; ++k) tail[k] += u >> k;
             }
+            or_chunk |= orv[0] | orv[1] | orv[2] | orv[3];
             for (int k = 0; k < NUM_K; ++k)
-                s[k] += (uint64_t)acc[k][0] + acc[k][1] + acc[k][2] + acc[k][3] + tail[k];
+                part[k] = acc[k][0] + acc[k][1] + acc[k][2] + acc[k][3] + tail[k];
 #else
-            uint32_t acc[NUM_K] = {};
+            for (int k = 0; k < NUM_K; ++k) part[k] = 0;
             for (; i < stop; ++i) {
                 const uint32_t u = zigzag(residuals[i]);
-                for (int k = 0; k < NUM_K; ++k) acc[k] += u >> k;
+                or_chunk |= u;
+                for (int k = 0; k < NUM_K; ++k) part[k] += u >> k;
             }
-            for (int k = 0; k < NUM_K; ++k) s[k] += acc[k];
 #endif
+            // part[] is only trustworthy if no lane could have wrapped. part[0]
+            // is the largest of the 15, and is bounded by cnt * or_chunk.
+            if ((uint64_t)cnt * or_chunk <= 0xFFFFFFFFull) {
+                INSTR(g_instr.rice_chunk_fast.fetch_add(1, std::memory_order_relaxed));
+                for (int k = 0; k < NUM_K; ++k) s[k] += part[k];
+            } else {
+                INSTR(g_instr.rice_chunk_slow.fetch_add(1, std::memory_order_relaxed));
+                for (uint32_t j = base; j < stop; ++j) {
+                    const uint32_t u = zigzag(residuals[j]);
+                    for (int k = 0; k < NUM_K; ++k) s[k] += (u >> k);
+                }
+            }
+            or_all |= or_chunk;
             base = stop;
         }
+        const uint32_t mabs = or_all >> 1;
+
         n_res[p]        = (first < end) ? (end - first) : 0;
         max_abs_arr[p]  = mabs;
     }

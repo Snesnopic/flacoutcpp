@@ -23,10 +23,21 @@ gen() { # outfile, extra ffmpeg args...
   ffmpeg -y -loglevel error -f lavfi -i "$SRC" "$@" -c:a flac "$OUT/$out"
 }
 
+# Correctness fixtures (check.sh). Long enough to span several DP nodes and
+# exercise more than one block size.
 gen stereo_1s.flac  -t 1  -ac 2 -sample_fmt s16
 gen stereo_4s.flac  -t 4  -ac 2 -sample_fmt s16
 gen mono_2s.flac    -t 2  -ac 1 -sample_fmt s16
 gen s24_2s.flac     -t 2  -ac 2 -sample_fmt s32 -bits_per_raw_sample 24
 gen short.flac      -t 0.01 -ac 2 -sample_fmt s16   # < 1024 samples: short-stream path
+
+# Micro fixtures (compare.sh default). ~0.25 s, so an exhaustive A/B round trip
+# is seconds rather than minutes — short enough to keep in the edit/measure
+# loop. Still 10 DP nodes, so the parallel phase is real work rather than one
+# block on one thread. Use the longer fixtures above to confirm anything that
+# looks like a win here, especially for scheduling changes: tail effects barely
+# show up at this size.
+gen micro.flac      -t 0.25 -ac 2 -sample_fmt s16
+gen micro_s24.flac  -t 0.25 -ac 2 -sample_fmt s32 -bits_per_raw_sample 24
 
 ls -l "$OUT"

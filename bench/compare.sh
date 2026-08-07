@@ -26,8 +26,18 @@ time_one() { # binary, args...  -> seconds on stdout
   { /usr/bin/time -p "$bin" "$@" >/dev/null; } 2>&1 | awk '/^real/{t=$2} END{print t+0}'
 }
 
+# Default to the ~0.25 s micro fixtures so an A/B is seconds, not minutes.
+# BENCH_SET=full for the longer ones — worth doing before believing any result,
+# and required for scheduling changes, whose tail effects need enough DP nodes
+# to show up at all.
+case "${BENCH_SET:-quick}" in
+  quick) CASES=("-e micro" "-e micro_s24") ;;
+  full)  CASES=("-e stereo_1s" "-e mono_2s" "-e s24_2s" "stereo_4s") ;;
+  *)     echo "error: BENCH_SET must be 'quick' or 'full'" >&2; exit 2 ;;
+esac
+
 printf '%-16s %10s %10s %8s   %s\n' CASE "$(basename "$A")" "$(basename "$B")" SPEEDUP OUTPUT
-for case in "-e stereo_1s" "-e mono_2s" "-e s24_2s" "stereo_4s"; do
+for case in "${CASES[@]}"; do
   set -- $case
   if [ "$1" = "-e" ]; then flags=-e; fixture=$2; else flags=""; fixture=$1; fi
   [ -f "$FIX/$fixture.flac" ] || { echo "  skip $fixture (missing fixture)"; continue; }

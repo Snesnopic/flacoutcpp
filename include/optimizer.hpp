@@ -214,7 +214,9 @@ private:
     /// @cond INTERNAL
 
     // --- DP fast-path helpers (granule-based autocorrelation cache) ----------
-    struct Granule { double autoc[33]; }; ///< Cached autocorrelation for one 1024-sample granule.
+    // Lags 0..8 only: estimate_lpc_bits_fast runs Levinson at fixed order 8,
+    // which never reads past autoc[8].
+    struct Granule { double autoc[9]; }; ///< Cached autocorrelation for one 16-sample granule.
     std::vector<std::vector<Granule>> m_granules;
     void precompute_granules(const std::vector<std::vector<int32_t>>& pcm_data);
     [[nodiscard]] uint32_t estimate_lpc_bits_fast(int channel,

@@ -1495,7 +1495,7 @@ void Optimizer::precompute_granules(
     for (uint32_t c = 0; c < m_channels; ++c)
         for (size_t g = 0; g < num_g; ++g) {
             const int32_t* src = &pcm_data[c][g * 16];
-            for (int i = 0; i <= 32; ++i) {
+            for (int i = 0; i <= 8; ++i) {
                 double s = 0;
                 for (int j = 0; j < 16 - i; ++j) s += (double)src[j] * src[j+i];
                 m_granules[c][g].autoc[i] = s;
@@ -1506,9 +1506,9 @@ void Optimizer::precompute_granules(
 uint32_t Optimizer::estimate_lpc_bits_fast(
     int channel, uint32_t n_start, uint32_t n_end, int bps) const
 {
-    double autoc[33] = {};
+    double autoc[9] = {};
     for (uint32_t g = n_start; g < n_end; ++g)
-        for (int i = 0; i <= 32; ++i)
+        for (int i = 0; i <= 8; ++i)
             autoc[i] += m_granules[channel][g].autoc[i];
 
     float coeffs[32];

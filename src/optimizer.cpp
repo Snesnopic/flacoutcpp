@@ -1,5 +1,8 @@
 #include "optimizer.hpp"
 #include <algorithm>
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>
+#endif
 #include <atomic>
 #include <cassert>
 #include <cmath>
@@ -24,7 +27,8 @@ struct InstrCounters {
     std::atomic<uint64_t> prec_pruned_break{0};
     std::atomic<uint64_t> overflow_skips{0};
     std::atomic<uint64_t> residual_calls{0};    // residual loops actually run
-    std::atomic<uint64_t> residual_macs{0};     // int64 multiply-accumulates
+    std::atomic<uint64_t> residual_delta{0};    // of which: precision-ladder delta updates
+    std::atomic<uint64_t> residual_macs{0};     // int64 multiply-accumulates (full computes only)
     std::atomic<uint64_t> rice_calls{0};
     std::atomic<uint64_t> rice_scan_samples{0}; // residuals scanned in sums pass
     std::atomic<uint64_t> rice_k_ops{0};        // (u>>k) accumulations
@@ -48,7 +52,8 @@ struct InstrCounters {
         std::fprintf(stderr, "(win,ord,prec) entered  : %llu   pruned-by-break: %llu\n",
                      (unsigned long long)prec_iters, (unsigned long long)prec_pruned_break);
         std::fprintf(stderr, "overflow skips          : %llu\n", (unsigned long long)overflow_skips);
-        std::fprintf(stderr, "residual loops run      : %llu\n", (unsigned long long)residual_calls);
+        std::fprintf(stderr, "residual loops run      : %llu   (delta updates: %llu)\n",
+                     (unsigned long long)residual_calls, (unsigned long long)residual_delta);
         std::fprintf(stderr, "residual MACs           : %llu\n", (unsigned long long)residual_macs);
         std::fprintf(stderr, "rice calls              : %llu\n", (unsigned long long)rice_calls);
         std::fprintf(stderr, "rice residuals scanned  : %llu\n", (unsigned long long)rice_scan_samples);
@@ -445,6 +450,19 @@ void Optimizer::compute_lpc_coefficients(const double* autoc, float* out, int or
 #if defined(__clang__) || defined(__GNUC__)
 #  define FLACOUT_HAVE_VECEXT 1
 typedef uint32_t u32x4 __attribute__((vector_size(16)));
+
+// Pairwise horizontal add: lane i of the result is the sum of lanes 2i, 2i+1
+// of (a ++ b). Both compilers lower this shuffle+add pattern to a single
+// pairwise-add instruction where one exists (NEON addp, SSSE3 phaddd).
+static inline u32x4 hadd_pairs(u32x4 a, u32x4 b) {
+#if defined(__clang__)
+    return __builtin_shufflevector(a, b, 0, 2, 4, 6)
+         + __builtin_shufflevector(a, b, 1, 3, 5, 7);
+#else
+    return __builtin_shuffle(a, b, (u32x4){0, 2, 4, 6})
+         + __builtin_shuffle(a, b, (u32x4){1, 3, 5, 7});
+#endif
+}
 #else
 #  define FLACOUT_HAVE_VECEXT 0
 #endif
@@ -525,7 +543,8 @@ static void autocorrelation(
 
 static void compute_lpc_residuals(
     const int32_t* shifted, uint32_t bsize,
-    const int32_t* qc, int ord, int shift, int32_t* residuals)
+    const int32_t* qc, int ord, int shift, int32_t* residuals,
+    int64_t* pred_out = nullptr)
 {
     assert(ord >= 1);
 
@@ -547,6 +566,8 @@ static void compute_lpc_residuals(
 #endif
             for (uint32_t k = 0; k < BLOCK; ++k) acc[k] += c * (int64_t)src[k];
         }
+        if (pred_out)
+            for (uint32_t k = 0; k < BLOCK; ++k) pred_out[i + k] = acc[k];
         for (uint32_t k = 0; k < BLOCK; ++k)
             residuals[i + k] = shifted[i + k] - (int32_t)(acc[k] >> shift);
     }
@@ -556,11 +577,73 @@ static void compute_lpc_residuals(
         int64_t p = 0;
         for (int j = 0; j < ord; ++j)
             p += (int64_t)qc[j] * (int64_t)shifted[i - 1 - j];
+        if (pred_out) pred_out[i] = p;
         residuals[i] = shifted[i] - (int32_t)(p >> shift);
     }
 
     // Warm-up samples are stored verbatim.
     for (int k = 0; k < ord; ++k) residuals[k] = shifted[k];
+}
+
+// Precision-ladder delta update. When the ladder steps prec -> prec+1 the
+// quantization target doubles exactly (v = lpc[j] * 2^shift, and shift grows
+// by one), so the new coefficients are qc'[j] = 2*qc[j] + d[j] with
+// d[j] = round(2v) - 2*round(v) in {-1, 0, 1} — about half of them zero.
+// The new prediction is therefore
+//
+//     pred'[i] = 2*pred[i] + sum over nonzero d of d[j]*shifted[i-1-j]
+//
+// which replaces a full ord-tap widening multiply-accumulate with add/subs
+// over ~ord/2 taps, accumulated in int32 (twice the SIMD width): the
+// correction is bounded by ord * max|sample| <= 32 * 2^25 < 2^31, and the
+// caller guards eff_bps so that bound holds. pred itself is the exact integer
+// dot product of the new coefficients — no error accumulates across steps —
+// so the residuals are bit-identical to a full recompute.
+static void update_lpc_residuals_delta(
+    const int32_t* shifted, uint32_t bsize,
+    const int32_t* d, int ord, int shift,
+    int64_t* pred, int32_t* residuals)
+{
+    // Gather the nonzero taps once; the sample loops only touch those.
+    int     tap_off [32];
+    int32_t tap_sign[32];
+    int nnz = 0;
+    for (int j = 0; j < ord; ++j)
+        if (d[j]) { tap_off[nnz] = j; tap_sign[nnz] = d[j]; ++nnz; }
+
+    // Wider than the int64 loop's 16: int32 accumulators are half the size, so
+    // 32 still fits in 8 vector registers, and the extra independent chains
+    // cover the multiply-accumulate latency the serial per-lane adds expose.
+    constexpr uint32_t BLOCK = 32;
+
+    uint32_t i = (uint32_t)ord;
+    for (; i + BLOCK <= bsize; i += BLOCK) {
+        int32_t corr[BLOCK] = {};
+        for (int t = 0; t < nnz; ++t) {
+            const int32_t  c   = tap_sign[t];
+            const int32_t* src = shifted + i - 1 - tap_off[t];
+#if defined(__clang__)
+#  pragma unroll
+#elif defined(__GNUC__)
+#  pragma GCC unroll 32
+#endif
+            for (uint32_t k = 0; k < BLOCK; ++k) corr[k] += c * src[k];
+        }
+        for (uint32_t k = 0; k < BLOCK; ++k) {
+            const int64_t p = 2 * pred[i + k] + (int64_t)corr[k];
+            pred[i + k] = p;
+            residuals[i + k] = shifted[i + k] - (int32_t)(p >> shift);
+        }
+    }
+
+    for (; i < bsize; ++i) {
+        int64_t p = 2 * pred[i];
+        for (int t = 0; t < nnz; ++t)
+            p += (int64_t)tap_sign[t] * (int64_t)shifted[i - 1 - tap_off[t]];
+        pred[i] = p;
+        residuals[i] = shifted[i] - (int32_t)(p >> shift);
+    }
+    // Warm-up residuals are already in place from the full compute.
 }
 
 // sum(u_i >> k) is additive over disjoint ranges, so sums are computed once at the finest partition order and folded upward instead of rescanning per order.
@@ -603,7 +686,8 @@ uint32_t Optimizer::calculate_rice_cost(
         uint32_t first = std::max(start, order); // skip warm-up in partition 0
 
         uint64_t* s = sums[p];
-        for (int k = 0; k < NUM_K; ++k) s[k] = 0;
+        // The chunked path below accumulates into s[] and needs it zeroed; the
+        // single-chunk fast path writes each s[k] exactly once and does not.
 
         // One pass computing both the magnitude bound and the 15 partial sums.
         //
@@ -626,6 +710,66 @@ uint32_t Optimizer::calculate_rice_cost(
         // the OR proves it could have wrapped.
         static constexpr uint32_t CHUNK = 1024;
         uint32_t or_all = 0;
+
+#if FLACOUT_HAVE_VECEXT
+        // Single-chunk fast path. For power-of-two block sizes — every DP
+        // candidate — the finest partition is at most 64 residuals, so this is
+        // the path every partition of every candidate actually takes; the
+        // chunked loop below only ever runs for the odd-sized remainder block.
+        // With so few residuals per partition the bookkeeping around the scan
+        // costs as much as the scan, so this path strips it down: no zeroed
+        // u64 sums to read-modify-write, no part[] staging, and the fifteen
+        // per-lane reductions collapse into a pairwise-add tree whose u64
+        // widening lands directly in sums[p].
+        if (end - first <= CHUNK) {
+            const uint32_t cnt = end - first;
+            u32x4 acc[16] = {}; // 16th stays zero: pads the reduction tree
+            u32x4 orv = {};
+            uint32_t i = first;
+            for (; i + 4 <= end; i += 4) {
+                const u32x4 u = { zigzag(residuals[i]),     zigzag(residuals[i + 1]),
+                                  zigzag(residuals[i + 2]), zigzag(residuals[i + 3]) };
+                orv |= u;
+#  if defined(__clang__)
+#    pragma unroll
+#  elif defined(__GNUC__)
+#    pragma GCC unroll 15
+#  endif
+                for (int k = 0; k < NUM_K; ++k) acc[k] += u >> k;
+            }
+            uint32_t tail[16] = {};
+            uint32_t or_tail = 0;
+            for (; i < end; ++i) {
+                const uint32_t u = zigzag(residuals[i]);
+                or_tail |= u;
+                for (int k = 0; k < NUM_K; ++k) tail[k] += u >> k;
+            }
+            or_all = or_tail | orv[0] | orv[1] | orv[2] | orv[3];
+
+            if ((uint64_t)cnt * or_all <= 0xFFFFFFFFull) {
+                INSTR(g_instr.rice_chunk_fast.fetch_add(1, std::memory_order_relaxed));
+                for (int k = 0; k < NUM_K; k += 4) {
+                    // r = [sum(acc[k]), sum(acc[k+1]), sum(acc[k+2]), sum(acc[k+3])]
+                    const u32x4 r = hadd_pairs(hadd_pairs(acc[k],     acc[k + 1]),
+                                               hadd_pairs(acc[k + 2], acc[k + 3]));
+                    for (int j = 0; j < 4 && k + j < NUM_K; ++j)
+                        s[k + j] = (uint64_t)r[j] + tail[k + j];
+                }
+            } else {
+                INSTR(g_instr.rice_chunk_slow.fetch_add(1, std::memory_order_relaxed));
+                for (int k = 0; k < NUM_K; ++k) s[k] = 0;
+                for (uint32_t j = first; j < end; ++j) {
+                    const uint32_t u = zigzag(residuals[j]);
+                    for (int k = 0; k < NUM_K; ++k) s[k] += (u >> k);
+                }
+            }
+
+            n_res[p]       = cnt;
+            max_abs_arr[p] = or_all >> 1;
+            continue;
+        }
+#endif
+        for (int k = 0; k < NUM_K; ++k) s[k] = 0;
         for (uint32_t base = first; base < end; ) {
             const uint32_t stop = std::min(base + CHUNK, end);
             const uint32_t cnt  = stop - base;
@@ -707,9 +851,17 @@ uint32_t Optimizer::calculate_rice_cost(
             int      best_k = 0;
 
             // --- Try Rice parameters k = 0..14 ---
+            // bits(k) is exactly convex in k: s[k] = 2*s[k+1] + (count of
+            // residuals with bit k set), so the forward difference
+            // bits(k+1) - bits(k) = n - s[k+1] - o_k is nondecreasing in k.
+            // Scanning ascending, the running best is bits(k-1) until the
+            // minimum is passed, so the first k that fails to improve proves
+            // every later k is no better — stop there. Strict '<' keeps the
+            // smallest k on ties, exactly like the full scan did.
             for (int k = 0; k < NUM_K; ++k) {
                 uint64_t bits = (uint64_t)n * (1 + k) + s[k];
                 if (bits < best_k_bits) { best_k_bits = bits; best_k = k; }
+                else break;
             }
 
             // --- Try Rice escape code (k=15): verbatim residuals ---
@@ -719,8 +871,15 @@ uint32_t Optimizer::calculate_rice_cost(
             // such limit) is chosen instead.
             if (max_abs_arr[p] < (1u << 30)) {
                 uint32_t max_abs = max_abs_arr[p];
-                int escape_bps = 1;
-                while (escape_bps < 31 && (1u << (escape_bps - 1)) <= max_abs) ++escape_bps;
+                // Smallest width whose sign bit clears max_abs: 2 + floor(log2)
+                // for nonzero values, 1 for zero — same result the old
+                // increment loop produced, in one bit-scan.
+#if defined(_MSC_VER) && !defined(__clang__)
+                unsigned long hi;
+                int escape_bps = _BitScanReverse(&hi, max_abs) ? (int)hi + 2 : 1;
+#else
+                int escape_bps = max_abs ? 33 - __builtin_clz(max_abs) : 1;
+#endif
 
                 uint64_t escape_bits = 5ull + (uint64_t)escape_bps * n;
                 if (escape_bits < best_k_bits) {
@@ -924,6 +1083,7 @@ SubframeParams Optimizer::optimize_subframe(
     if (bsize >= 2) {
         std::vector<double> windowed(bsize);
         std::vector<int32_t> residuals(bsize);
+        std::vector<int64_t> pred(bsize); // unshifted predictions, for the precision-ladder delta
         float all_lpc[32][32]; // all_lpc[order-1][coeff]
 
         // hoisted: samples[i] >> wasted was re-read for every window/order/precision combo below
@@ -974,6 +1134,15 @@ SubframeParams Optimizer::optimize_subframe(
                 log2cmax = (int)std::floor(std::log2(cmax));
             // else cmax < 1 -> log2cmax <= -1, but we keep it at 0 so shift stays high.
 
+            // Precision-ladder delta state: prev_qc/prev_shift describe the
+            // coefficients pred[] currently holds the dot products of.
+            // int32 correction accumulation needs ord * max|sample| < 2^31;
+            // |sample| <= 2^(eff_bps-1) and ord <= 32, so eff_bps <= 26 is safe.
+            const bool delta_ok  = eff_bps <= 26;
+            bool       have_pred = false;
+            int        prev_shift = 0;
+            int32_t    prev_qc[32];
+
 #ifdef FLACOUT_INSTRUMENT
             int prec_idx = 0;
 #endif
@@ -1010,9 +1179,35 @@ SubframeParams Optimizer::optimize_subframe(
                 if (overflow) { INSTR(g_instr.overflow_skips.fetch_add(1, std::memory_order_relaxed)); continue; }
 
                 INSTR(g_instr.residual_calls.fetch_add(1, std::memory_order_relaxed));
-                INSTR(g_instr.residual_macs.fetch_add((uint64_t)(bsize - ord) * ord, std::memory_order_relaxed));
-                compute_lpc_residuals(shifted.data(), bsize, qc, ord, shift,
-                                      residuals.data());
+
+                // One ladder step up from the coefficients pred[] was built
+                // for: apply the {-1,0,1} correction instead of recomputing.
+                // d[j] = round(2v) - 2*round(v) is in {-1,0,1} by construction
+                // whenever neither rounding clamped, and clamping skips the
+                // candidate above — the check is pure belt-and-braces.
+                bool delta_done = false;
+                if (delta_ok && have_pred && shift == prev_shift + 1) {
+                    int32_t d[32];
+                    bool small = true;
+                    for (int j = 0; j < ord; ++j) {
+                        d[j] = qc[j] - 2 * prev_qc[j];
+                        if (d[j] < -1 || d[j] > 1) { small = false; break; }
+                    }
+                    if (small) {
+                        INSTR(g_instr.residual_delta.fetch_add(1, std::memory_order_relaxed));
+                        update_lpc_residuals_delta(shifted.data(), bsize, d, ord,
+                                                   shift, pred.data(), residuals.data());
+                        delta_done = true;
+                    }
+                }
+                if (!delta_done) {
+                    INSTR(g_instr.residual_macs.fetch_add((uint64_t)(bsize - ord) * ord, std::memory_order_relaxed));
+                    compute_lpc_residuals(shifted.data(), bsize, qc, ord, shift,
+                                          residuals.data(), pred.data());
+                }
+                std::memcpy(prev_qc, qc, (size_t)ord * sizeof(int32_t));
+                prev_shift = shift;
+                have_pred  = true;
 
                 // Cost only — no out-params. Filling in a SubframeParams
                 // here would zero and populate ~1.3 KB (rice_k[256] alone is

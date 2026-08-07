@@ -5,3 +5,8 @@ build*/
 *.log
 .idea/
 a.out
+
+# bench/ working dirs (fixtures + reference snapshots are regenerable)
+bench/fixtures/
+bench/reference/
+bench/.current/

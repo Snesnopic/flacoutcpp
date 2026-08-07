@@ -13,6 +13,64 @@
 #include <thread>
 #include <vector>
 
+#ifdef FLACOUT_INSTRUMENT
+#include <cstdio>
+struct InstrCounters {
+    std::atomic<uint64_t> subframes{0};
+    std::atomic<uint64_t> windows_run{0};
+    std::atomic<uint64_t> order_iters{0};       // (window,order) pairs entered
+    std::atomic<uint64_t> order_pruned_break{0};// orders skipped by hdr_min break
+    std::atomic<uint64_t> prec_iters{0};        // (window,order,prec) entered
+    std::atomic<uint64_t> prec_pruned_break{0};
+    std::atomic<uint64_t> overflow_skips{0};
+    std::atomic<uint64_t> residual_calls{0};    // residual loops actually run
+    std::atomic<uint64_t> residual_macs{0};     // int64 multiply-accumulates
+    std::atomic<uint64_t> rice_calls{0};
+    std::atomic<uint64_t> rice_scan_samples{0}; // residuals scanned in sums pass
+    std::atomic<uint64_t> rice_k_ops{0};        // (u>>k) accumulations
+    std::atomic<uint64_t> rice_fold_ops{0};
+    std::atomic<uint64_t> autoc_macs{0};
+    std::atomic<uint64_t> window_samples{0};
+    std::atomic<uint64_t> win_order_hist[33]{};
+    std::atomic<uint64_t> best_order_hist[33]{};
+    std::atomic<uint64_t> best_prec_hist[16]{};
+    std::atomic<uint64_t> best_window_hist[32]{};
+    ~InstrCounters() {
+        std::fprintf(stderr, "\n===== INSTRUMENTATION =====\n");
+        std::fprintf(stderr, "subframes optimized     : %llu\n", (unsigned long long)subframes);
+        std::fprintf(stderr, "windows evaluated       : %llu\n", (unsigned long long)windows_run);
+        std::fprintf(stderr, "window samples          : %llu\n", (unsigned long long)window_samples);
+        std::fprintf(stderr, "autocorrelation MACs    : %llu\n", (unsigned long long)autoc_macs);
+        std::fprintf(stderr, "(win,ord) entered       : %llu   pruned-by-break: %llu\n",
+                     (unsigned long long)order_iters, (unsigned long long)order_pruned_break);
+        std::fprintf(stderr, "(win,ord,prec) entered  : %llu   pruned-by-break: %llu\n",
+                     (unsigned long long)prec_iters, (unsigned long long)prec_pruned_break);
+        std::fprintf(stderr, "overflow skips          : %llu\n", (unsigned long long)overflow_skips);
+        std::fprintf(stderr, "residual loops run      : %llu\n", (unsigned long long)residual_calls);
+        std::fprintf(stderr, "residual MACs           : %llu\n", (unsigned long long)residual_macs);
+        std::fprintf(stderr, "rice calls              : %llu\n", (unsigned long long)rice_calls);
+        std::fprintf(stderr, "rice residuals scanned  : %llu\n", (unsigned long long)rice_scan_samples);
+        std::fprintf(stderr, "rice (u>>k) ops         : %llu\n", (unsigned long long)rice_k_ops);
+        std::fprintf(stderr, "rice fold ops           : %llu\n", (unsigned long long)rice_fold_ops);
+        std::fprintf(stderr, "WINNING order histogram:\n");
+        for (int i = 1; i <= 32; ++i)
+            if (best_order_hist[i]) std::fprintf(stderr, "   ord %2d: %llu\n", i, (unsigned long long)best_order_hist[i]);
+        std::fprintf(stderr, "WINNING precision histogram:\n");
+        for (int i = 0; i < 16; ++i)
+            if (best_prec_hist[i]) std::fprintf(stderr, "   prec %2d: %llu\n", i, (unsigned long long)best_prec_hist[i]);
+        std::fprintf(stderr, "WINNING window histogram:\n");
+        for (int i = 0; i < 32; ++i)
+            if (best_window_hist[i]) std::fprintf(stderr, "   %-22s: %llu\n",
+                window_to_name((WindowType)i).c_str(), (unsigned long long)best_window_hist[i]);
+        std::fprintf(stderr, "===========================\n");
+    }
+};
+static InstrCounters g_instr;
+#define INSTR(x) do { x; } while (0)
+#else
+#define INSTR(x) do {} while (0)
+#endif
+
 #ifndef M_PI
 #define M_PI  3.14159265358979323846
 #endif
@@ -363,6 +421,62 @@ void Optimizer::compute_lpc_coefficients(const double* autoc, float* out, int or
 // Rice cost
 // ============================================================
 
+// Four-lane unsigned vector for the Rice sum accumulators. GCC/clang lower the
+// generic vector extension to whatever the target has (NEON usra, SSE2
+// psrld+paddd); MSVC has no equivalent, so it takes the scalar array instead.
+// Both spellings compute identical sums — this only changes instruction
+// selection, never results.
+#if defined(__clang__) || defined(__GNUC__)
+#  define FLACOUT_HAVE_VECEXT 1
+typedef uint32_t u32x4 __attribute__((vector_size(16)));
+#else
+#  define FLACOUT_HAVE_VECEXT 0
+#endif
+
+// Fold a signed residual into the unsigned value Rice coding actually emits.
+// Done through uint32_t because left-shifting a negative int32_t is UB.
+static inline uint32_t zigzag(int32_t r) {
+    return ((uint32_t)r << 1) ^ (uint32_t)(r >> 31);
+}
+
+// Quantized-LPC residuals for one candidate, over already-wasted-bit-shifted
+// samples.
+//
+// The taps are on the outside and the sample index on the inside. The textbook
+// order — accumulate one `pred` per sample by looping over j — walks `shifted`
+// backwards with a runtime trip count into a serial int64 accumulator, which
+// does not vectorize. Swapping the loops makes both streams unit-stride with no
+// loop-carried dependency, so each tap becomes a widening multiply-accumulate
+// across several samples at once.
+//
+// Integer addition is associative, so reordering the accumulation is exact:
+// every partial product is the same and so is the sum. Tiled so the int64
+// partials stay in L1 instead of streaming a bsize-sized array `ord` times.
+//
+// `pred` is caller-supplied scratch of at least min(tile, bsize) elements; it is
+// passed in rather than allocated here because this runs millions of times per
+// subframe.
+static void compute_lpc_residuals(
+    const int32_t* shifted, uint32_t bsize,
+    const int32_t* qc, int ord, int shift,
+    int64_t* pred, uint32_t tile, int32_t* residuals)
+{
+    for (uint32_t t = (uint32_t)ord; t < bsize; t += tile) {
+        const uint32_t n = std::min(tile, bsize - t);
+        for (uint32_t x = 0; x < n; ++x) pred[x] = 0;
+        for (int j = 0; j < ord; ++j) {
+            const int64_t  c   = qc[j];
+            const int32_t* src = shifted + t - 1 - j;
+            for (uint32_t x = 0; x < n; ++x)
+                pred[x] += c * (int64_t)src[x];
+        }
+        for (uint32_t x = 0; x < n; ++x)
+            residuals[t + x] = shifted[t + x] - (int32_t)(pred[x] >> shift);
+    }
+    // Warm-up samples are stored verbatim.
+    for (int i = 0; i < ord; ++i) residuals[i] = shifted[i];
+}
+
 // sum(u_i >> k) is additive over disjoint ranges, so sums are computed once at the finest partition order and folded upward instead of rescanning per order.
 uint32_t Optimizer::calculate_rice_cost(
     const int32_t* residuals, uint32_t block_size,
@@ -392,6 +506,11 @@ uint32_t Optimizer::calculate_rice_cost(
     uint32_t n_res[MAX_PARTS];
     uint32_t max_abs_arr[MAX_PARTS];
 
+    INSTR(g_instr.rice_calls.fetch_add(1, std::memory_order_relaxed));
+    INSTR(g_instr.rice_scan_samples.fetch_add(block_size - order, std::memory_order_relaxed));
+    INSTR(g_instr.rice_k_ops.fetch_add((uint64_t)(block_size - order) * NUM_K, std::memory_order_relaxed));
+    INSTR(g_instr.rice_fold_ops.fetch_add((uint64_t)(num_parts - 1) * NUM_K, std::memory_order_relaxed));
+
     for (uint32_t p = 0; p < num_parts; ++p) {
         uint32_t start = p * p_size;
         uint32_t end   = start + p_size;
@@ -399,13 +518,62 @@ uint32_t Optimizer::calculate_rice_cost(
 
         uint64_t* s = sums[p];
         for (int k = 0; k < NUM_K; ++k) s[k] = 0;
-        uint32_t mabs = 0;
+
+        // Pass 1: zigzag-fold and take the maximum. Folded u is 2*|r| for r>=0
+        // and 2*|r|-1 for r<0, so the |r| the escape-code path wants is u>>1 —
+        // no separate max-abs reduction needed. This loop is a plain max
+        // reduction over unit-stride data and vectorizes on its own.
+        uint32_t mu = 0;
         for (uint32_t i = first; i < end; ++i) {
-            int32_t  r = residuals[i];
-            uint32_t u = (uint32_t)((r << 1) ^ (r >> 31));
-            for (int k = 0; k < NUM_K; ++k) s[k] += (u >> k);
-            uint32_t a = (uint32_t)(r < 0 ? ~r : r);
-            if (a > mabs) mabs = a;
+            uint32_t u = zigzag(residuals[i]);
+            if (u > mu) mu = u;
+        }
+        uint32_t mabs = mu >> 1;
+
+        // Pass 2: the 15 partial sums. Accumulating in 32-bit lanes lets each
+        // (s[k] += u >> k) become a single shift-right-and-accumulate, four
+        // residuals at a time, instead of 15 dependent 64-bit adds per
+        // residual. 32-bit lanes can only absorb 0xFFFFFFFF/mu residuals before
+        // s[0] (the largest of the 15) could wrap, so the range is walked in
+        // chunks of that size and widened into the 64-bit sums between chunks.
+        // For real audio mu is small enough that `cap` exceeds any legal block
+        // size and the widening happens exactly once.
+        const uint32_t cap = mu ? (uint32_t)std::min<uint64_t>(0xFFFFFFFFull / mu,
+                                                               0xFFFFFFFFull)
+                                : 0xFFFFFFFFu;
+        for (uint32_t base = first; base < end; ) {
+            const uint32_t stop = (cap >= end - base) ? end : base + cap;
+            uint32_t i = base;
+#if FLACOUT_HAVE_VECEXT
+            u32x4 acc[NUM_K] = {};
+            for (; i + 4 <= stop; i += 4) {
+                const u32x4 u = { zigzag(residuals[i]),     zigzag(residuals[i + 1]),
+                                  zigzag(residuals[i + 2]), zigzag(residuals[i + 3]) };
+                // Must be fully unrolled: `k` has to be a constant for each
+                // shift to fold into the accumulate.
+#  if defined(__clang__)
+#    pragma unroll
+#  elif defined(__GNUC__)
+#    pragma GCC unroll 15
+#  endif
+                for (int k = 0; k < NUM_K; ++k) acc[k] += u >> k;
+            }
+            uint32_t tail[NUM_K] = {};
+            for (; i < stop; ++i) {
+                const uint32_t u = zigzag(residuals[i]);
+                for (int k = 0; k < NUM_K; ++k) tail[k] += u >> k;
+            }
+            for (int k = 0; k < NUM_K; ++k)
+                s[k] += (uint64_t)acc[k][0] + acc[k][1] + acc[k][2] + acc[k][3] + tail[k];
+#else
+            uint32_t acc[NUM_K] = {};
+            for (; i < stop; ++i) {
+                const uint32_t u = zigzag(residuals[i]);
+                for (int k = 0; k < NUM_K; ++k) acc[k] += u >> k;
+            }
+            for (int k = 0; k < NUM_K; ++k) s[k] += acc[k];
+#endif
+            base = stop;
         }
         n_res[p]        = (first < end) ? (end - first) : 0;
         max_abs_arr[p]  = mabs;
@@ -413,7 +581,11 @@ uint32_t Optimizer::calculate_rice_cost(
 
     uint64_t best_total = std::numeric_limits<uint64_t>::max();
     int      best_porder = 0;
-    int      best_ks[MAX_PARTS] = {};
+    // Only tracked when the caller wants parameters back. During the candidate
+    // search it does not, and skipping this drops a 1 KB zero-init plus a memcpy
+    // per improving partition order from a call made millions of times.
+    int      best_ks[MAX_PARTS];
+    if (out_params) std::memset(best_ks, 0, sizeof(best_ks));
 
     uint32_t cur_num_parts = num_parts;
     for (int p_order = max_p_order; p_order >= 0; --p_order) {
@@ -458,7 +630,7 @@ uint32_t Optimizer::calculate_rice_cost(
         if (total <= best_total) {
             best_total  = total;
             best_porder = p_order;
-            std::memcpy(best_ks, ks, cur_num_parts * sizeof(int));
+            if (out_params) std::memcpy(best_ks, ks, cur_num_parts * sizeof(int));
         }
 
         if (p_order == 0) break;
@@ -592,6 +764,19 @@ SubframeParams Optimizer::optimize_subframe(
 {
     SubframeParams best{};
     best.bits_cost = std::numeric_limits<uint32_t>::max();
+#ifdef FLACOUT_INSTRUMENT
+    int instr_best_win = -1;
+    struct InstrOnExit {
+        const SubframeParams& b; const int& w;
+        ~InstrOnExit() {
+            if (b.mode == 3) {
+                g_instr.best_order_hist[b.order].fetch_add(1, std::memory_order_relaxed);
+                g_instr.best_prec_hist[b.lpc_precision].fetch_add(1, std::memory_order_relaxed);
+                if (w >= 0) g_instr.best_window_hist[w].fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    } instr_on_exit{best, instr_best_win};
+#endif
 
     // ---- Wasted-bits detection ----
     int wasted = 0;
@@ -633,6 +818,11 @@ SubframeParams Optimizer::optimize_subframe(
         std::vector<int32_t> residuals(bsize);
         float all_lpc[32][32]; // all_lpc[order-1][coeff]
 
+        // Scratch for the tiled prediction accumulator (see the residual loop
+        // below). Sized so one tile of int64 partials stays L1-resident.
+        static constexpr uint32_t PRED_TILE = 1024;
+        std::vector<int64_t> pred(std::min(PRED_TILE, bsize));
+
         // hoisted: samples[i] >> wasted was re-read for every window/order/precision combo below
         std::vector<int32_t> shifted(bsize);
         for (uint32_t i = 0; i < bsize; ++i) shifted[i] = samples[i] >> wasted;
@@ -644,15 +834,29 @@ SubframeParams Optimizer::optimize_subframe(
         const uint32_t min_prec  = (uint32_t)precisions.front();
         const uint32_t hdr_fixed = 8u + (wasted ? (uint32_t)(1 + wasted) : 0u) + 4u + 5u;
 
+        // Winner tracked as a bare description rather than a filled-in
+        // SubframeParams; see the cost-only call below. Seeded from the best
+        // non-LPC mode so it doubles as the pruning bound, exactly as
+        // best.bits_cost did — it starts at the same value and decreases at the
+        // same points, so pruning decisions are unchanged.
+        uint32_t best_lpc_cost = best.bits_cost;
+        int      bl_ord = 0, bl_prec = 0, bl_shift = 0;
+        int32_t  bl_qc[32] = {};
+
+        INSTR(g_instr.subframes.fetch_add(1, std::memory_order_relaxed));
         for (WindowType wt : windows) {
+            INSTR(g_instr.windows_run.fetch_add(1, std::memory_order_relaxed));
+            INSTR(g_instr.window_samples.fetch_add(bsize, std::memory_order_relaxed));
             apply_window(samples, bsize, wasted, wt, windowed.data());
 
             // Autocorrelation for all lags 0..min(32, bsize-1)
             double autoc[33] = {};
             int max_lag = (int)std::min((uint32_t)32, bsize - 1);
-            for (int lag = 0; lag <= max_lag; ++lag)
+            for (int lag = 0; lag <= max_lag; ++lag) {
+                INSTR(g_instr.autoc_macs.fetch_add(bsize - (uint32_t)lag, std::memory_order_relaxed));
                 for (uint32_t j = 0; j < bsize - (uint32_t)lag; ++j)
                     autoc[lag] += windowed[j] * windowed[j + lag];
+            }
 
             if (autoc[0] <= 0.0) continue;
 
@@ -666,7 +870,12 @@ SubframeParams Optimizer::optimize_subframe(
                 // at the cheapest precision, since rice cost >= 0. it grows with
                 // order, so once it can't beat best neither can any higher order.
                 uint32_t hdr_min = hdr_fixed + (uint32_t)ord * (eff_bps + min_prec);
-                if (hdr_min >= best.bits_cost) break;
+                if (hdr_min >= best_lpc_cost) {
+                    INSTR(g_instr.order_pruned_break.fetch_add(max_order - ord + 1, std::memory_order_relaxed));
+                    break;
+                }
+                INSTR(g_instr.order_iters.fetch_add(1, std::memory_order_relaxed));
+                INSTR(g_instr.win_order_hist[ord].fetch_add(1, std::memory_order_relaxed));
 
                 const float* lpc = all_lpc[ord - 1];
 
@@ -683,11 +892,19 @@ SubframeParams Optimizer::optimize_subframe(
                     log2cmax = (int)std::floor(std::log2(cmax));
                 // else cmax < 1 → log2cmax ≤ -1, but we keep it at 0 so shift stays high.
 
+#ifdef FLACOUT_INSTRUMENT
+                int prec_idx = 0;
+#endif
                 for (int prec : precisions) {
+                    INSTR(++prec_idx);
                     // fixed cost is a lower bound on this candidate (rice >= 0);
                     // grows with precision, so break once it can't beat best.
                     uint32_t hdr = hdr_fixed + (uint32_t)ord * (eff_bps + (uint32_t)prec);
-                    if (hdr >= best.bits_cost) break;
+                    if (hdr >= best_lpc_cost) {
+                        INSTR(g_instr.prec_pruned_break.fetch_add(precisions.size() - prec_idx + 1, std::memory_order_relaxed));
+                        break;
+                    }
+                    INSTR(g_instr.prec_iters.fetch_add(1, std::memory_order_relaxed));
 
                     // shift = (prec-1) - log2cmax - 1
                     // = prec - log2cmax - 2
@@ -708,36 +925,53 @@ SubframeParams Optimizer::optimize_subframe(
                         if (qi > maxq || qi < minq) { overflow = true; break; }
                         qc[j] = qi;
                     }
-                    if (overflow) continue; // can happen if cmax was underestimated; skip
+                    if (overflow) { INSTR(g_instr.overflow_skips.fetch_add(1, std::memory_order_relaxed)); continue; }
 
-                    // Compute residuals on ORIGINAL (non-windowed) samples
-                    for (uint32_t i = 0; i < bsize; ++i) {
-                        int32_t s = shifted[i];
-                        if ((uint32_t)i < (uint32_t)ord) {
-                            residuals[i] = s;
-                        } else {
-                            int64_t pred = 0;
-                            for (int j = 0; j < ord; ++j)
-                                pred += (int64_t)qc[j] * (int64_t)shifted[i-1-j];
-                            residuals[i] = s - (int32_t)(pred >> shift);
-                        }
-                    }
+                    INSTR(g_instr.residual_calls.fetch_add(1, std::memory_order_relaxed));
+                    INSTR(g_instr.residual_macs.fetch_add((uint64_t)(bsize - ord) * ord, std::memory_order_relaxed));
+                    compute_lpc_residuals(shifted.data(), bsize, qc, ord, shift,
+                                          pred.data(), PRED_TILE, residuals.data());
 
-                    SubframeParams cur{};
-                    cur.mode          = 3;
-                    cur.order         = ord;
-                    cur.lpc_precision = prec;
-                    cur.lpc_shift     = shift;
-                    cur.wasted_bits   = wasted;
-                    std::memcpy(cur.q_coeffs, qc, ord * sizeof(int32_t));
-
-                    uint32_t rice = calculate_rice_cost(residuals.data(), bsize, (uint32_t)ord, &cur);
+                    // Cost only — no out-params. Filling in a SubframeParams
+                    // here would zero and populate ~1.3 KB (rice_k[256] alone is
+                    // 1 KB) for every candidate, and all but one of them is
+                    // discarded. Only the winner's identity is kept; its
+                    // parameters are reconstructed once, after the search.
+                    uint32_t rice = calculate_rice_cost(residuals.data(), bsize,
+                                                        (uint32_t)ord, nullptr);
                     // +6: residual block header (2-bit coding method + 4-bit
                     // partition order), see estimate_subframe_cost for detail.
-                    try_update(cur, hdr + 6u + rice);
+                    const uint32_t cost = hdr + 6u + rice;
+                    if (cost < best_lpc_cost) {
+                        best_lpc_cost = cost;
+                        bl_ord = ord; bl_prec = prec; bl_shift = shift;
+                        std::memcpy(bl_qc, qc, (size_t)ord * sizeof(int32_t));
+                        INSTR(instr_best_win = (int)wt);
+                    }
                 }
             }
 
+        }
+
+        // Materialize the winning LPC candidate, if it beat the non-LPC modes.
+        // Re-deriving its residuals costs one more pass out of the millions the
+        // search just ran, and in exchange every candidate above skipped the
+        // per-candidate parameter bookkeeping.
+        if (bl_ord > 0) {
+            compute_lpc_residuals(shifted.data(), bsize, bl_qc, bl_ord, bl_shift,
+                                  pred.data(), PRED_TILE, residuals.data());
+            SubframeParams cur{};
+            cur.mode          = 3;
+            cur.order         = bl_ord;
+            cur.lpc_precision = bl_prec;
+            cur.lpc_shift     = bl_shift;
+            cur.wasted_bits   = wasted;
+            std::memcpy(cur.q_coeffs, bl_qc, (size_t)bl_ord * sizeof(int32_t));
+            uint32_t rice = calculate_rice_cost(residuals.data(), bsize,
+                                                (uint32_t)bl_ord, &cur);
+            const uint32_t hdr = hdr_fixed + (uint32_t)bl_ord * (eff_bps + (uint32_t)bl_prec);
+            assert(hdr + 6u + rice == best_lpc_cost);
+            try_update(cur, hdr + 6u + rice);
         }
     }
 
@@ -885,6 +1119,18 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
         for (size_t c = 0; c < NUM_CANDS; ++c)
             if ((uint64_t)n * STEP + CANDIDATES[c] <= total_samples)
                 work.push_back({n, c});
+
+    // Longest-processing-time-first. Workers pull from one shared counter, so
+    // whatever order this vector is in is the order work is handed out. Built
+    // node-major, the 16384-sample blocks — 16x the cost of a 1024 — are spread
+    // evenly through the queue, and some land near the end where there is no
+    // remaining work to overlap them with. Handing out the expensive ones first
+    // leaves only cheap blocks to fill the tail. Purely a scheduling change:
+    // cost_table is indexed by (node, candidate), not by completion order.
+    std::stable_sort(work.begin(), work.end(),
+                     [](const WorkItem& a, const WorkItem& b) {
+                         return CANDIDATES[a.ci] > CANDIDATES[b.ci];
+                     });
 
     std::vector<BlockParams> cost_table(num_nodes * NUM_CANDS);
 

@@ -203,15 +203,21 @@ Optimizer::Optimizer(uint32_t channels, uint32_t bps, uint32_t sample_rate,
 // ============================================================
 // All window formulas match libFLAC's window.c exactly.
 
-void Optimizer::apply_window(
-    const int32_t* samples, uint32_t N, int wasted_bits,
-    WindowType wt, double* out)
+// Note for future profilers: a 16-thread `sample` of -c once attributed ~24%
+// of runtime to the trig here; a single-threaded profile put it at ~2%. The
+// 24% was heterogeneous-core sampling distortion — verify shares
+// single-threaded before optimizing this function. The table cache below is
+// NOT here to skip the trig (that saved nothing measurable); it exists so
+// apply_window stays a tiny multiply loop at its call site, which keeps the
+// register allocator honest in the surrounding analyse_window code — the
+// wide-band autocorrelation loop spills without it.
+
+static void compute_window_coeffs(WindowType wt, uint32_t N, double* out)
 {
     auto fN = (double)(N - 1);
     auto fNh = fN / 2.0;
 
     for (uint32_t i = 0; i < N; ++i) {
-        double x = (double)(samples[i] >> wasted_bits);
         double w = 1.0;
         double fi = (double)i;
 
@@ -379,8 +385,67 @@ void Optimizer::apply_window(
             w = 1.0; break;
         }
 
-        out[i] = x * w;
+        out[i] = w;
     }
+}
+
+// The DP's candidate block sizes (shared with find_optimal_block_partitioning).
+// Window coefficient tables for these sizes are precomputed once; any other
+// size (the remainder block, the short-stream path) computes on the fly.
+static const uint32_t DP_CANDIDATES[] = { 1024, 2048, 4096, 8192, 16384 };
+static constexpr size_t NUM_DP_CANDIDATES = 5;
+
+static int candidate_slot(uint32_t N)
+{
+    for (size_t c = 0; c < NUM_DP_CANDIDATES; ++c)
+        if (DP_CANDIDATES[c] == N) return (int)c;
+    return -1;
+}
+
+// All 26 windows x 5 candidate sizes, built once on first use (~6.6 MB,
+// thread-safe magic static — worker threads block on the first builder and
+// read lock-free forever after). The values are computed by the exact code
+// that used to run inline per block, so the output is bit-identical.
+static const double* window_table(WindowType wt, int slot)
+{
+    static const std::vector<double> tables = [] {
+        size_t total = 0;
+        for (size_t c = 0; c < NUM_DP_CANDIDATES; ++c) total += DP_CANDIDATES[c];
+        std::vector<double> t((size_t)WindowType::COUNT * total);
+        size_t off = 0;
+        for (int w = 0; w < (int)WindowType::COUNT; ++w)
+            for (size_t c = 0; c < NUM_DP_CANDIDATES; ++c) {
+                compute_window_coeffs((WindowType)w, DP_CANDIDATES[c], &t[off]);
+                off += DP_CANDIDATES[c];
+            }
+        return t;
+    }();
+
+    // offset of (wt, slot): wt strides the whole size set, then sizes before slot
+    size_t size_sum = 0, prefix = 0;
+    for (size_t c = 0; c < NUM_DP_CANDIDATES; ++c) size_sum += DP_CANDIDATES[c];
+    for (int c = 0; c < slot; ++c) prefix += DP_CANDIDATES[c];
+    return &tables[(size_t)wt * size_sum + prefix];
+}
+
+void Optimizer::apply_window(
+    const int32_t* samples, uint32_t N, int wasted_bits,
+    WindowType wt, double* out)
+{
+    const int slot = candidate_slot(N);
+    const double* w;
+    std::vector<double> scratch;
+    if (slot >= 0) {
+        w = window_table(wt, slot);
+    } else {
+        scratch.resize(N);
+        compute_window_coeffs(wt, N, scratch.data());
+        w = scratch.data();
+    }
+    // One multiply per sample, same arithmetic as the fused version, and
+    // -ffp-contract=off means nothing can fuse into it: bit-exact.
+    for (uint32_t i = 0; i < N; ++i)
+        out[i] = (double)(samples[i] >> wasted_bits) * w[i];
 }
 
 // ============================================================
@@ -505,7 +570,10 @@ static inline uint32_t zigzag(int32_t r) {
 // `bsize` doubles — and each pass is a reduction, so loads dominate and the
 // serial accumulator chain gives the vectorizer nothing to work with. Handling
 // LAG_BAND lags together gets LAG_BAND multiply-accumulates out of every loaded
-// w[j] and cuts the number of passes by the same factor.
+// w[j] and cuts the number of passes by the same factor. At 33 the whole
+// max_lag=32 range is one pass; measured in isolation that is 2.0x over the
+// original band of 8 (register-pressure sweet spots are not monotonic — 16
+// measured no better than 8, so widen all the way or not at all).
 //
 // This is floating point, so unlike the integer loops the summation order is
 // *not* free to change — reassociating would perturb the coefficients and with
@@ -516,7 +584,7 @@ static inline uint32_t zigzag(int32_t r) {
 static void autocorrelation(
     const double* w, uint32_t n, int max_lag, double* autoc)
 {
-    constexpr int LAG_BAND = 8;
+    constexpr int LAG_BAND = 33;
 
     int lag0 = 0;
     for (; lag0 + LAG_BAND <= max_lag + 1; lag0 += LAG_BAND) {
@@ -1543,8 +1611,10 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
     // Phase 2: sequential DP over precomputed cost table — O(N×K), instant.
     // Phase 3: back-trace to recover the optimal frame sequence.
 
-    static const uint32_t CANDIDATES[]   = { 1024, 2048, 4096, 8192, 16384 };
-    static const size_t   NUM_CANDS      = std::size(CANDIDATES);
+    // Shared with the window-table cache, which precomputes coefficients for
+    // exactly these sizes (see DP_CANDIDATES at file scope).
+    static const auto&    CANDIDATES     = DP_CANDIDATES;
+    static const size_t   NUM_CANDS      = std::size(DP_CANDIDATES);
     static constexpr uint32_t STEP = 1024u; // GCD of all candidates
 
     const size_t   num_nodes = total_samples / STEP;

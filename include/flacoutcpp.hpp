@@ -76,6 +76,25 @@ struct Config {
     bool exhaustive = false;
 
     /**
+     * @brief Ranked-search budget: (window, order) pairs evaluated per subframe.
+     *
+     * @c 0 (default) disables ranked search entirely — @ref exhaustive then
+     * decides between the full sweep and the fast heuristic, as before.
+     *
+     * A non-zero value selects an intermediate mode. Levinson-Durbin already
+     * computes the prediction error at every order as a by-product; ranked
+     * search uses it to estimate each (window, order) pair's cost up front and
+     * fully evaluates only the best @c max_candidates of them. Everything else
+     * matches exhaustive mode: exact DP over block sizes, all four stereo
+     * modes, the full precision sweep, and all 26 windows offered to the
+     * ranking.
+     *
+     * Unlike the other options this one can change the output: it is a
+     * compression-for-speed trade, and larger values approach @ref exhaustive.
+     */
+    unsigned max_candidates = 0;
+
+    /**
      * @brief Print progress and statistics to stdout during the run.
      *
      * Set to @c false to suppress progress/statistics output — useful when

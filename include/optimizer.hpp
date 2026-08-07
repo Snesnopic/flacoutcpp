@@ -166,12 +166,16 @@ public:
      * @param bps          Bits per sample (e.g. 16, 24).
      * @param windows      Apodization windows to test.  Empty → all 26 windows.
      * @param max_threads  Worker thread limit.  0 → all logical CPUs.
+     * @param max_candidates  Ranked-search budget: the number of
+     *        (window, order) pairs fully evaluated per subframe.  0 (default)
+     *        evaluates every pair, which is the exhaustive behaviour.
      */
     Optimizer(uint32_t channels, uint32_t bps,
               std::vector<WindowType> windows = {},
               unsigned max_threads = 0,
               bool exhaustive = false,
-              bool verbose = true);
+              bool verbose = true,
+              unsigned max_candidates = 0);
 
     /**
      * @brief Find the optimal variable block-size partition for the stream.
@@ -202,7 +206,8 @@ public:
         uint32_t                    bsize,
         uint32_t                    bps,
         const std::vector<WindowType>& windows,
-        bool                        exhaustive);
+        bool                        exhaustive,
+        unsigned                    max_candidates = 0);
 
 private:
     /// @cond INTERNAL
@@ -227,8 +232,16 @@ private:
 
     // --- LPC helpers --------------------------------------------------------
     /// Levinson-Durbin recursion for all orders 1..max_order simultaneously.
+    ///
+    /// @param out_err  Optional; receives the residual energy after predicting
+    ///        at each order, with out_err[0] the unpredicted energy. Entries
+    ///        the recursion did not reach (it stops early on an unstable
+    ///        reflection coefficient) are left negative. Ranked search uses
+    ///        out_err[ord]/out_err[0] to estimate an order's cost without
+    ///        actually building its residuals.
     static void compute_lpc_all_orders(
-        const double* autoc, float out_coeffs[][32], int max_order);
+        const double* autoc, float out_coeffs[][32], int max_order,
+        double* out_err = nullptr);
 
     /// Single-order Levinson-Durbin wrapper (used in granule fast-path).
     static void compute_lpc_coefficients(
@@ -251,6 +264,12 @@ private:
     unsigned              m_max_threads;
     bool                  m_exhaustive;
     bool                  m_verbose;
+    unsigned              m_max_candidates;
+
+    /// True when block costs come from real encodes rather than the granule
+    /// estimate: exact DP, all four stereo modes, full precision sweep.
+    /// Ranked search is cheap enough per block to afford all of that.
+    [[nodiscard]] bool full_search() const { return m_exhaustive || m_max_candidates > 0; }
 
     /// @endcond
 };

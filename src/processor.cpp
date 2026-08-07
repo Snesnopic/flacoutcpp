@@ -119,7 +119,8 @@ bool Processor::process() {
     auto md5_digest = md5.digest();
 
     // --- Step 3: run optimiser ----
-    Optimizer opt(m_channels, m_bps, m_config.windows, m_config.max_threads, m_config.exhaustive, m_config.verbose);
+    Optimizer opt(m_channels, m_bps, m_config.windows, m_config.max_threads,
+                  m_config.exhaustive, m_config.verbose, m_config.max_candidates);
     std::vector<BlockParams> blocks = opt.find_optimal_block_partitioning(m_pcm_data);
 
     if (blocks.empty()) {

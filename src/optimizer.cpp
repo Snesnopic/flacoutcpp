@@ -172,11 +172,16 @@ Optimizer::Optimizer(uint32_t channels, uint32_t bps,
                      std::vector<WindowType> windows,
                      unsigned max_threads,
                      bool exhaustive,
-                     bool verbose)
-    : m_channels(channels), m_bps(bps), m_max_threads(max_threads), m_exhaustive(exhaustive), m_verbose(verbose)
+                     bool verbose,
+                     unsigned max_candidates)
+    : m_channels(channels), m_bps(bps), m_max_threads(max_threads),
+      m_exhaustive(exhaustive), m_verbose(verbose), m_max_candidates(max_candidates)
 {
     if (windows.empty()) {
-        if (m_exhaustive) {
+        // Ranked search wants the widest window set to choose from: it pays per
+        // candidate evaluated, not per window offered, so restricting the set
+        // only removes options the ranking could have picked.
+        if (full_search()) {
             m_windows = all_window_types();
         } else {
             m_windows = {WindowType::TUKEY_050, WindowType::HANN, WindowType::WELCH, WindowType::RECTANGULAR};
@@ -376,8 +381,10 @@ void Optimizer::apply_window(
 // ============================================================
 
 void Optimizer::compute_lpc_all_orders(
-    const double* autoc, float out_coeffs[][32], int max_order)
+    const double* autoc, float out_coeffs[][32], int max_order, double* out_err)
 {
+    // Negative marks "recursion never got here"; callers must skip those.
+    if (out_err) for (int i = 0; i <= max_order; ++i) out_err[i] = -1.0;
     // ld_a[i][j] = coefficient j for predictor of order i (1-indexed in both).
     // We use a stack-allocated array — 33×33 doubles = ~8 KB, safe.
     double ld_a[33][33];
@@ -385,6 +392,7 @@ void Optimizer::compute_lpc_all_orders(
     std::memset(ld_a, 0, sizeof(ld_a));
 
     ld_e[0] = autoc[0];
+    if (out_err) out_err[0] = ld_e[0];
     if (ld_e[0] <= 0.0) {
         for (int i = 0; i < max_order; ++i)
             for (int j = 0; j < 32; ++j) out_coeffs[i][j] = 0.0f;
@@ -407,6 +415,7 @@ void Optimizer::compute_lpc_all_orders(
 
         ld_e[ord] = ld_e[ord-1] * (1.0 - ld_a[ord][ord]*ld_a[ord][ord]);
         if (ld_e[ord] <= 0.0) ld_e[ord] = 1e-10;
+        if (out_err) out_err[ord] = ld_e[ord];
 
         for (int j = 1; j < ord; ++j)
             ld_a[ord][j] = ld_a[ord-1][j] - ld_a[ord][ord] * ld_a[ord-1][ord-j];
@@ -797,7 +806,8 @@ uint32_t Optimizer::estimate_subframe_cost(
 
 SubframeParams Optimizer::optimize_subframe(
     const int32_t* samples, uint32_t bsize, uint32_t bps,
-    const std::vector<WindowType>& windows, bool exhaustive)
+    const std::vector<WindowType>& windows, bool exhaustive,
+    unsigned max_candidates)
 {
     SubframeParams best{};
     best.bits_cost = std::numeric_limits<uint32_t>::max();
@@ -865,9 +875,11 @@ SubframeParams Optimizer::optimize_subframe(
         for (uint32_t i = 0; i < bsize; ++i) shifted[i] = samples[i] >> wasted;
 
         // precision set is constant for the whole subframe; build once
+        // Ranked search evaluates only a handful of candidates, so it can
+        // afford the full precision sweep on each of them.
         std::vector<int> precisions;
-        if (exhaustive) { for (int p = 8; p <= 15; ++p) precisions.push_back(p); }
-        else            { precisions = {12, 15}; }
+        if (exhaustive || max_candidates > 0) { for (int p = 8; p <= 15; ++p) precisions.push_back(p); }
+        else                                  { precisions = {12, 15}; }
         const uint32_t min_prec  = (uint32_t)precisions.front();
         const uint32_t hdr_fixed = 8u + (wasted ? (uint32_t)(1 + wasted) : 0u) + 4u + 5u;
 
@@ -881,7 +893,93 @@ SubframeParams Optimizer::optimize_subframe(
         int32_t  bl_qc[32] = {};
 
         INSTR(g_instr.subframes.fetch_add(1, std::memory_order_relaxed));
-        for (WindowType wt : windows) {
+
+        const int max_order = (int)std::min((uint32_t)32, bsize - 1);
+
+        // Evaluate one candidate — a coefficient set at one order — across
+        // every precision, updating the winner. Shared by both drivers below so
+        // ranked and exhaustive search cost a candidate identically; they differ
+        // only in which candidates they hand it.
+        auto eval_candidate = [&](const float* lpc, int ord, WindowType wt) {
+            (void)wt;
+            INSTR(g_instr.order_iters.fetch_add(1, std::memory_order_relaxed));
+            INSTR(g_instr.win_order_hist[ord].fetch_add(1, std::memory_order_relaxed));
+
+            // Determine quantization shift from the magnitude of the largest coefficient.
+            // This matches the libFLAC approach: shift = precision - floor(log2(max_coeff)) - 2
+            // so that quantized(max_coeff) < 2^(precision-1) without clipping.
+            double cmax = 1e-10;
+            for (int j = 0; j < ord; ++j)
+                cmax = std::max(cmax, std::abs((double)lpc[j]));
+
+            // floor(log2(cmax)) gives the position of the highest set bit.
+            int log2cmax = 0;
+            if (cmax >= 1.0)
+                log2cmax = (int)std::floor(std::log2(cmax));
+            // else cmax < 1 -> log2cmax <= -1, but we keep it at 0 so shift stays high.
+
+#ifdef FLACOUT_INSTRUMENT
+            int prec_idx = 0;
+#endif
+            for (int prec : precisions) {
+                INSTR(++prec_idx);
+                // fixed cost is a lower bound on this candidate (rice >= 0);
+                // grows with precision, so break once it can't beat best.
+                uint32_t hdr = hdr_fixed + (uint32_t)ord * (eff_bps + (uint32_t)prec);
+                if (hdr >= best_lpc_cost) {
+                    INSTR(g_instr.prec_pruned_break.fetch_add(precisions.size() - prec_idx + 1, std::memory_order_relaxed));
+                    break;
+                }
+                INSTR(g_instr.prec_iters.fetch_add(1, std::memory_order_relaxed));
+
+                // shift = (prec-1) - log2cmax - 1
+                // = prec - log2cmax - 2
+                // Ensures quantized coefficient = round(coeff * 2^shift) fits in [-(2^(prec-1)), 2^(prec-1)-1].
+                int shift = prec - log2cmax - 2;
+                if (shift < 0)  shift = 0;
+                if (shift > 14) shift = 14; // 5-bit signed: max positive value = 15, but 14 is safe
+
+                int32_t maxq = (1 << (prec-1)) - 1;
+                int32_t minq = -(1 << (prec-1));
+
+                // Quantize
+                int32_t qc[32];
+                bool overflow = false;
+                for (int j = 0; j < ord; ++j) {
+                    double  v  = (double)lpc[j] * (double)(1 << shift);
+                    int32_t qi = (int32_t)std::round(v);
+                    if (qi > maxq || qi < minq) { overflow = true; break; }
+                    qc[j] = qi;
+                }
+                if (overflow) { INSTR(g_instr.overflow_skips.fetch_add(1, std::memory_order_relaxed)); continue; }
+
+                INSTR(g_instr.residual_calls.fetch_add(1, std::memory_order_relaxed));
+                INSTR(g_instr.residual_macs.fetch_add((uint64_t)(bsize - ord) * ord, std::memory_order_relaxed));
+                compute_lpc_residuals(shifted.data(), bsize, qc, ord, shift,
+                                      pred.data(), PRED_TILE, residuals.data());
+
+                // Cost only — no out-params. Filling in a SubframeParams
+                // here would zero and populate ~1.3 KB (rice_k[256] alone is
+                // 1 KB) for every candidate, and all but one of them is
+                // discarded. Only the winner's identity is kept; its
+                // parameters are reconstructed once, after the search.
+                uint32_t rice = calculate_rice_cost(residuals.data(), bsize,
+                                                    (uint32_t)ord, nullptr);
+                // +6: residual block header (2-bit coding method + 4-bit
+                // partition order), see estimate_subframe_cost for detail.
+                const uint32_t cost = hdr + 6u + rice;
+                if (cost < best_lpc_cost) {
+                    best_lpc_cost = cost;
+                    bl_ord = ord; bl_prec = prec; bl_shift = shift;
+                    std::memcpy(bl_qc, qc, (size_t)ord * sizeof(int32_t));
+                    INSTR(instr_best_win = (int)wt);
+                }
+            }
+        };
+
+        // Autocorrelation + Levinson-Durbin for one window. Returns false if the
+        // windowed signal has no energy and the window should be skipped.
+        auto analyse_window = [&](WindowType wt, double* out_err) -> bool {
             INSTR(g_instr.windows_run.fetch_add(1, std::memory_order_relaxed));
             INSTR(g_instr.window_samples.fetch_add(bsize, std::memory_order_relaxed));
             apply_window(samples, bsize, wasted, wt, windowed.data());
@@ -894,100 +992,84 @@ SubframeParams Optimizer::optimize_subframe(
                 for (uint32_t j = 0; j < bsize - (uint32_t)lag; ++j)
                     autoc[lag] += windowed[j] * windowed[j + lag];
             }
+            if (autoc[0] <= 0.0) return false;
 
-            if (autoc[0] <= 0.0) continue;
-
-            // Levinson-Durbin for all orders 1..32
-            int max_order = (int)std::min((uint32_t)32, bsize - 1);
             std::memset(all_lpc, 0, sizeof(all_lpc));
-            compute_lpc_all_orders(autoc, all_lpc, max_order);
+            compute_lpc_all_orders(autoc, all_lpc, max_order, out_err);
+            return true;
+        };
 
-            for (int ord = 1; ord <= max_order; ++ord) {
-                // sound lower bound: fixed cost (header + warm-up + coeffs) alone,
-                // at the cheapest precision, since rice cost >= 0. it grows with
-                // order, so once it can't beat best neither can any higher order.
-                uint32_t hdr_min = hdr_fixed + (uint32_t)ord * (eff_bps + min_prec);
-                if (hdr_min >= best_lpc_cost) {
-                    INSTR(g_instr.order_pruned_break.fetch_add(max_order - ord + 1, std::memory_order_relaxed));
-                    break;
-                }
-                INSTR(g_instr.order_iters.fetch_add(1, std::memory_order_relaxed));
-                INSTR(g_instr.win_order_hist[ord].fetch_add(1, std::memory_order_relaxed));
-
-                const float* lpc = all_lpc[ord - 1];
-
-                // Determine quantization shift from the magnitude of the largest coefficient.
-                // This matches the libFLAC approach: shift = precision - floor(log2(max_coeff)) - 2
-                // so that quantized(max_coeff) < 2^(precision-1) without clipping.
-                double cmax = 1e-10;
-                for (int j = 0; j < ord; ++j)
-                    cmax = std::max(cmax, std::abs((double)lpc[j]));
-
-                // floor(log2(cmax)) gives the position of the highest set bit.
-                int log2cmax = 0;
-                if (cmax >= 1.0)
-                    log2cmax = (int)std::floor(std::log2(cmax));
-                // else cmax < 1 → log2cmax ≤ -1, but we keep it at 0 so shift stays high.
-
-#ifdef FLACOUT_INSTRUMENT
-                int prec_idx = 0;
-#endif
-                for (int prec : precisions) {
-                    INSTR(++prec_idx);
-                    // fixed cost is a lower bound on this candidate (rice >= 0);
-                    // grows with precision, so break once it can't beat best.
-                    uint32_t hdr = hdr_fixed + (uint32_t)ord * (eff_bps + (uint32_t)prec);
-                    if (hdr >= best_lpc_cost) {
-                        INSTR(g_instr.prec_pruned_break.fetch_add(precisions.size() - prec_idx + 1, std::memory_order_relaxed));
+        if (max_candidates == 0) {
+            // ---- Exhaustive: every (window, order) pair ----
+            for (WindowType wt : windows) {
+                if (!analyse_window(wt, nullptr)) continue;
+                for (int ord = 1; ord <= max_order; ++ord) {
+                    // sound lower bound: fixed cost (header + warm-up + coeffs) alone,
+                    // at the cheapest precision, since rice cost >= 0. it grows with
+                    // order, so once it can't beat best neither can any higher order.
+                    uint32_t hdr_min = hdr_fixed + (uint32_t)ord * (eff_bps + min_prec);
+                    if (hdr_min >= best_lpc_cost) {
+                        INSTR(g_instr.order_pruned_break.fetch_add(max_order - ord + 1, std::memory_order_relaxed));
                         break;
                     }
-                    INSTR(g_instr.prec_iters.fetch_add(1, std::memory_order_relaxed));
+                    eval_candidate(all_lpc[ord - 1], ord, wt);
+                }
+            }
+        } else {
+            // ---- Ranked: score every (window, order) pair, then fully
+            //      evaluate only the most promising `max_candidates` of them.
+            //
+            // Levinson-Durbin already produces the residual energy at each
+            // order as a by-product; the exhaustive path just discards it.
+            // err[ord]/err[0] is the fraction of signal energy the predictor
+            // fails to remove, which turns into an estimated residual bit cost
+            // via the Gaussian entropy 0.5*log2(2*pi*e*var) that
+            // estimate_lpc_bits_fast already uses. The constant term and the
+            // signal's own variance are identical for every candidate, so they
+            // drop out of the comparison and only the log of the ratio remains.
+            //
+            // Using the *ratio* rather than the raw energy is what makes scores
+            // comparable across windows at all: each window scales the signal
+            // differently, so raw err[ord] values are in different units, while
+            // the fraction removed is dimensionless.
+            struct Cand { double score; int wi; int ord; };
+            std::vector<Cand> cands;
+            cands.reserve(windows.size() * (size_t)max_order);
 
-                    // shift = (prec-1) - log2cmax - 1
-                    // = prec - log2cmax - 2
-                    // Ensures quantized coefficient = round(coeff * 2^shift) fits in [-(2^(prec-1)), 2^(prec-1)-1].
-                    int shift = prec - log2cmax - 2;
-                    if (shift < 0)  shift = 0;
-                    if (shift > 14) shift = 14; // 5-bit signed: max positive value = 15, but 14 is safe
+            // all_lpc for every window, so the winning candidates do not have to
+            // re-run apply_window + autocorrelation to get their coefficients
+            // back. 4 KB per window.
+            constexpr size_t LPC_STRIDE = 32 * 32;
+            std::vector<float> lpc_store(windows.size() * LPC_STRIDE, 0.0f);
 
-                    int32_t maxq = (1 << (prec-1)) - 1;
-                    int32_t minq = -(1 << (prec-1));
-
-                    // Quantize
-                    int32_t qc[32];
-                    bool overflow = false;
-                    for (int j = 0; j < ord; ++j) {
-                        double  v  = (double)lpc[j] * (double)(1 << shift);
-                        int32_t qi = (int32_t)std::round(v);
-                        if (qi > maxq || qi < minq) { overflow = true; break; }
-                        qc[j] = qi;
-                    }
-                    if (overflow) { INSTR(g_instr.overflow_skips.fetch_add(1, std::memory_order_relaxed)); continue; }
-
-                    INSTR(g_instr.residual_calls.fetch_add(1, std::memory_order_relaxed));
-                    INSTR(g_instr.residual_macs.fetch_add((uint64_t)(bsize - ord) * ord, std::memory_order_relaxed));
-                    compute_lpc_residuals(shifted.data(), bsize, qc, ord, shift,
-                                          pred.data(), PRED_TILE, residuals.data());
-
-                    // Cost only — no out-params. Filling in a SubframeParams
-                    // here would zero and populate ~1.3 KB (rice_k[256] alone is
-                    // 1 KB) for every candidate, and all but one of them is
-                    // discarded. Only the winner's identity is kept; its
-                    // parameters are reconstructed once, after the search.
-                    uint32_t rice = calculate_rice_cost(residuals.data(), bsize,
-                                                        (uint32_t)ord, nullptr);
-                    // +6: residual block header (2-bit coding method + 4-bit
-                    // partition order), see estimate_subframe_cost for detail.
-                    const uint32_t cost = hdr + 6u + rice;
-                    if (cost < best_lpc_cost) {
-                        best_lpc_cost = cost;
-                        bl_ord = ord; bl_prec = prec; bl_shift = shift;
-                        std::memcpy(bl_qc, qc, (size_t)ord * sizeof(int32_t));
-                        INSTR(instr_best_win = (int)wt);
-                    }
+            for (size_t wi = 0; wi < windows.size(); ++wi) {
+                double lderr[33];
+                if (!analyse_window(windows[wi], lderr)) continue;
+                std::memcpy(&lpc_store[wi * LPC_STRIDE], all_lpc, sizeof(all_lpc));
+                if (lderr[0] <= 0.0) continue;
+                for (int ord = 1; ord <= max_order; ++ord) {
+                    if (lderr[ord] <= 0.0) continue; // recursion stopped short of this order
+                    const double ratio = lderr[ord] / lderr[0];
+                    if (!(ratio > 0.0)) continue;
+                    const double resid_bits = 0.5 * std::log2(ratio) * (double)(bsize - ord);
+                    const double coef_bits  = (double)ord * (double)(eff_bps + min_prec);
+                    cands.push_back({ resid_bits + coef_bits, (int)wi, ord });
                 }
             }
 
+            const size_t keep = std::min((size_t)max_candidates, cands.size());
+            std::partial_sort(cands.begin(), cands.begin() + keep, cands.end(),
+                              [](const Cand& a, const Cand& b) { return a.score < b.score; });
+
+            // Best-first, so the exact cost of a strong candidate tightens the
+            // pruning bound before the weaker ones are tried.
+            for (size_t c = 0; c < keep; ++c) {
+                const Cand& cd = cands[c];
+                uint32_t hdr_min = hdr_fixed + (uint32_t)cd.ord * (eff_bps + min_prec);
+                if (hdr_min >= best_lpc_cost) continue;
+                eval_candidate(&lpc_store[cd.wi * LPC_STRIDE + (size_t)(cd.ord - 1) * 32],
+                               cd.ord, windows[cd.wi]);
+            }
         }
 
         // Materialize the winning LPC candidate, if it beat the non-LPC modes.
@@ -1093,7 +1175,7 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
         if (m_channels == 1) {
             bp.stereo_mode  = 0;
             bp.subframes[0] = optimize_subframe(pcm_data[0].data(),
-                                                (uint32_t)total_samples, m_bps, m_windows, m_exhaustive);
+                                                (uint32_t)total_samples, m_bps, m_windows, m_exhaustive, m_max_candidates);
         } else {
             uint32_t best_bits = std::numeric_limits<uint32_t>::max();
             for (int mode : {0, 8, 9, 10}) {
@@ -1108,8 +1190,8 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
                 // mode 9 = right+side: ch0 is side (needs +1 bit), ch1 is right
                 uint32_t bps0 = (mode == 9) ? m_bps + 1 : m_bps;
                 uint32_t bps1 = (mode == 9) ? m_bps     : (mode == 0 ? m_bps : m_bps + 1);
-                SubframeParams s0 = optimize_subframe(ch0.data(), (uint32_t)total_samples, bps0, m_windows, m_exhaustive);
-                SubframeParams s1 = optimize_subframe(ch1.data(), (uint32_t)total_samples, bps1, m_windows, m_exhaustive);
+                SubframeParams s0 = optimize_subframe(ch0.data(), (uint32_t)total_samples, bps0, m_windows, m_exhaustive, m_max_candidates);
+                SubframeParams s1 = optimize_subframe(ch1.data(), (uint32_t)total_samples, bps1, m_windows, m_exhaustive, m_max_candidates);
                 if (s0.bits_cost + s1.bits_cost < best_bits) {
                     best_bits = s0.bits_cost + s1.bits_cost;
                     bp.stereo_mode  = mode;
@@ -1189,7 +1271,7 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
                     size_t idx = next.fetch_add(1, std::memory_order_relaxed);
                     if (idx >= work.size()) break;
                     auto [node, ci] = work[idx];
-                    if (m_exhaustive) {
+                    if (full_search()) {
                         cost_table[node * NUM_CANDS + ci] =
                             compute_block(pcm_data, (uint64_t)node * STEP, CANDIDATES[ci]);
                     } else {
@@ -1260,7 +1342,7 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
     std::reverse(path.begin(), path.end());
 
     std::vector<BlockParams> result(path.size() + (remainder > 0 ? 1 : 0));
-    if (!m_exhaustive) {
+    if (!full_search()) {
         std::atomic<size_t> next{0}, done{0};
         std::mutex           cout_mtx;
         std::vector<std::thread> threads;
@@ -1320,13 +1402,13 @@ BlockParams Optimizer::compute_block(
     if (m_channels == 1) {
         bp.stereo_mode  = 0;
         bp.subframes[0] = optimize_subframe(
-            &pcm_data[0][sample_start], block_size, m_bps, m_windows, m_exhaustive);
+            &pcm_data[0][sample_start], block_size, m_bps, m_windows, m_exhaustive, m_max_candidates);
     } else {
         uint32_t best_bits = std::numeric_limits<uint32_t>::max();
 
         // Independent stereo (mode 0)
         std::vector<int> modes_to_test = {0, 8, 9, 10};
-        if (!m_exhaustive) {
+        if (!full_search()) {
             // Fast estimation using Fixed Predictor (order 2)
             auto estimate_ch = [&](const int32_t* smp, int bits_per_sample) -> uint32_t {
                 int wasted = 0;
@@ -1370,9 +1452,9 @@ BlockParams Optimizer::compute_block(
         auto get_sig = [&](int sig) -> const SubframeParams& {
             if (have[sig]) return cache[sig];
             if (sig == SIG_L) {
-                cache[sig] = optimize_subframe(&pcm_data[0][sample_start], block_size, m_bps, m_windows, m_exhaustive);
+                cache[sig] = optimize_subframe(&pcm_data[0][sample_start], block_size, m_bps, m_windows, m_exhaustive, m_max_candidates);
             } else if (sig == SIG_R) {
-                cache[sig] = optimize_subframe(&pcm_data[1][sample_start], block_size, m_bps, m_windows, m_exhaustive);
+                cache[sig] = optimize_subframe(&pcm_data[1][sample_start], block_size, m_bps, m_windows, m_exhaustive, m_max_candidates);
             } else {
                 std::vector<int32_t> ch(block_size);
                 uint32_t bps_s;
@@ -1385,7 +1467,7 @@ BlockParams Optimizer::compute_block(
                         ch[k] = (pcm_data[0][sample_start + k] + pcm_data[1][sample_start + k]) >> 1;
                     bps_s = m_bps;
                 }
-                cache[sig] = optimize_subframe(ch.data(), block_size, bps_s, m_windows, m_exhaustive);
+                cache[sig] = optimize_subframe(ch.data(), block_size, bps_s, m_windows, m_exhaustive, m_max_candidates);
             }
             have[sig] = true;
             return cache[sig];

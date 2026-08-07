@@ -44,6 +44,15 @@ struct ProcessorConfig {
     bool exhaustive = false;
 
     /**
+     * @brief Ranked-search budget: (window, order) pairs evaluated per subframe.
+     *
+     * 0 (default) disables ranked search; `exhaustive` then decides between the
+     * full sweep and the fast heuristic. Non-zero selects the intermediate mode
+     * and can change the output — it trades compression for speed.
+     */
+    unsigned max_candidates = 0;
+
+    /**
      * @brief If false, suppresses progress/statistics stdout output.
      * Errors always go to stderr regardless of this setting.
      */

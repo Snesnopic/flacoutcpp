@@ -33,7 +33,12 @@ time_one() { # binary, args...  -> seconds on stdout
 case "${BENCH_SET:-quick}" in
   quick) CASES=("-e micro" "-e micro_s24") ;;
   full)  CASES=("-e stereo_1s" "-e mono_2s" "-e s24_2s" "stereo_4s") ;;
-  *)     echo "error: BENCH_SET must be 'quick' or 'full'" >&2; exit 2 ;;
+  # Real music, if you dropped some into fixtures/ (see README). The synthetic
+  # fixtures are fine for timing, but anything that trades compression for speed
+  # has to be judged on real content — their noise floor does not behave like
+  # music. Missing fixtures are skipped, so this is safe to run either way.
+  music) CASES=("-e music_3s" "-e music_20s") ;;
+  *)     echo "error: BENCH_SET must be 'quick', 'full' or 'music'" >&2; exit 2 ;;
 esac
 
 printf '%-16s %10s %10s %8s   %s\n' CASE "$(basename "$A")" "$(basename "$B")" SPEEDUP OUTPUT

@@ -15,13 +15,29 @@ cmake --build build -j && bench/check.sh verify build
 ## check.sh — bit-exactness gate
 
 Optimizations to the encoder's hot loops are meant to leave the bitstream
-untouched, so the regression test is just `cmp`. Nine cases cover exhaustive and
-heuristic mode, mono/stereo, 16- and 24-bit, the
+untouched, so the regression test is just `cmp`. Fourteen cases cover exhaustive,
+heuristic and ranked (`-c`) mode, mono/stereo, 16- and 24-bit, the
 `< 1024`-sample short-stream path, and an explicit `-w` window list. Outputs are
 additionally checked with `flac -t`, so a change that corrupts the reference and
 the candidate the same way still fails.
 
 `record` refuses to snapshot output that does not decode.
+
+The `rk_*` (ranked) cases are a slightly different kind of test. Ranked search
+deliberately produces a different bitstream than `-e` — that is the whole point
+of it — so `cmp` there is not asserting "unchanged since forever", only "unchanged
+since the reference was recorded". Retuning the ranking is *expected* to move
+those files, and the right response is to re-record after checking the size
+delta went the way you intended. A reference including them can only be recorded
+from the commit that added `-c` or later.
+
+`cmp` also cannot tell you whether the encoder is still lossless, only whether it
+is consistent. For that, decode and compare against the source:
+
+```sh
+flac -d -c -s input.flac | md5sum
+flac -d -c -s output.flac | md5sum   # must match
+```
 
 ## compare.sh — A/B timing
 
@@ -89,3 +105,23 @@ subframes to LPC order 32, which inflates how valuable high orders look. That is
 fine for the bit-exactness gate and fine for relative timing, but any change that
 trades compression for speed has to be re-measured on real music before its
 constants are chosen.
+
+### Using real music
+
+Drop a track into `fixtures/` and cut excerpts named `music_3s.flac` and
+`music_20s.flac`:
+
+```sh
+ffmpeg -ss 60 -t 3  -i track.flac -c:a flac bench/fixtures/music_3s.flac
+ffmpeg -ss 60 -t 20 -i track.flac -c:a flac bench/fixtures/music_20s.flac
+BENCH_SET=music bench/compare.sh <build-a> <build-b>
+```
+
+`fixtures/` is gitignored, so nothing you put there gets committed — which is
+also why these are not checked in.
+
+It is worth knowing how differently real content behaves. On the synthetic
+fixture, LPC order 32 wins 238 of 757 subframes; on real music the distribution
+peaks hard at order 6 and 32 still wins 280 of ~2500. Predictions about which
+orders matter, made from the synthetic fixture alone, were wrong in both
+directions.

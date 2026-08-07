@@ -9,6 +9,12 @@ static void print_usage(const char* prog) {
         << "Usage: " << prog << " [options] <input.flac> [output.flac]\n"
         << "Options:\n"
         << "  -e, --exhaustive     Perform full exhaustive search (extremely slow)\n"
+        << "  -c, --candidates N   Ranked search: fully evaluate only the N most\n"
+        << "                       promising (window, order) pairs per subframe,\n"
+        << "                       ranked by Levinson-Durbin prediction error.\n"
+        << "                       Sits between the default and -e. Larger N is\n"
+        << "                       slower and compresses better. Unlike the other\n"
+        << "                       options this one changes the output.\n"
         << "  -n, --no-metadata    Do not copy metadata from input to output\n"
         << "  -q, --quiet          Suppress all progress output\n"
         << "  -t, --threads N      Limit parallel worker threads (default: all CPUs)\n"
@@ -52,6 +58,23 @@ int main(int argc, char* argv[]) {
 
         } else if (arg == "-e" || arg == "--exhaustive") {
             cfg.exhaustive = true;
+
+        } else if (arg == "-c" || arg == "--candidates") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: -c requires a number.\n";
+                return EXIT_FAILURE;
+            }
+            ++i;
+            try {
+                cfg.max_candidates = static_cast<unsigned>(std::stoul(argv[i]));
+            } catch (const std::exception&) {
+                std::cerr << "Error: -c requires a positive integer, got '" << argv[i] << "'.\n";
+                return EXIT_FAILURE;
+            }
+            if (cfg.max_candidates == 0) {
+                std::cerr << "Error: -c requires a value of at least 1.\n";
+                return EXIT_FAILURE;
+            }
 
         } else if (arg == "-q" || arg == "--quiet") {
             cfg.verbose = false;
@@ -107,7 +130,16 @@ int main(int argc, char* argv[]) {
                                  ? positional[1]
                                  : input + ".optimized.flac";
 
+    if (cfg.exhaustive && cfg.max_candidates > 0) {
+        std::cerr << "Error: -e and -c are mutually exclusive (-e already "
+                     "evaluates every candidate).\n";
+        return EXIT_FAILURE;
+    }
+
     if (cfg.verbose) {
+        if (cfg.max_candidates > 0)
+            std::cout << "Ranked search: " << cfg.max_candidates
+                      << " candidates/subframe\n";
         if (cfg.windows.empty())
             std::cout << "Windows: all (" << all_window_types().size() << " functions)\n";
         else {

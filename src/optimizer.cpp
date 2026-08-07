@@ -477,6 +477,52 @@ static inline uint32_t zigzag(int32_t r) {
 //
 // Integer addition is associative, so this is exact — same partial products,
 // same sum, and in fact the same order as the original scalar version.
+//
+// autoc[lag] = sum over j of w[j]*w[j+lag], for lag in [0, max_lag].
+//
+// Computed a band of lags at a time rather than one lag per pass. The
+// straightforward version walks the whole block once per lag — 33 passes over
+// `bsize` doubles — and each pass is a reduction, so loads dominate and the
+// serial accumulator chain gives the vectorizer nothing to work with. Handling
+// LAG_BAND lags together gets LAG_BAND multiply-accumulates out of every loaded
+// w[j] and cuts the number of passes by the same factor.
+//
+// This is floating point, so unlike the integer loops the summation order is
+// *not* free to change — reassociating would perturb the coefficients and with
+// them the output. It is preserved exactly: the parallelism is across lags, each
+// keeping its own accumulator summed over ascending j, and each band's ragged
+// tail (where the highest lag in the band would run off the end) is finished per
+// lag afterwards, which is still ascending j for that lag.
+static void autocorrelation(
+    const double* w, uint32_t n, int max_lag, double* autoc)
+{
+    constexpr int LAG_BAND = 8;
+
+    int lag0 = 0;
+    for (; lag0 + LAG_BAND <= max_lag + 1; lag0 += LAG_BAND) {
+        double a[LAG_BAND] = {};
+        // Range of j where every lag in this band is still in bounds.
+        const uint32_t jend = n - (uint32_t)(lag0 + LAG_BAND - 1);
+        for (uint32_t j = 0; j < jend; ++j) {
+            const double x = w[j];
+            for (int l = 0; l < LAG_BAND; ++l) a[l] += x * w[j + lag0 + l];
+        }
+        // Ragged tail: lag0+l runs off the end later for smaller l.
+        for (int l = 0; l < LAG_BAND; ++l) {
+            const uint32_t lim = n - (uint32_t)(lag0 + l);
+            for (uint32_t j = jend; j < lim; ++j) a[l] += w[j] * w[j + lag0 + l];
+        }
+        for (int l = 0; l < LAG_BAND; ++l) autoc[lag0 + l] = a[l];
+    }
+
+    // Leftover lags that do not fill a band.
+    for (int lag = lag0; lag <= max_lag; ++lag) {
+        double s = 0.0;
+        for (uint32_t j = 0; j < n - (uint32_t)lag; ++j) s += w[j] * w[j + lag];
+        autoc[lag] = s;
+    }
+}
+
 static void compute_lpc_residuals(
     const int32_t* shifted, uint32_t bsize,
     const int32_t* qc, int ord, int shift, int32_t* residuals)
@@ -997,11 +1043,11 @@ SubframeParams Optimizer::optimize_subframe(
             // Autocorrelation for all lags 0..min(32, bsize-1)
             double autoc[33] = {};
             int max_lag = (int)std::min((uint32_t)32, bsize - 1);
-            for (int lag = 0; lag <= max_lag; ++lag) {
-                INSTR(g_instr.autoc_macs.fetch_add(bsize - (uint32_t)lag, std::memory_order_relaxed));
-                for (uint32_t j = 0; j < bsize - (uint32_t)lag; ++j)
-                    autoc[lag] += windowed[j] * windowed[j + lag];
-            }
+#ifdef FLACOUT_INSTRUMENT
+            for (int lag = 0; lag <= max_lag; ++lag)
+                g_instr.autoc_macs.fetch_add(bsize - (uint32_t)lag, std::memory_order_relaxed);
+#endif
+            autocorrelation(windowed.data(), bsize, max_lag, autoc);
             if (autoc[0] <= 0.0) return false;
 
             std::memset(all_lpc, 0, sizeof(all_lpc));

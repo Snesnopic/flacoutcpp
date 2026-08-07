@@ -67,3 +67,14 @@ and low `N` is dominated by fixed per-block costs rather than by `N` itself,
 which is why `-c 1` is not much faster than `-c 8`.
 
 These figures are one excerpt of one track; the trade depends on the material.
+
+### Reproducibility
+
+For a given input and options, flacoutcpp produces the same bytes regardless of
+optimization level or host CPU tuning. This is not free: the encoder picks LPC
+coefficients from a double-precision autocorrelation and quantizes them to 8-15
+bits, so a last-bit rounding difference can occasionally tip which candidate
+wins. `flacout_lib` is therefore built with floating-point contraction disabled
+(`-ffp-contract=off`, or `/fp:precise` on MSVC) — see the comment in
+`CMakeLists.txt`. Do not override it if byte-identical output across builds
+matters to you.

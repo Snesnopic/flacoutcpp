@@ -31,6 +31,25 @@ those files, and the right response is to re-record after checking the size
 delta went the way you intended. A reference including them can only be recorded
 from the commit that added `-c` or later.
 
+### Why the reference is portable at all
+
+The optimizer derives LPC coefficients from a double-precision autocorrelation
+and quantizes them to 8-15 bit integers. A last-bit difference in that sum
+usually quantizes to the same integer — but occasionally lands one step over,
+which changes the residuals, the cost, and therefore which candidate wins. The
+encoded bitstream is that sensitive to floating-point rounding.
+
+That is why `flacout_lib` is built with `-ffp-contract=off` (see the comment in
+`CMakeLists.txt`). Without it, whether the compiler fuses `a += x * y` into a
+single-rounding FMA leaks into the output: clang at `-O3` and the same clang
+with contraction disabled disagreed on 7 of the 14 cases here. With it pinned,
+`-O0`, `-O1`, `-O2`, `-O3` and `FLACOUT_NATIVE=ON` all produce identical files.
+
+So if a `verify` fails only on some builds, suspect the FP settings before
+suspecting the change. And be aware the guarantee is only as strong as that flag
+— a compiler that ignores it, or a different libm for the window functions,
+could still diverge.
+
 `cmp` also cannot tell you whether the encoder is still lossless, only whether it
 is consistent. For that, decode and compare against the source:
 

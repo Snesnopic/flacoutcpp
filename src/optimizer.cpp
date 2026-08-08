@@ -1179,6 +1179,22 @@ SubframeParams Optimizer::optimize_subframe(
     const std::vector<WindowType>& windows, bool exhaustive,
     unsigned max_candidates)
 {
+    // Heuristic mode ranks candidates too, just with its smaller window set.
+    // The Levinson-error scoring below prices every (window, order) pair for
+    // the cost of the analysis alone, so sweeping all of them through the
+    // (much more expensive) exact evaluation buys little over fully evaluating
+    // the most promising few. Note this makes the precision sweep the full
+    // 8-15 ladder rather than {12,15}, same as -c.
+    //
+    // 8 candidates costs ~0.03% size on real music (16- and 24-bit alike) for
+    // ~1.75x. Known weak spot: near-white 24-bit content, where the Levinson
+    // errors are almost flat across orders and the ranking is noise — 24-bit
+    // whitenoise fixtures grew 2-2.8% at N=8 and needed N=32 for parity. Real
+    // music does not behave that way, and pricing all content at N=32 keeps
+    // only 1.17x, so the flat 8 stands.
+    if (!exhaustive && max_candidates == 0)
+        max_candidates = 8;
+
     SubframeParams best{};
     best.bits_cost = std::numeric_limits<uint32_t>::max();
 #ifdef FLACOUT_INSTRUMENT

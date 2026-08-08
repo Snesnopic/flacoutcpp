@@ -4,8 +4,8 @@
  *
  * flacoutcpp is a FLAC re-encoder that achieves better compression than
  * `flac --best` by exhaustively searching the LPC parameter space
- * (26 apodization windows × 32 orders × 8 quantization precisions × 4 stereo
- * modes per block) and selecting the globally optimal variable block-size
+ * (26 standard apodization windows × 32 orders × 8 quantization precisions ×
+ * 4 stereo modes per block) and selecting the globally optimal variable block-size
  * partition via dynamic programming.
  *
  * ### Typical usage
@@ -50,9 +50,11 @@ struct Config {
     /**
      * @brief Apodization windows to test during LPC optimisation.
      *
-     * An empty vector (the default) enables all 26 built-in windows, which
-     * yields maximum compression at the cost of higher CPU usage.  Supply a
-     * smaller set to trade compression for speed.
+     * An empty vector (the default) enables all 26 standard windows under
+     * exhaustive mode, which yields maximum compression at the cost of higher
+     * CPU usage.  Supply a smaller set to trade compression for speed.
+     * Experimental windows (WindowType values from EXPERIMENTAL_BEGIN on)
+     * are used only when named here explicitly.
      *
      * @see WindowType for the list of available windows.
      */
@@ -73,7 +75,7 @@ struct Config {
      * When true, every (position, block size) pair in the partitioning DP is
      * fully encoded rather than estimated from granule autocorrelations, all
      * four stereo modes are fully evaluated per block, and the default window
-     * set widens to all 26 windows. Can be extremely slow.
+     * set widens to all 26 standard windows. Can be extremely slow.
      *
      * Orthogonal to @ref max_candidates: this option decides how *blocks* are
      * priced; @c max_candidates decides how deep the per-subframe LPC search

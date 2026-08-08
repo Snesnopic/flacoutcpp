@@ -27,7 +27,8 @@ struct ProcessorConfig {
     /**
      * @brief Apodization windows to test during the exhaustive LPC search.
      * 
-     * If empty, all 26 supported windows are evaluated to maximize compression.
+     * If empty, all 26 standard windows are evaluated to maximize compression
+     * (experimental windows must be named explicitly).
      */
     std::vector<WindowType> windows;
 

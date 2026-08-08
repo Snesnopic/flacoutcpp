@@ -48,7 +48,8 @@ Two independent knobs control the search:
 - **`-e`** switches the block-partitioning DP from granule-based *estimates* to
   *exact* costs — every (position, block size) pair and every stereo mode is
   fully encoded before the DP chooses — and widens the window set from 4 to
-  all 26. Orders of magnitude more CPU.
+  all 26 standard windows (experimental windows such as `lanczos` stay opt-in
+  via `-w`). Orders of magnitude more CPU.
 - **`-c N`** bounds the per-subframe LPC search. Levinson-Durbin already
   computes the prediction error at each order as a by-product of deriving the
   coefficients; the ranking uses it to estimate every (window, order) pair's

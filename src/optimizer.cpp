@@ -41,7 +41,7 @@ struct InstrCounters {
     std::atomic<uint64_t> win_order_hist[33]{};
     std::atomic<uint64_t> best_order_hist[33]{};
     std::atomic<uint64_t> best_prec_hist[16]{};
-    std::atomic<uint64_t> best_window_hist[32]{};
+    std::atomic<uint64_t> best_window_hist[(size_t)WindowType::COUNT]{};
     ~InstrCounters() {
         std::fprintf(stderr, "\n===== INSTRUMENTATION =====\n");
         std::fprintf(stderr, "subframes optimized     : %llu\n", (unsigned long long)subframes);
@@ -72,7 +72,7 @@ struct InstrCounters {
         for (int i = 0; i < 16; ++i)
             if (best_prec_hist[i]) std::fprintf(stderr, "   prec %2d: %llu\n", i, (unsigned long long)best_prec_hist[i]);
         std::fprintf(stderr, "WINNING window histogram:\n");
-        for (int i = 0; i < 32; ++i)
+        for (int i = 0; i < (int)WindowType::COUNT; ++i)
             if (best_window_hist[i]) std::fprintf(stderr, "   %-22s: %llu\n",
                 window_to_name((WindowType)i).c_str(), (unsigned long long)best_window_hist[i]);
         std::fprintf(stderr, "===========================\n");
@@ -95,9 +95,11 @@ static InstrCounters g_instr;
 // WindowType utilities
 // ============================================================
 
-std::vector<WindowType> all_window_types() {
+std::vector<WindowType> all_window_types(bool include_experimental) {
     std::vector<WindowType> out;
-    for (int i = 0; i < (int)WindowType::COUNT; ++i)
+    const int end = include_experimental ? (int)WindowType::COUNT
+                                         : (int)WindowType::EXPERIMENTAL_BEGIN;
+    for (int i = 0; i < end; ++i)
         out.push_back((WindowType)i);
     return out;
 }
@@ -130,6 +132,11 @@ std::string window_to_name(WindowType wt) {
         case WindowType::PARTIAL_TUKEY_2_067:      return "partialtukey2_067";
         case WindowType::PUNCHOUT_TUKEY_2_033:     return "punchouttukey2_033";
         case WindowType::PUNCHOUT_TUKEY_2_067:     return "punchouttukey2_067";
+        case WindowType::LANCZOS:                  return "lanczos";
+        case WindowType::BOHMAN:                   return "bohman";
+        case WindowType::PARZEN:                   return "parzen";
+        case WindowType::PLANCKTAPER_010:          return "plancktaper010";
+        case WindowType::PLANCKTAPER_025:          return "plancktaper025";
         default:                                   return "unknown";
     }
 }
@@ -167,6 +174,11 @@ WindowType window_from_name(const std::string& raw) {
     if (clean == "partialtukey2067")                      return WindowType::PARTIAL_TUKEY_2_067;
     if (clean == "punchouttukey2033")                     return WindowType::PUNCHOUT_TUKEY_2_033;
     if (clean == "punchouttukey2067")                     return WindowType::PUNCHOUT_TUKEY_2_067;
+    if (clean == "lanczos")                               return WindowType::LANCZOS;
+    if (clean == "bohman")                                return WindowType::BOHMAN;
+    if (clean == "parzen")                                return WindowType::PARZEN;
+    if (clean == "plancktaper010")                        return WindowType::PLANCKTAPER_010;
+    if (clean == "plancktaper025")                        return WindowType::PLANCKTAPER_025;
     return WindowType::COUNT; // unrecognised
 }
 
@@ -203,7 +215,8 @@ Optimizer::Optimizer(uint32_t channels, uint32_t bps, uint32_t sample_rate,
 // ============================================================
 // Window application
 // ============================================================
-// All window formulas match libFLAC's window.c exactly.
+// All window formulas up to EXPERIMENTAL_BEGIN match libFLAC's window.c
+// exactly; experimental windows past it are our own additions.
 
 // Note for future profilers: a 16-thread `sample` of -c once attributed ~24%
 // of runtime to the trig here; a single-threaded profile put it at ~2%. The
@@ -383,6 +396,44 @@ static void compute_window_coeffs(WindowType wt, uint32_t N, double* out)
             break;
         }
 
+        case WindowType::LANCZOS: {
+            // sinc(2i/(N-1) - 1); not in libFLAC. Experimental (-w only).
+            double x = 2.0*fi/fN - 1.0;
+            w = (x == 0.0) ? 1.0 : std::sin(M_PI*x) / (M_PI*x);
+            break;
+        }
+
+        case WindowType::BOHMAN: {
+            // (1-|x|)cos(pi|x|) + sin(pi|x|)/pi, x in [-1,1]. Experimental.
+            double x = std::abs(2.0*fi/fN - 1.0);
+            w = (1.0 - x)*std::cos(M_PI*x) + std::sin(M_PI*x)/M_PI;
+            break;
+        }
+
+        case WindowType::PARZEN: {
+            // Piecewise cubic B-spline (scipy form), x = |i - (N-1)/2| / (N/2).
+            // Experimental.
+            double x = std::abs(fi - fNh) / ((double)N / 2.0);
+            if (x <= 0.5) w = 1.0 - 6.0*x*x*(1.0 - x);
+            else { double k = 1.0 - x; w = 2.0*k*k*k; }
+            break;
+        }
+
+        case WindowType::PLANCKTAPER_010:
+        case WindowType::PLANCKTAPER_025: {
+            // Flat center, C-infinity edges: w = 1/(e^Z + 1) over the first
+            // and last eps*N samples, Z = eps*N*(1/j + 1/(j - eps*N)), with
+            // w(0) = w(N-1) = 0. Experimental.
+            double eps = (wt == WindowType::PLANCKTAPER_010) ? 0.10 : 0.25;
+            double t = eps * (double)N;
+            double j = std::min(fi, fN - fi);
+            if (j <= 0.0)     w = 0.0;
+            else if (j < t) { double Z = t*(1.0/j + 1.0/(j - t));
+                              w = 1.0 / (std::exp(Z) + 1.0); }
+            else              w = 1.0;
+            break;
+        }
+
         default:
             w = 1.0; break;
         }
@@ -404,7 +455,8 @@ static int candidate_slot(uint32_t N)
     return -1;
 }
 
-// All 26 windows x 5 candidate sizes, built once on first use (~6.6 MB,
+// All windows (incl. experimental) x 5 candidate sizes, built once on first
+// use (~254 KB per window; ~7.6 MB at 30 windows,
 // thread-safe magic static — worker threads block on the first builder and
 // read lock-free forever after). The values are computed by the exact code
 // that used to run inline per block, so the output is bit-identical.
@@ -433,7 +485,7 @@ static const double* window_table(WindowType wt, int slot)
 // Sum of squared window coefficients, the normalizer that turns a windowed
 // Levinson error into an absolute residual-variance estimate (see the ranked
 // scoring in optimize_subframe). Cached for the precomputed table sizes —
-// 26 x 5 doubles, built lazily from the tables themselves — and computed on
+// COUNT x 5 doubles, built lazily from the tables themselves — and computed on
 // the fly for the rare other sizes (remainder block, short-stream path).
 static double window_energy(WindowType wt, uint32_t N)
 {

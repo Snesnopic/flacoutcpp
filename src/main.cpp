@@ -27,7 +27,9 @@ static void print_usage(const char* prog) {
         << "  gauss025, gauss0125, hamming, hann, kaiserbessel, nuttall, triangle, welch,\n"
         << "  tukey005, tukey010, tukey020, tukey050, tukey075, tukey090,\n"
         << "  partialtukey2, partialtukey2_033, partialtukey2_067,\n"
-        << "  punchouttukey2_033, punchouttukey2_067\n";
+        << "  punchouttukey2_033, punchouttukey2_067\n"
+        << "Experimental windows (never in a default set; explicit -w only):\n"
+        << "  lanczos, bohman, parzen, plancktaper010, plancktaper025\n";
 }
 
 // Split a comma-separated string into tokens.

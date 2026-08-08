@@ -4,7 +4,8 @@
  *
  * The Optimizer class is the computational core of flacoutcpp.  For each
  * candidate block it evaluates every combination of:
- *   - 26 apodization windows (WindowType)
+ *   - 26 standard apodization windows (WindowType; plus experimental
+ *     windows opt-in via an explicit window list)
  *   - LPC orders 1–32 (Levinson-Durbin via compute_lpc_all_orders)
  *   - Quantization precisions 8–15 bits
  *   - 4 stereo modes: Independent, Left-Side, Right-Side, Mid-Side
@@ -66,7 +67,17 @@ enum class WindowType : uint8_t {
     PARTIAL_TUKEY_2_067,      ///< Partial Tukey (2 partitions, offset 0.67).
     PUNCHOUT_TUKEY_2_033,     ///< Punchout Tukey (2 partitions, offset 0.33).
     PUNCHOUT_TUKEY_2_067,     ///< Punchout Tukey (2 partitions, offset 0.67).
-    COUNT                     ///< Sentinel — total number of window types.
+    // Experimental windows: reachable only via an explicit -w list; excluded
+    // from all_window_types() until measurement earns them promotion
+    // (WINDOWS_PLAN.md). Keeping them past this line keeps every default
+    // window set — and therefore every default-mode bitstream — unchanged.
+    LANCZOS,                  ///< Lanczos (sinc) window. Experimental, -w only.
+    BOHMAN,                   ///< Bohman window. Experimental, -w only.
+    PARZEN,                   ///< Parzen (cubic B-spline) window. Experimental, -w only.
+    PLANCKTAPER_010,          ///< Planck-taper window, ε = 0.10. Experimental, -w only.
+    PLANCKTAPER_025,          ///< Planck-taper window, ε = 0.25. Experimental, -w only.
+    COUNT,                    ///< Sentinel — total number of window types.
+    EXPERIMENTAL_BEGIN = LANCZOS ///< First experimental (opt-in) window.
 };
 
 /**
@@ -84,12 +95,13 @@ WindowType window_from_name(const std::string& raw);
 std::string window_to_name(WindowType wt);
 
 /**
- * @brief Return a vector containing all 26 window types (excluding COUNT).
+ * @brief Return a vector of window types (excluding COUNT).
  *
- * Passing this set to the Optimizer enables maximum compression at full
- * CPU cost.
+ * By default returns the 26 standard windows — the set exact-DP mode (-e)
+ * sweeps. Pass @p include_experimental to also get the experimental windows,
+ * which are otherwise reachable only through an explicit @c -w list.
  */
-std::vector<WindowType> all_window_types();
+std::vector<WindowType> all_window_types(bool include_experimental = false);
 
 /// @}
 
@@ -165,7 +177,8 @@ public:
      * @param channels     Number of audio channels (1 or 2).
      * @param bps          Bits per sample (e.g. 16, 24).
      * @param sample_rate  Stream sample rate in Hz (prices frame headers in the DP).
-     * @param windows      Apodization windows to test.  Empty → all 26 windows.
+     * @param windows      Apodization windows to test.  Empty → the default
+     *                     set (all 26 standard windows under -e).
      * @param max_threads  Worker thread limit.  0 → all logical CPUs.
      * @param max_candidates  Ranked-search budget: the number of
      *        (window, order) pairs fully evaluated per subframe.  0 (default)

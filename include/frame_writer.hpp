@@ -66,6 +66,28 @@ public:
                                uint32_t sample_rate, uint32_t payload_bits);
 
     /**
+     * @brief Re-emit a complete input frame under this stream's conventions.
+     *
+     * Splices the input frame's subframe payload verbatim (it is byte-aligned
+     * after the header and independent of header framing), but rebuilds the
+     * header — variable blocking strategy, canonical blocksize/samplerate
+     * codes, the given absolute sample number — and recomputes CRC-8/16.
+     * The channel-assignment/bps byte is copied from the input header since
+     * the payload's interpretation depends on it.
+     *
+     * @param in           Raw bytes of one complete input frame.
+     * @param len          Length of @p in in bytes (header through CRC-16).
+     * @param sample_number Absolute first-sample index for the new header.
+     * @param block_size   Samples in this frame (drives the blocksize code).
+     * @param sample_rate  Stream sample rate (drives the samplerate code).
+     * @return Rewritten frame bytes, or an empty vector if the input header
+     *         cannot be parsed (caller should fall back to re-encoding).
+     */
+    static std::vector<uint8_t> rewrite_frame(
+        const uint8_t* in, size_t len,
+        uint64_t sample_number, uint32_t block_size, uint32_t sample_rate);
+
+    /**
      * @brief Serialize the 38-byte STREAMINFO metadata block.
      * 
      * @param is_last       True if this is the final metadata block before audio frames.

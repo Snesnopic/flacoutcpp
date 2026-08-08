@@ -110,6 +110,64 @@ uint8_t FrameWriter::encode_bps(uint32_t bps) {
     }
 }
 
+std::vector<uint8_t> FrameWriter::rewrite_frame(
+    const uint8_t* in, size_t len,
+    uint64_t sample_number, uint32_t block_size, uint32_t sample_rate)
+{
+    // Parse just enough of the input header to find the payload. Layout:
+    // sync(14) res(1) blocking(1) | bs code(4) sr code(4) | ch(4) bps(3)
+    // res(1) | UTF-8 number (1-7 B) | bs extra (0-2 B) | sr extra (0-2 B) |
+    // CRC-8. Subframes follow byte-aligned; the last 2 bytes are CRC-16.
+    if (len < 8 || in[0] != 0xFF || (in[1] & 0xF8u) != 0xF8u)
+        return {};
+    const uint8_t bs_code_in = (uint8_t)(in[2] >> 4);
+    const uint8_t sr_code_in = (uint8_t)(in[2] & 0x0F);
+
+    size_t utf8_bytes = 0;
+    const uint8_t lead = in[4];
+    if      ((lead & 0x80u) == 0x00u) utf8_bytes = 1;
+    else if ((lead & 0xE0u) == 0xC0u) utf8_bytes = 2;
+    else if ((lead & 0xF0u) == 0xE0u) utf8_bytes = 3;
+    else if ((lead & 0xF8u) == 0xF0u) utf8_bytes = 4;
+    else if ((lead & 0xFCu) == 0xF8u) utf8_bytes = 5;
+    else if ((lead & 0xFEu) == 0xFCu) utf8_bytes = 6;
+    else if (lead == 0xFEu)           utf8_bytes = 7;
+    else return {};
+
+    size_t bs_extra_in = (bs_code_in == 0x6) ? 1 : (bs_code_in == 0x7) ? 2 : 0;
+    size_t sr_extra_in = (sr_code_in == 0xC) ? 1
+                       : (sr_code_in == 0xD || sr_code_in == 0xE) ? 2 : 0;
+    const size_t hdr_len = 4 + utf8_bytes + bs_extra_in + sr_extra_in + 1;
+    if (len < hdr_len + 2) return {};
+    const uint8_t* payload     = in + hdr_len;
+    const size_t   payload_len = len - hdr_len - 2; // strip input CRC-16
+
+    BitWriter bw;
+    bw.write_bits(0x3FFE, 14);
+    bw.write_bits(0, 1);
+    bw.write_bits(1, 1);  // variable blocking strategy, like write_frame
+
+    uint32_t bs_extra_val = 0; int bs_extra_bits = 0;
+    bw.write_bits(blocksize_code(block_size, bs_extra_val, bs_extra_bits), 4);
+    uint32_t sr_extra_val = 0; int sr_extra_bits = 0;
+    bw.write_bits(samplerate_code(sample_rate, sr_extra_val, sr_extra_bits), 4);
+
+    bw.write_bits(in[3], 8);  // channel assignment + bps + reserved, verbatim
+
+    bw.write_utf8(sample_number);
+    if (bs_extra_bits > 0) bw.write_bits(bs_extra_val, bs_extra_bits);
+    if (sr_extra_bits > 0) bw.write_bits(sr_extra_val, sr_extra_bits);
+    bw.write_bits(bw.crc8(0, bw.byte_size()), 8);
+
+    for (size_t i = 0; i < payload_len; ++i)
+        bw.write_bits(payload[i], 8);
+
+    uint16_t crc16 = bw.crc16(0, bw.byte_size());
+    bw.write_bits(crc16 >> 8,   8);
+    bw.write_bits(crc16 & 0xFF, 8);
+    return bw.buffer();
+}
+
 // ============================================================
 // Main frame serialization
 // ============================================================

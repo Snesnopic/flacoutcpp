@@ -93,7 +93,15 @@ bool Processor::process() {
         return false;
     }
 
-    bool ok = FLAC__stream_decoder_process_until_end_of_stream(decoder);
+    // For frame reuse we need each input frame's byte range. Decode metadata
+    // first so the position query below lands on the first audio frame.
+    bool ok = true;
+    if (m_config.reuse_frames) {
+        ok = FLAC__stream_decoder_process_until_end_of_metadata(decoder);
+        if (ok && !FLAC__stream_decoder_get_decode_position(decoder, &m_prev_frame_end))
+            m_frame_pos_ok = false;
+    }
+    ok = ok && FLAC__stream_decoder_process_until_end_of_stream(decoder);
     FLAC__stream_decoder_delete(decoder);
 
     if (!ok || m_pcm_data.empty() || m_total_samples == 0) return false;
@@ -177,37 +185,120 @@ bool Processor::process() {
 
     // --- Step 5: encode and write frames ----
     FrameWriter fw;
-    uint64_t sample_number = 0;
     uint32_t min_frm = std::numeric_limits<uint32_t>::max();
     uint32_t max_frm = 0;
+    uint32_t emit_min_bs = std::numeric_limits<uint32_t>::max();
+    uint32_t emit_max_bs = 0;
+    size_t   total_written = 0;
+    size_t   frames_reused = 0;
 
-    size_t total_written = 0;
-    for (const auto& block : blocks) {
-        auto frame_bytes = fw.write_frame(
-            block, m_pcm_data, sample_number, m_sample_rate, m_bps);
+    auto emit = [&](const std::vector<uint8_t>& fb, uint32_t bs) {
+        out.write(reinterpret_cast<const char*>(fb.data()),
+                  (std::streamsize)fb.size());
+        min_frm = std::min(min_frm, (uint32_t)fb.size());
+        max_frm = std::max(max_frm, (uint32_t)fb.size());
+        emit_min_bs = std::min(emit_min_bs, bs);
+        emit_max_bs = std::max(emit_max_bs, bs);
+        total_written += fb.size();
+    };
 
-        // Debug builds: the optimizer's predicted frame size must equal what
-        // the writer actually emitted, or the DP is optimizing a cost the
-        // stream does not pay. (block.total_bits is exact here — every block
-        // in the final sequence came from compute_block.)
-        assert(frame_bytes.size() * 8 ==
-               FrameWriter::frame_bits(sample_number, block.block_size,
-                                       m_sample_rate, block.total_bits));
+    // Frame reuse: the input's own frames compete against the re-encoded
+    // ones wherever both partitions share a boundary. Validate that the
+    // recorded frames tile the stream, then load the input bytes for
+    // payload splicing.
+    bool reuse = m_config.reuse_frames && m_frame_pos_ok && !m_input_frames.empty();
+    std::vector<uint8_t> input_bytes;
+    if (reuse) {
+        uint64_t expect = 0;
+        for (const auto& f : m_input_frames) {
+            if (f.first_sample != expect || f.byte_end <= f.byte_start) { reuse = false; break; }
+            expect += f.block_size;
+        }
+        if (expect != m_total_samples) reuse = false;
+    }
+    if (reuse) {
+        std::ifstream inf(m_input, std::ios::binary);
+        inf.seekg(0, std::ios::end);
+        input_bytes.resize((size_t)inf.tellg());
+        inf.seekg(0, std::ios::beg);
+        inf.read(reinterpret_cast<char*>(input_bytes.data()),
+                 (std::streamsize)input_bytes.size());
+        if (!inf || input_bytes.size() < m_input_frames.back().byte_end)
+            reuse = false;
+    }
 
-        out.write(reinterpret_cast<const char*>(frame_bytes.data()),
-                  (std::streamsize)frame_bytes.size());
+    if (!reuse) {
+        uint64_t sample_number = 0;
+        for (const auto& block : blocks) {
+            auto frame_bytes = fw.write_frame(
+                block, m_pcm_data, sample_number, m_sample_rate, m_bps);
 
-        sample_number += block.block_size;
-        min_frm = std::min(min_frm, (uint32_t)frame_bytes.size());
-        max_frm = std::max(max_frm, (uint32_t)frame_bytes.size());
-        total_written += frame_bytes.size();
+            // Debug builds: the optimizer's predicted frame size must equal what
+            // the writer actually emitted, or the DP is optimizing a cost the
+            // stream does not pay. (block.total_bits is exact here — every block
+            // in the final sequence came from compute_block.)
+            assert(frame_bytes.size() * 8 ==
+                   FrameWriter::frame_bits(sample_number, block.block_size,
+                                           m_sample_rate, block.total_bits));
+
+            emit(frame_bytes, block.block_size);
+            sample_number += block.block_size;
+        }
+    } else {
+        // Two-pointer walk over both partitions. A segment closes whenever
+        // they hit a common sample boundary; whichever side spent fewer
+        // bytes over the segment is emitted. Ties keep the re-encoded
+        // frames, so a second pass over our own output is byte-stable.
+        size_t bi = 0, ij = 0;
+        uint64_t our_end = 0, in_end = 0;
+        std::vector<std::pair<std::vector<uint8_t>, uint32_t>> ours, theirs;
+        size_t our_sz = 0, in_sz = 0;
+        bool   seg_ok = true; // false if any input frame failed to rewrite
+
+        while (bi < blocks.size() || ij < m_input_frames.size()) {
+            if (our_end <= in_end && bi < blocks.size()) {
+                const auto& block = blocks[bi++];
+                auto fb = fw.write_frame(
+                    block, m_pcm_data, our_end, m_sample_rate, m_bps);
+                assert(fb.size() * 8 ==
+                       FrameWriter::frame_bits(our_end, block.block_size,
+                                               m_sample_rate, block.total_bits));
+                our_sz += fb.size();
+                our_end += block.block_size;
+                ours.emplace_back(std::move(fb), block.block_size);
+            } else if (ij < m_input_frames.size()) {
+                const auto& f = m_input_frames[ij++];
+                auto fb = FrameWriter::rewrite_frame(
+                    &input_bytes[f.byte_start],
+                    (size_t)(f.byte_end - f.byte_start),
+                    f.first_sample, f.block_size, m_sample_rate);
+                if (fb.empty()) seg_ok = false;
+                else in_sz += fb.size();
+                in_end += f.block_size;
+                theirs.emplace_back(std::move(fb), f.block_size);
+            } else {
+                break; // partitions disagree on total length; validated above
+            }
+
+            if (our_end == in_end && !ours.empty() && !theirs.empty()) {
+                const bool take_input = seg_ok && in_sz < our_sz;
+                auto& chosen = take_input ? theirs : ours;
+                if (take_input) frames_reused += theirs.size();
+                for (auto& [fb, bs] : chosen) emit(fb, bs);
+                ours.clear(); theirs.clear();
+                our_sz = in_sz = 0;
+                seg_ok = true;
+            }
+        }
     }
 
     // --- Step 6: seek back and update STREAMINFO with frame sizes + MD5 ----
+    // Block sizes come from the emitted frames — with reuse they can differ
+    // from the DP's blocks.
     // Position: fLaC(4) + STREAMINFO block header(4) = byte 8
     out.seekp(8, std::ios::beg);
     auto si_updated = FrameWriter::make_streaminfo_block(
-        si_is_last, min_bs, max_bs,
+        si_is_last, emit_min_bs, emit_max_bs,
         min_frm, max_frm,
         m_sample_rate, m_channels, m_bps, m_total_samples,
         md5_digest.data());
@@ -223,16 +314,44 @@ bool Processor::process() {
     }
     out.close();
 
+    // Whole-file guarantee: if the finished file is still larger than the
+    // input, ship the input unchanged. Only with copy_metadata — the copy
+    // preserves the input's metadata, which -n explicitly asked to drop.
+    bool copied_through = false;
+    if (m_config.reuse_frames && m_config.copy_metadata) {
+        std::ifstream a(tmp_output, std::ios::binary | std::ios::ate);
+        std::ifstream b(m_input,    std::ios::binary | std::ios::ate);
+        if (a && b && a.tellg() > b.tellg()) {
+            b.seekg(0, std::ios::beg);
+            std::ofstream repl(tmp_output, std::ios::binary | std::ios::trunc);
+            repl << b.rdbuf();
+            if (!repl) {
+                std::cerr << "Error: copy-through write failed.\n";
+                std::remove(tmp_output.c_str());
+                return false;
+            }
+            copied_through = true;
+        }
+    }
+
     if (std::rename(tmp_output.c_str(), m_output.c_str()) != 0) {
         std::cerr << "Error: could not finalize output file: " << m_output << "\n";
         std::remove(tmp_output.c_str());
         return false;
     }
 
-    if (m_config.verbose)
-        std::cout << "Wrote " << total_written << " bytes of audio data ("
-                  << blocks.size() << " frames, min=" << min_bs
-                  << " max=" << max_bs << " samples/frame).\n";
+    if (m_config.verbose) {
+        if (copied_through)
+            std::cout << "Output would exceed the input; copied the input through unchanged.\n";
+        else
+            std::cout << "Wrote " << total_written << " bytes of audio data ("
+                      << blocks.size() << " frames, min=" << emit_min_bs
+                      << " max=" << emit_max_bs << " samples/frame"
+                      << (frames_reused
+                          ? ", " + std::to_string(frames_reused) + " input frames reused"
+                          : std::string())
+                      << ").\n";
+    }
     return true;
 }
 
@@ -241,7 +360,7 @@ bool Processor::process() {
 // ============================================================
 
 FLAC__StreamDecoderWriteStatus Processor::write_callback(
-    const FLAC__StreamDecoder*, const FLAC__Frame* frame,
+    const FLAC__StreamDecoder* decoder, const FLAC__Frame* frame,
     const FLAC__int32* const buffer[], void* client_data)
 {
     auto* self = static_cast<Processor*>(client_data);
@@ -250,6 +369,23 @@ FLAC__StreamDecoderWriteStatus Processor::write_callback(
 
     if (self->m_pcm_data.empty())
         self->m_pcm_data.resize(nch);
+
+    // Frame-reuse bookkeeping: the decode position after a frame is that
+    // frame's end; its start is the previous frame's end. Sample position
+    // comes from the running decode count, so it is right for both fixed-
+    // and variable-blocksize inputs.
+    if (self->m_config.reuse_frames && self->m_frame_pos_ok) {
+        uint64_t end = 0;
+        if (FLAC__stream_decoder_get_decode_position(decoder, &end)) {
+            self->m_input_frames.push_back(InputFrame{
+                (uint64_t)self->m_pcm_data[0].size(), bsize,
+                self->m_prev_frame_end, end });
+            self->m_prev_frame_end = end;
+        } else {
+            self->m_frame_pos_ok = false;
+            self->m_input_frames.clear();
+        }
+    }
 
     for (uint32_t c = 0; c < nch; ++c)
         self->m_pcm_data[c].insert(

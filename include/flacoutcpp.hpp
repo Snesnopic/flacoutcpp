@@ -112,6 +112,21 @@ struct Config {
     bool adaptive_windows = false;
 
     /**
+     * @brief Reuse input frames that beat the new encoding (experimental).
+     *
+     * The input file arrives already partitioned into frames whose exact
+     * compressed sizes are known. With this enabled, wherever the input's
+     * frames tile a span of the chosen partition in fewer bytes than the
+     * re-encoded frames, the input frames are spliced into the output
+     * (payload verbatim, header rewritten to this stream's conventions,
+     * CRCs recomputed). If the finished file is still larger than the
+     * input, the input is copied through unchanged (only when
+     * @ref copy_metadata is true, since copy-through preserves metadata).
+     * Together these guarantee re-encoding never grows a file.
+     */
+    bool reuse_frames = false;
+
+    /**
      * @brief Print progress and statistics to stdout during the run.
      *
      * Set to @c false to suppress progress/statistics output — useful when

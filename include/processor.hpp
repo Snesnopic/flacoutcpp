@@ -61,6 +61,13 @@ struct ProcessorConfig {
     bool adaptive_windows = false;
 
     /**
+     * @brief Splice input frames that beat the re-encoded ones, and copy the
+     * whole input through if the output would still be larger. See
+     * flacoutcpp::Config::reuse_frames.
+     */
+    bool reuse_frames = false;
+
+    /**
      * @brief If false, suppresses progress/statistics stdout output.
      * Errors always go to stderr regardless of this setting.
      */
@@ -122,6 +129,18 @@ private:
     std::string     m_input;
     std::string     m_output;
     ProcessorConfig m_config;
+
+    // Input frame map for frame reuse: sample span and byte range of every
+    // frame in the input file, recorded during decode (reuse_frames only).
+    struct InputFrame {
+        uint64_t first_sample;
+        uint32_t block_size;
+        uint64_t byte_start;
+        uint64_t byte_end;
+    };
+    std::vector<InputFrame> m_input_frames;
+    uint64_t m_prev_frame_end = 0;   // rolling byte offset during decode
+    bool     m_frame_pos_ok   = true; // false if the decoder can't report positions
 
     // Decoded PCM (per-channel, arrays of channel samples)
     std::vector<std::vector<int32_t>> m_pcm_data;

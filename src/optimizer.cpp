@@ -9,9 +9,11 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <future>
 #include <iostream>
 #include <limits>
+#include <sstream>
 #include <mutex>
 #include <map>
 #include <string>
@@ -96,12 +98,46 @@ static InstrCounters g_instr;
 // WindowType utilities
 // ============================================================
 
+// ------------------------------------------------------------
+// Runtime-loaded ("custom:") window registry
+// ------------------------------------------------------------
+// Filled by register_custom_window() before encoding starts, then read-only:
+// worker threads index it lock-free. Each entry carries its own coefficient
+// tables for the DP block sizes, so custom windows never touch the global
+// window table (which is sized for the compiled-in shapes only) and cost
+// nothing at all when unused.
+
+struct CustomWindow {
+    bool                loaded = false;
+    std::string         path;
+    std::vector<double> knots;
+    std::vector<double> tables;     ///< coefficients for each DP size, concatenated
+    std::vector<size_t> offsets;    ///< start of each DP size within `tables`
+    std::vector<double> energy;     ///< sum(w^2) per DP size
+    std::vector<double> zero_frac;  ///< fraction of exact zeros per DP size
+};
+
+static CustomWindow g_custom[MAX_CUSTOM_WINDOWS];
+
+static inline bool window_is_custom(WindowType wt) {
+    return (int)wt >= (int)WindowType::CUSTOM_BEGIN && (int)wt < (int)WindowType::COUNT;
+}
+
+static inline int custom_index(WindowType wt) {
+    return (int)wt - (int)WindowType::CUSTOM_BEGIN;
+}
+
 std::vector<WindowType> all_window_types(bool include_experimental) {
     std::vector<WindowType> out;
     const int end = include_experimental ? (int)WindowType::COUNT
                                          : (int)WindowType::EXPERIMENTAL_BEGIN;
-    for (int i = 0; i < end; ++i)
+    for (int i = 0; i < end; ++i) {
+        // Custom slots hold a shape only once something registers one; an
+        // empty slot is not a window and must never reach the search.
+        if (window_is_custom((WindowType)i) && !g_custom[custom_index((WindowType)i)].loaded)
+            continue;
         out.push_back((WindowType)i);
+    }
     return out;
 }
 
@@ -159,8 +195,14 @@ std::string window_to_name(WindowType wt) {
         case WindowType::DPSS_2:                   return "dpss2";
         case WindowType::DPSS_3:                   return "dpss3";
         case WindowType::DPSS_4:                   return "dpss4";
-        default:                                   return "unknown";
+        default: break;
     }
+    if (window_is_custom(wt)) {
+        const CustomWindow& cw = g_custom[custom_index(wt)];
+        return cw.loaded ? "custom:" + cw.path
+                         : "custom" + std::to_string(custom_index(wt)) + "(empty)";
+    }
+    return "unknown";
 }
 
 WindowType window_from_name(const std::string& raw) {
@@ -353,8 +395,43 @@ static void compute_dpss(uint32_t N, double NW, double* out)
     for (uint32_t i = 0; i < N; ++i) out[i] = v[i] / peak;
 }
 
+// Sample a registered knot vector at N points. The knots span the whole block,
+// so knot j sits at position j/(K-1) and sample i at i/(N-1).
+//
+// Two properties the arithmetic is arranged to guarantee exactly, because
+// experiments compare custom windows against compiled-in ones: a knot vector
+// of all-equal values reproduces that constant bit-for-bit (the `a + f*(b-a)`
+// form contributes exactly zero when a == b, which `a*(1-f) + b*f` does not),
+// and the first and last samples are the first and last knots.
+static void interpolate_custom(const std::vector<double>& k, uint32_t N, double* out)
+{
+    const size_t K = k.size();
+    if (N == 0) return;
+    if (N == 1) { out[0] = k[0]; return; }
+
+    const double span  = (double)(K - 1);
+    const double denom = (double)(N - 1);
+    for (uint32_t i = 0; i + 1 < N; ++i) {
+        const double x = (double)i * span / denom;   // < K-1 for i < N-1
+        size_t j = (size_t)x;
+        if (j + 1 >= K) j = K - 2;                   // defensive; x < K-1 already
+        const double frac = x - (double)j;
+        out[i] = k[j] + frac * (k[j + 1] - k[j]);
+    }
+    out[N - 1] = k[K - 1];
+}
+
 static void compute_window_coeffs(WindowType wt, uint32_t N, double* out)
 {
+    if (window_is_custom(wt)) {
+        const CustomWindow& cw = g_custom[custom_index(wt)];
+        // Unregistered slots cannot reach any window list, but a flat window
+        // keeps this total rather than leaving the buffer undefined.
+        if (!cw.loaded) { for (uint32_t i = 0; i < N; ++i) out[i] = 1.0; return; }
+        interpolate_custom(cw.knots, N, out);
+        return;
+    }
+
     auto fN = (double)(N - 1);
     auto fNh = fN / 2.0;
 
@@ -672,19 +749,30 @@ static int candidate_slot(uint32_t N)
     return -1;
 }
 
-// All windows (incl. experimental) x 5 candidate sizes, built once on first
-// use (~254 KB per window; ~13 MB at 51 windows,
+// All compiled-in windows (incl. experimental) x 5 candidate sizes, built once
+// on first use (~254 KB per window; ~13 MB at 51 windows,
 // thread-safe magic static — worker threads block on the first builder and
 // read lock-free forever after). The values are computed by the exact code
 // that used to run inline per block, so the output is bit-identical.
+//
+// Runtime-loaded (custom:) windows are deliberately not in here: this table is
+// built lazily during encoding, whereas custom shapes are registered before
+// it, so folding them in would trade a zero-cost lookup for an
+// order-of-initialisation trap. They carry equivalent per-entry tables built
+// at registration instead.
 static const double* window_table(WindowType wt, int slot)
 {
+    if (window_is_custom(wt)) {
+        const CustomWindow& cw = g_custom[custom_index(wt)];
+        return &cw.tables[cw.offsets[(size_t)slot]];
+    }
+
     static const std::vector<double> tables = [] {
         size_t total = 0;
         for (size_t c = 0; c < NUM_DP_CANDIDATES; ++c) total += DP_CANDIDATES[c];
-        std::vector<double> t((size_t)WindowType::COUNT * total);
+        std::vector<double> t((size_t)WindowType::CUSTOM_BEGIN * total);
         size_t off = 0;
-        for (int w = 0; w < (int)WindowType::COUNT; ++w)
+        for (int w = 0; w < (int)WindowType::CUSTOM_BEGIN; ++w)
             for (size_t c = 0; c < NUM_DP_CANDIDATES; ++c) {
                 compute_window_coeffs((WindowType)w, DP_CANDIDATES[c], &t[off]);
                 off += DP_CANDIDATES[c];
@@ -699,6 +787,100 @@ static const double* window_table(WindowType wt, int slot)
     return &tables[(size_t)wt * size_sum + prefix];
 }
 
+// Load a knot file into a free custom slot. Everything the encoder will later
+// need from the shape — coefficients, energy, zero fraction, at each DP block
+// size — is computed here, while we are still single-threaded.
+WindowType register_custom_window(const std::string& path, std::string* error)
+{
+    auto fail = [&](const std::string& msg) {
+        if (error) *error = msg;
+        return WindowType::COUNT;
+    };
+
+    for (int i = 0; i < MAX_CUSTOM_WINDOWS; ++i)
+        if (g_custom[i].loaded && g_custom[i].path == path)
+            return (WindowType)((int)WindowType::CUSTOM_BEGIN + i);
+
+    int slot = -1;
+    for (int i = 0; i < MAX_CUSTOM_WINDOWS; ++i)
+        if (!g_custom[i].loaded) { slot = i; break; }
+    if (slot < 0)
+        return fail("no free custom window slots (limit " +
+                    std::to_string(MAX_CUSTOM_WINDOWS) + ")");
+
+    std::ifstream in(path);
+    if (!in) return fail("cannot open file");
+
+    std::vector<double> knots;
+    std::string line;
+    size_t lineno = 0;
+    constexpr size_t MAX_KNOTS = 1u << 20;
+    while (std::getline(in, line)) {
+        ++lineno;
+        const size_t hash = line.find('#');
+        if (hash != std::string::npos) line.erase(hash);
+        for (char& c : line) if (c == ',' || c == ';' || c == '\t') c = ' ';
+        std::istringstream ls(line);
+        std::string tok;
+        while (ls >> tok) {
+            size_t used = 0;
+            double v;
+            try {
+                v = std::stod(tok, &used);
+            } catch (const std::exception&) {
+                return fail("line " + std::to_string(lineno) +
+                            ": not a number: '" + tok + "'");
+            }
+            if (used != tok.size())
+                return fail("line " + std::to_string(lineno) +
+                            ": trailing junk after number: '" + tok + "'");
+            if (!std::isfinite(v))
+                return fail("line " + std::to_string(lineno) +
+                            ": value is not finite: '" + tok + "'");
+            if (knots.size() >= MAX_KNOTS)
+                return fail("more than " + std::to_string(MAX_KNOTS) + " knots");
+            knots.push_back(v);
+        }
+    }
+    if (knots.size() < 2)
+        return fail("need at least 2 knots, found " +
+                    std::to_string(knots.size()));
+
+    bool all_zero = true;
+    for (double v : knots) if (v != 0.0) { all_zero = false; break; }
+    if (all_zero) return fail("window is identically zero");
+
+    CustomWindow& cw = g_custom[slot];
+    cw.path  = path;
+    cw.knots = std::move(knots);
+
+    size_t total = 0;
+    cw.offsets.resize(NUM_DP_CANDIDATES);
+    for (size_t c = 0; c < NUM_DP_CANDIDATES; ++c) {
+        cw.offsets[c] = total;
+        total += DP_CANDIDATES[c];
+    }
+    cw.tables.resize(total);
+    cw.energy.resize(NUM_DP_CANDIDATES);
+    cw.zero_frac.resize(NUM_DP_CANDIDATES);
+    for (size_t c = 0; c < NUM_DP_CANDIDATES; ++c) {
+        double* t = &cw.tables[cw.offsets[c]];
+        interpolate_custom(cw.knots, DP_CANDIDATES[c], t);
+        double   e = 0.0;
+        uint32_t z = 0;
+        for (uint32_t i = 0; i < DP_CANDIDATES[c]; ++i) {
+            e += t[i] * t[i];
+            if (t[i] == 0.0) ++z;
+        }
+        cw.energy[c]    = e;
+        cw.zero_frac[c] = (double)z / (double)DP_CANDIDATES[c];
+    }
+
+    // Last: nothing may observe a half-built entry.
+    cw.loaded = true;
+    return (WindowType)((int)WindowType::CUSTOM_BEGIN + slot);
+}
+
 // Sum of squared window coefficients, the normalizer that turns a windowed
 // Levinson error into an absolute residual-variance estimate (see the ranked
 // scoring in optimize_subframe). Cached for the precomputed table sizes —
@@ -707,10 +889,13 @@ static const double* window_table(WindowType wt, int slot)
 static double window_energy(WindowType wt, uint32_t N)
 {
     const int slot = candidate_slot(N);
-    if (slot >= 0) {
+    if (window_is_custom(wt)) {
+        const CustomWindow& cw = g_custom[custom_index(wt)];
+        if (slot >= 0) return cw.energy[(size_t)slot];
+    } else if (slot >= 0) {
         static const std::vector<double> energies = [] {
-            std::vector<double> e((size_t)WindowType::COUNT * NUM_DP_CANDIDATES);
-            for (int w = 0; w < (int)WindowType::COUNT; ++w)
+            std::vector<double> e((size_t)WindowType::CUSTOM_BEGIN * NUM_DP_CANDIDATES);
+            for (int w = 0; w < (int)WindowType::CUSTOM_BEGIN; ++w)
                 for (size_t c = 0; c < NUM_DP_CANDIDATES; ++c) {
                     const double* t = window_table((WindowType)w, (int)c);
                     double s = 0.0;
@@ -737,10 +922,13 @@ static double window_energy(WindowType wt, uint32_t N)
 static double window_zero_frac(WindowType wt, uint32_t N)
 {
     const int slot = candidate_slot(N);
-    if (slot >= 0) {
+    if (window_is_custom(wt)) {
+        const CustomWindow& cw = g_custom[custom_index(wt)];
+        if (slot >= 0) return cw.zero_frac[(size_t)slot];
+    } else if (slot >= 0) {
         static const std::vector<double> fracs = [] {
-            std::vector<double> f((size_t)WindowType::COUNT * NUM_DP_CANDIDATES);
-            for (int w = 0; w < (int)WindowType::COUNT; ++w)
+            std::vector<double> f((size_t)WindowType::CUSTOM_BEGIN * NUM_DP_CANDIDATES);
+            for (int w = 0; w < (int)WindowType::CUSTOM_BEGIN; ++w)
                 for (size_t c = 0; c < NUM_DP_CANDIDATES; ++c) {
                     const double* t = window_table((WindowType)w, (int)c);
                     uint32_t z = 0;

@@ -1,0 +1,25 @@
+# Example knot file for `-w custom:<file>` — also bench/check.sh's cw_* fixture.
+#
+# Values are the window's coefficients at evenly spaced positions across the
+# whole block, linearly interpolated to whatever block size the encoder needs.
+# The first value sits at the first sample, the last at the last, so 2 knots
+# describe a ramp and 9 (below) describe an 8-segment piecewise-linear shape.
+# Comments run from '#' to end of line; separators may be whitespace, commas,
+# semicolons, or newlines.
+#
+# Absolute scale does not matter: the LPC search is scale-invariant, so these
+# are used exactly as written with no normalisation.
+#
+# The shape here is a fast attack / slow decay taper — the asymmetry the
+# compiled-in symmetric windows cannot express — meant as a starting point to
+# edit, not as a tuned window.
+
+0.00   # block start
+0.85
+1.00   # peak early: attack
+0.97
+0.88
+0.74
+0.55
+0.31
+0.00   # block end

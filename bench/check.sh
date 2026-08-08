@@ -55,6 +55,11 @@ run rk_mono   -R -e -c 4 "$FIX/mono_2s.flac"
 run rk_24     -R -e -c 8 "$FIX/s24_2s.flac"
 run rk_short  -R -e -c 8 "$FIX/short.flac"
 run rk_win    -R -e -c 2 -w hann,tukey020 "$FIX/stereo_1s.flac"
+# Runtime-loaded window (-w custom:<file>): pins the knot parser and the
+# interpolation onto both table and non-table block sizes. The knot file is
+# committed next to this script, so these are reproducible anywhere.
+run cw_stereo -R    -w "custom:$HERE/windows/example_taper.txt",hann "$FIX/stereo_4s.flac"
+run cw_short  -R -e -w "custom:$HERE/windows/example_taper.txt"      "$FIX/short.flac"
 # Frame reuse (the default) — heuristic splice path and exact-DP reuse-edge
 # path, both over the ffmpeg-encoded fixtures so input frames actually
 # compete.

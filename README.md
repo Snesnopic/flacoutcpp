@@ -44,7 +44,8 @@ Options:
                        metadata says; incompatible with -R
   -q, --quiet          Suppress all progress output
   -t, --threads N      Limit parallel worker threads (default: all CPUs)
-  -w, --windows <list> Comma-separated list of apodization windows to use
+  -w, --windows <list> Comma-separated list of apodization windows to use;
+                       an entry custom:<file> loads a shape from a knot file
 ```
 
 If `[output.flac]` is omitted, it will default to `<input.flac>.optimized.flac`.
@@ -159,6 +160,29 @@ at unchanged analysis cost. Measured across a 9-album corpus at `-c 0` it
 saved 0.03–0.34% per album with zero regressing tracks; at the plain default
 it is nearly free but the gains are small. Excludes `-e` (which already
 offers every window) and `-w` (which fixes the set by hand).
+
+### Custom window shapes (`-w custom:<file>`)
+
+A `-w` entry of the form `custom:<file>` loads a window shape from a text file
+instead of using a compiled-in one, so new shapes can be tried — or searched
+over by an external script — without recompiling:
+
+```bash
+flacoutcpp -w custom:my_shape.txt,hann input.flac output.flac
+```
+
+The file holds the window's coefficients at evenly spaced positions across the
+block, one or many per line, separated by whitespace, commas or semicolons,
+with `#` starting a comment. They are linearly interpolated to whatever block
+size the encoder needs: two values describe a ramp, and as many values as the
+block size reproduces a shape exactly. Absolute scale is irrelevant — the LPC
+search is scale-invariant — so the values are used exactly as written, with no
+normalisation. Up to four may be loaded per run.
+[bench/windows/example_taper.txt](bench/windows/example_taper.txt) documents the
+format and is a usable starting point.
+
+Custom windows are opt-in like the other experimental windows: they are never
+part of any default set, so output is unchanged unless you name one.
 
 ### Reproducibility
 

@@ -106,9 +106,44 @@ enum class WindowType : uint8_t {
     DPSS_2,                   ///< DPSS window, NW = 2. Experimental, -w only.
     DPSS_3,                   ///< DPSS window, NW = 3. Experimental, -w only.
     DPSS_4,                   ///< DPSS window, NW = 4. Experimental, -w only.
+    // Runtime-loaded windows: shapes read from a knot file by
+    // register_custom_window(), reachable only as `-w custom:<file>`. These
+    // slots hold no shape until something registers one.
+    CUSTOM_0,                 ///< Runtime-loaded window slot 0. -w custom:<file> only.
+    CUSTOM_1,                 ///< Runtime-loaded window slot 1. -w custom:<file> only.
+    CUSTOM_2,                 ///< Runtime-loaded window slot 2. -w custom:<file> only.
+    CUSTOM_3,                 ///< Runtime-loaded window slot 3. -w custom:<file> only.
     COUNT,                    ///< Sentinel — total number of window types.
-    EXPERIMENTAL_BEGIN = LANCZOS ///< First experimental (opt-in) window.
+    EXPERIMENTAL_BEGIN = LANCZOS, ///< First experimental (opt-in) window.
+    CUSTOM_BEGIN = CUSTOM_0   ///< First runtime-loaded window slot.
 };
+
+/// Number of runtime-loadable window slots (WindowType::CUSTOM_0 onwards).
+constexpr int MAX_CUSTOM_WINDOWS =
+    (int)WindowType::COUNT - (int)WindowType::CUSTOM_BEGIN;
+
+/**
+ * @brief Load a window shape from a knot file into a free custom slot.
+ *
+ * The file is whitespace-, comma-, or newline-separated decimal values (`#`
+ * begins a comment); they are the window's coefficients at @c K evenly spaced
+ * positions spanning the whole block, and are linearly interpolated to
+ * whatever block size the encoder needs. Two knots therefore describe a ramp,
+ * and @c K equal to the block size reproduces the shape exactly. Absolute
+ * scale is irrelevant — the LPC search is scale-invariant — so no
+ * normalisation is applied; the values are used as written.
+ *
+ * Registering the same path twice returns the original slot rather than
+ * consuming a second one. Coefficient tables for the DP block sizes are built
+ * here, so **all registration must happen before encoding starts**; the
+ * registry is read lock-free by the worker threads and never mutated
+ * afterwards.
+ *
+ * @param path   File to read.
+ * @param error  Set to a human-readable reason when registration fails.
+ * @return       The slot's WindowType, or @c WindowType::COUNT on failure.
+ */
+WindowType register_custom_window(const std::string& path, std::string* error);
 
 /**
  * @brief Parse a window type from its name (case-insensitive).

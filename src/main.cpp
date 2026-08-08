@@ -39,6 +39,9 @@ static void print_usage(const char* prog) {
         << "  -t, --threads N      Limit parallel worker threads (default: all CPUs)\n"
         << "  -w, --windows <list> Comma-separated list of apodization windows to use\n"
         << "                       (default: all 26 with -e, else tukey050,hann,welch,rect)\n"
+        << "                       An entry of the form custom:<file> loads a window\n"
+        << "                       shape from a knot file (up to 4 per run); see\n"
+        << "                       bench/windows/example_taper.txt for the format\n"
         << "Available window names:\n"
         << "  rect, bartlett, bartletthann, blackman, blackmanharris, connes, flattop,\n"
         << "  gauss025, gauss0125, hamming, hann, kaiserbessel, nuttall, triangle, welch,\n"
@@ -137,6 +140,19 @@ int main(int argc, char* argv[]) {
             }
             ++i;
             for (const auto& name : split_csv(argv[i])) {
+                // A custom: entry names a file, so a bad one is a mistake worth
+                // stopping for — silently dropping it would quietly change the
+                // window set a measurement run was built around.
+                if (name.rfind("custom:", 0) == 0) {
+                    std::string err;
+                    auto wt = register_custom_window(name.substr(7), &err);
+                    if (wt == WindowType::COUNT) {
+                        std::cerr << "Error: -w " << name << ": " << err << "\n";
+                        return EXIT_FAILURE;
+                    }
+                    cfg.windows.push_back(wt);
+                    continue;
+                }
                 auto wt = window_from_name(name);
                 if (wt == WindowType::COUNT) {
                     std::cerr << "Warning: unrecognised window '" << name << "' — skipped.\n";

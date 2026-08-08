@@ -112,19 +112,23 @@ struct Config {
     bool adaptive_windows = false;
 
     /**
-     * @brief Reuse input frames that beat the new encoding (experimental).
+     * @brief Reuse input frames that beat the new encoding (default: on).
      *
      * The input file arrives already partitioned into frames whose exact
-     * compressed sizes are known. With this enabled, wherever the input's
-     * frames tile a span of the chosen partition in fewer bytes than the
-     * re-encoded frames, the input frames are spliced into the output
-     * (payload verbatim, header rewritten to this stream's conventions,
-     * CRCs recomputed). If the finished file is still larger than the
+     * compressed sizes are known. Wherever the input's frames tile a span
+     * of the chosen partition in fewer bytes than the re-encoded frames,
+     * the input frames are spliced into the output (payload verbatim,
+     * header rewritten to this stream's conventions, CRCs recomputed);
+     * under exact-DP mode they also compete inside the partitioning DP as
+     * exact-cost edges. If the finished file is still larger than the
      * input, the input is copied through unchanged (only when
      * @ref copy_metadata is true, since copy-through preserves metadata).
      * Together these guarantee re-encoding never grows a file.
+     *
+     * Disable only to measure the raw search without the input as a
+     * competitor (bench/check.sh does this to pin search behavior).
      */
-    bool reuse_frames = false;
+    bool reuse_frames = true;
 
     /**
      * @brief Print progress and statistics to stdout during the run.

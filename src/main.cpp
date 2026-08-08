@@ -21,10 +21,12 @@ static void print_usage(const char* prog) {
         << "  -a, --adaptive-windows  Experimental: pick each block's 4-window set\n"
         << "                       from its signal statistics instead of the fixed\n"
         << "                       shortlist (estimated-DP only; excludes -e/-w)\n"
-        << "  -r, --reuse-frames   Experimental: splice input frames into the output\n"
-        << "                       wherever they beat the re-encoded ones, and copy\n"
-        << "                       the input through unchanged if the output would\n"
-        << "                       still be larger — re-encoding never grows a file\n"
+        << "  -R, --no-reuse       Disable input-frame reuse. By default, input\n"
+        << "                       frames that beat the re-encoded ones are spliced\n"
+        << "                       into the output (and the input is copied through\n"
+        << "                       if the output would still be larger), so\n"
+        << "                       re-encoding never grows a file. -R measures the\n"
+        << "                       raw search alone — mainly for testing\n"
         << "  -q, --quiet          Suppress all progress output\n"
         << "  -t, --threads N      Limit parallel worker threads (default: all CPUs)\n"
         << "  -w, --windows <list> Comma-separated list of apodization windows to use\n"
@@ -94,8 +96,8 @@ int main(int argc, char* argv[]) {
         } else if (arg == "-a" || arg == "--adaptive-windows") {
             cfg.adaptive_windows = true;
 
-        } else if (arg == "-r" || arg == "--reuse-frames") {
-            cfg.reuse_frames = true;
+        } else if (arg == "-R" || arg == "--no-reuse") {
+            cfg.reuse_frames = false;
 
         } else if (arg == "-q" || arg == "--quiet") {
             cfg.verbose = false;

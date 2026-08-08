@@ -62,10 +62,10 @@ struct ProcessorConfig {
 
     /**
      * @brief Splice input frames that beat the re-encoded ones, and copy the
-     * whole input through if the output would still be larger. See
-     * flacoutcpp::Config::reuse_frames.
+     * whole input through if the output would still be larger. On by
+     * default; see flacoutcpp::Config::reuse_frames.
      */
-    bool reuse_frames = false;
+    bool reuse_frames = true;
 
     /**
      * @brief If false, suppresses progress/statistics stdout output.

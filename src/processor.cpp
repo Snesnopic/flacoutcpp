@@ -68,6 +68,27 @@ bool Processor::read_extra_metadata_blocks(
     return true;
 }
 
+// Vendor identity from a VORBIS_COMMENT block (type 4): the payload begins
+// with a 32-bit little-endian length followed by the UTF-8 vendor string —
+// which is where encoders identify themselves ("reference libFLAC x.y.z",
+// "Lavf...", ...). Blocks are stored header+payload by
+// read_extra_metadata_blocks, so the payload starts at offset 4.
+static std::string vendor_from_blocks(
+    const std::vector<std::vector<uint8_t>>& blocks)
+{
+    for (const auto& b : blocks) {
+        if (b.size() < 8 || (b[0] & 0x7Fu) != 4u) continue;
+        const uint32_t len = (uint32_t)b[4] | ((uint32_t)b[5] << 8)
+                           | ((uint32_t)b[6] << 16) | ((uint32_t)b[7] << 24);
+        if (8ull + len > b.size()) continue;
+        std::string v(reinterpret_cast<const char*>(&b[8]), len);
+        for (char& c : v)
+            if ((unsigned char)c < 0x20) c = ' '; // keep the warning one-line
+        return v;
+    }
+    return {};
+}
+
 // ============================================================
 // Main pipeline
 // ============================================================
@@ -234,8 +255,10 @@ bool Processor::process() {
     uint32_t emit_max_bs = 0;
     size_t   total_written = 0;
     size_t   frames_reused = 0;
+    size_t   frames_emitted = 0;
 
     auto emit = [&](const std::vector<uint8_t>& fb, uint32_t bs) {
+        ++frames_emitted;
         out.write(reinterpret_cast<const char*>(fb.data()),
                   (std::streamsize)fb.size());
         min_frm = std::min(min_frm, (uint32_t)fb.size());
@@ -358,6 +381,30 @@ bool Processor::process() {
             }
             copied_through = true;
         }
+    }
+
+    // -W: the reuse comparison doubles as a detector for "the input encoder
+    // beat this search somewhere" — surface that, with the culprit's vendor
+    // identity when its metadata carries one.
+    if (m_config.warn_superior && (frames_reused > 0 || copied_through)) {
+        std::vector<std::vector<uint8_t>> fresh;
+        const auto* blocks_src = &extra_blocks;
+        if (!m_config.copy_metadata) {  // -n skipped the metadata read; do it now
+            read_extra_metadata_blocks(fresh);
+            blocks_src = &fresh;
+        }
+        const std::string vendor = vendor_from_blocks(*blocks_src);
+        std::cerr << "Warning: ";
+        if (copied_through)
+            std::cerr << "the entire input was copied through — "
+                         "the re-encode would have been larger";
+        else
+            std::cerr << "input frames beat the re-encode for " << frames_reused
+                      << " of " << frames_emitted << " frames";
+        std::cerr << " (input encoder: "
+                  << (vendor.empty() ? std::string("unknown")
+                                     : "\"" + vendor + "\"")
+                  << ").\n";
     }
 
     if (std::rename(tmp_output.c_str(), m_output.c_str()) != 0) {

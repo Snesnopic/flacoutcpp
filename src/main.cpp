@@ -27,6 +27,10 @@ static void print_usage(const char* prog) {
         << "                       if the output would still be larger), so\n"
         << "                       re-encoding never grows a file. -R measures the\n"
         << "                       raw search alone — mainly for testing\n"
+        << "  -W, --warn-superior  Warn on stderr when the input's own frames beat\n"
+        << "                       the re-encode (i.e. frame reuse fired), naming\n"
+        << "                       the input's encoder when its metadata says.\n"
+        << "                       Prints even with -q; incompatible with -R\n"
         << "  -q, --quiet          Suppress all progress output\n"
         << "  -t, --threads N      Limit parallel worker threads (default: all CPUs)\n"
         << "  -w, --windows <list> Comma-separated list of apodization windows to use\n"
@@ -99,6 +103,9 @@ int main(int argc, char* argv[]) {
         } else if (arg == "-R" || arg == "--no-reuse") {
             cfg.reuse_frames = false;
 
+        } else if (arg == "-W" || arg == "--warn-superior") {
+            cfg.warn_superior = true;
+
         } else if (arg == "-q" || arg == "--quiet") {
             cfg.verbose = false;
 
@@ -157,6 +164,13 @@ int main(int argc, char* argv[]) {
     // the per-subframe search while keeping the exact block-partitioning DP.
     if (!candidates_given && cfg.exhaustive)
         cfg.max_candidates = 0;
+
+    // -W reads the reuse comparison's results, so it needs reuse enabled.
+    if (cfg.warn_superior && !cfg.reuse_frames) {
+        std::cerr << "Error: -W detects superior input frames via the reuse "
+                     "comparison; it cannot be combined with -R.\n";
+        return EXIT_FAILURE;
+    }
 
     // Adaptive selection chooses the window set itself; -e and -w each define
     // their own set, so the combinations are contradictory rather than merely

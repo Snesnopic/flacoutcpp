@@ -131,6 +131,18 @@ struct Config {
     bool reuse_frames = true;
 
     /**
+     * @brief Warn (stderr) when the input's own frames beat the re-encode.
+     *
+     * If any input frames were reused — or the whole input was copied
+     * through — the search lost to whatever encoder produced the input
+     * somewhere. The warning reports how many frames and the input's
+     * encoder vendor string (from its VORBIS_COMMENT block) when present.
+     * Prints even with @ref verbose off; requires @ref reuse_frames, whose
+     * comparison machinery is what detects superiority.
+     */
+    bool warn_superior = false;
+
+    /**
      * @brief Print progress and statistics to stdout during the run.
      *
      * Set to @c false to suppress progress/statistics output — useful when

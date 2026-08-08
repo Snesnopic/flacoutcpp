@@ -68,6 +68,12 @@ struct ProcessorConfig {
     bool reuse_frames = true;
 
     /**
+     * @brief Warn on stderr when input frames beat the re-encode. See
+     * flacoutcpp::Config::warn_superior.
+     */
+    bool warn_superior = false;
+
+    /**
      * @brief If false, suppresses progress/statistics stdout output.
      * Errors always go to stderr regardless of this setting.
      */

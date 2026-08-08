@@ -24,9 +24,12 @@ cmake --build . --config Release
 ```bash
 Usage: flacoutcpp [options] <input.flac> [output.flac]
 Options:
-  -e, --exhaustive     Perform full exhaustive search (extremely slow)
-  -c, --candidates N   Ranked search: evaluate only the N most promising
-                       (window, order) pairs per subframe
+  -e, --exhaustive     Exact search: fully encode every block-size and
+                       stereo-mode choice instead of estimating them,
+                       and offer all windows (extremely slow)
+  -c, --candidates N   Fully evaluate only the N most promising
+                       (window, order) pairs per subframe (0 = no limit;
+                       default 8, or 0 when -e is given without -c)
   -n, --no-metadata    Do not copy metadata from input to output
   -q, --quiet          Suppress all progress output
   -t, --threads N      Limit parallel worker threads (default: all CPUs)
@@ -40,28 +43,35 @@ If `[output.flac]` is omitted, it will default to `<input.flac>.optimized.flac`.
 All three levels are lossless — the decoded audio is bit-identical to the input
 in every case. They differ only in how hard the encoder works to shrink the file.
 
-The default heuristic search is fast. `-e` searches every apodization window,
-LPC order and quantization precision for every block, which compresses better
-but costs orders of magnitude more CPU.
+Two independent knobs control the search:
 
-`-c N` sits between them. Levinson-Durbin already computes the prediction error
-at each order as a by-product of deriving the coefficients; ranked search uses it
-to estimate every (window, order) pair's cost up front and fully evaluates only
-the best `N`. Everything else matches `-e`: exact DP over block sizes, all four
-stereo modes, the full precision sweep, and all 26 windows offered to the ranking.
+- **`-e`** switches the block-partitioning DP from granule-based *estimates* to
+  *exact* costs — every (position, block size) pair and every stereo mode is
+  fully encoded before the DP chooses — and widens the window set from 4 to
+  all 26. Orders of magnitude more CPU.
+- **`-c N`** bounds the per-subframe LPC search. Levinson-Durbin already
+  computes the prediction error at each order as a by-product of deriving the
+  coefficients; the ranking uses it to estimate every (window, order) pair's
+  cost up front and fully evaluates only the best `N`. `0` means no limit.
+
+The flags compose. The default is plain `-c 8` (estimated DP, ranked search);
+bare `-e` implies `-c 0` (exact DP, unlimited sweep); `-e -c 8` prices blocks
+exactly but keeps the subframe search bounded — what plain `-c 8` meant before
+the flags composed.
 
 Measured on a 3-second excerpt of a 24-bit/44.1 kHz track, 16 threads, relative
-to `-e`:
+to `-e` (older numbers, from when the default evaluated every pair in its
+4-window set):
 
 | mode | time vs `-e` | size vs `-e` |
 |---|---|---|
 | default (heuristic) | 717x faster | +1.14% |
-| `-c 1` | 32x faster | +0.37% |
-| `-c 8` | 25x faster | +0.27% |
-| `-c 32` | 15x faster | +0.14% |
+| `-e -c 1` | 32x faster | +0.37% |
+| `-e -c 8` | 25x faster | +0.27% |
+| `-e -c 32` | 15x faster | +0.14% |
 | `-e` | — | — |
 
-So `-e` buys about 1.1% over the default, and `-c 8` recovers roughly three
+So `-e` buys about 1.1% over the default, and `-e -c 8` recovers roughly three
 quarters of that for a twenty-fifth of `-e`'s cost. The curve flattens quickly,
 and low `N` is dominated by fixed per-block costs rather than by `N` itself,
 which is why `-c 1` is not much faster than `-c 8`.

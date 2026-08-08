@@ -193,21 +193,24 @@ public:
     /**
      * @brief Find the cheapest encoding for a single channel block.
      *
-     * Tries all windows, orders, precisions, and subframe types (Constant,
-     * Verbatim, Fixed, LPC).  Picks the combination with the lowest bit cost.
+     * Tries every subframe type (Constant, Verbatim, Fixed, LPC); for LPC,
+     * ranks all (window, order) pairs by Levinson-Durbin prediction error and
+     * fully evaluates the best @p max_candidates of them across the whole
+     * precision ladder. Picks the combination with the lowest bit cost.
      *
-     * @param samples     Pointer to the first sample of this block.
-     * @param bsize  Number of samples.
-     * @param bps         Bits per sample for this channel.
-     * @param windows     Windows to test.
-     * @return            Best SubframeParams found.
+     * @param samples        Pointer to the first sample of this block.
+     * @param bsize          Number of samples.
+     * @param bps            Bits per sample for this channel.
+     * @param windows        Windows to test.
+     * @param max_candidates Ranked (window, order) pairs to fully evaluate;
+     *                       0 means no limit (exhaustive sweep).
+     * @return               Best SubframeParams found.
      */
     [[nodiscard]] static SubframeParams optimize_subframe(
         const int32_t*              samples,
         uint32_t                    bsize,
         uint32_t                    bps,
         const std::vector<WindowType>& windows,
-        bool                        exhaustive,
         unsigned                    max_candidates = 0);
 
 private:
@@ -273,7 +276,11 @@ private:
     /// True when block costs come from real encodes rather than the granule
     /// estimate: exact DP, all four stereo modes, full precision sweep.
     /// Ranked search is cheap enough per block to afford all of that.
-    [[nodiscard]] bool full_search() const { return m_exhaustive || m_max_candidates > 0; }
+    // Exact-DP mode: every (node, candidate) block in the partitioning DP is
+    // fully encoded (and all four stereo modes evaluated), rather than priced
+    // by the granule estimates. Orthogonal to m_max_candidates, which bounds
+    // the per-subframe LPC search depth in every mode.
+    [[nodiscard]] bool full_search() const { return m_exhaustive; }
 
     /// @endcond
 };

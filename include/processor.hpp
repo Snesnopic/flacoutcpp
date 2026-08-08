@@ -39,18 +39,19 @@ struct ProcessorConfig {
     unsigned max_threads = 0;
 
     /**
-     * @brief If true, performs full exhaustive search over all parameters.
+     * @brief Exact-search mode: fully encode every block-partitioning choice
+     * (and every stereo mode) instead of pricing them by estimate. Orthogonal
+     * to `max_candidates`.
      */
     bool exhaustive = false;
 
     /**
-     * @brief Ranked-search budget: (window, order) pairs evaluated per subframe.
-     *
-     * 0 (default) disables ranked search; `exhaustive` then decides between the
-     * full sweep and the fast heuristic. Non-zero selects the intermediate mode
-     * and can change the output — it trades compression for speed.
+     * @brief Ranked-search budget: (window, order) pairs fully evaluated per
+     * subframe, ranked by Levinson-Durbin prediction error. 0 = no limit
+     * (exhaustive sweep). Changing it changes the output — it trades
+     * compression for speed.
      */
-    unsigned max_candidates = 0;
+    unsigned max_candidates = 8;
 
     /**
      * @brief If false, suppresses progress/statistics stdout output.

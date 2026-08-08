@@ -68,31 +68,35 @@ struct Config {
     unsigned max_threads = 0;
 
     /**
-     * @brief If true, performs full exhaustive search over all parameters.
-     * 
-     * Bypasses all heuristics for window, precision, stereo, and DP pruning.
-     * Can be extremely slow.
+     * @brief Exact-search mode: price every block-partitioning choice exactly.
+     *
+     * When true, every (position, block size) pair in the partitioning DP is
+     * fully encoded rather than estimated from granule autocorrelations, all
+     * four stereo modes are fully evaluated per block, and the default window
+     * set widens to all 26 windows. Can be extremely slow.
+     *
+     * Orthogonal to @ref max_candidates: this option decides how *blocks* are
+     * priced; @c max_candidates decides how deep the per-subframe LPC search
+     * goes within whatever blocks get encoded.
      */
     bool exhaustive = false;
 
     /**
      * @brief Ranked-search budget: (window, order) pairs evaluated per subframe.
      *
-     * @c 0 (default) disables ranked search entirely — @ref exhaustive then
-     * decides between the full sweep and the fast heuristic, as before.
+     * Levinson-Durbin already computes the prediction error at every order as
+     * a by-product; the ranking uses it to estimate each (window, order)
+     * pair's cost up front, and only the best @c max_candidates of them are
+     * fully evaluated (each across the whole precision ladder). @c 0 means no
+     * limit — every pair is fully evaluated, the classic exhaustive sweep.
      *
-     * A non-zero value selects an intermediate mode. Levinson-Durbin already
-     * computes the prediction error at every order as a by-product; ranked
-     * search uses it to estimate each (window, order) pair's cost up front and
-     * fully evaluates only the best @c max_candidates of them. Everything else
-     * matches exhaustive mode: exact DP over block sizes, all four stereo
-     * modes, the full precision sweep, and all 26 windows offered to the
-     * ranking.
-     *
-     * Unlike the other options this one can change the output: it is a
-     * compression-for-speed trade, and larger values approach @ref exhaustive.
+     * The default of 8 costs ~0.03% size on real music for ~1.75x speed over
+     * the unlimited sweep. Known weak spot: near-white high-bps content, where
+     * the Levinson errors are almost flat across orders and the ranking is
+     * noise — 24-bit whitenoise fixtures grew 2-2.8% at 8 and needed 32 for
+     * parity. Real music does not behave that way.
      */
-    unsigned max_candidates = 0;
+    unsigned max_candidates = 8;
 
     /**
      * @brief Print progress and statistics to stdout during the run.

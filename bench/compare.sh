@@ -38,7 +38,7 @@ case "${BENCH_SET:-quick}" in
   # has to be judged on real content — their noise floor does not behave like
   # music. Missing fixtures are skipped, so this is safe to run either way.
   music)  CASES=("-e music_3s" "-e music_20s") ;;
-  ranked) CASES=("-c 8 music_3s" "-c 8 music_20s") ;;
+  ranked) CASES=("-e -c 8 music_3s" "-e -c 8 music_20s") ;;
   *)      echo "error: BENCH_SET must be 'quick', 'full', 'music' or 'ranked'" >&2; exit 2 ;;
 esac
 

@@ -42,15 +42,16 @@ run he_stereo    "$FIX/stereo_4s.flac"
 run he_mono      "$FIX/mono_2s.flac"
 run he_24        "$FIX/s24_2s.flac"
 run he_short     "$FIX/short.flac"
-# Ranked search (-c). Its output is a deliberate compression/speed trade, so it
-# is not comparable to -e — but it must still be stable and decode losslessly.
-# A reference for these can only be recorded from the commit that introduced
-# ranked search or later; older builds reject the flag and `record` will fail.
-run rk_stereo -c 8 "$FIX/stereo_1s.flac"
-run rk_mono   -c 4 "$FIX/mono_2s.flac"
-run rk_24     -c 8 "$FIX/s24_2s.flac"
-run rk_short  -c 8 "$FIX/short.flac"
-run rk_win    -c 2 -w hann,tukey020 "$FIX/stereo_1s.flac"
+# Ranked exact search (-e -c N; plain -c N before the flags composed). Its
+# output is a deliberate compression/speed trade, so it is not comparable to
+# bare -e — but it must still be stable and decode losslessly. A reference for
+# these can only be recorded from the commit that introduced ranked search or
+# later; older builds reject the flag and `record` will fail.
+run rk_stereo -e -c 8 "$FIX/stereo_1s.flac"
+run rk_mono   -e -c 4 "$FIX/mono_2s.flac"
+run rk_24     -e -c 8 "$FIX/s24_2s.flac"
+run rk_short  -e -c 8 "$FIX/short.flac"
+run rk_win    -e -c 2 -w hann,tukey020 "$FIX/stereo_1s.flac"
 
 fail=0
 for f in "$OUT"/*.flac; do

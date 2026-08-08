@@ -8,13 +8,15 @@ static void print_usage(const char* prog) {
     std::cerr
         << "Usage: " << prog << " [options] <input.flac> [output.flac]\n"
         << "Options:\n"
-        << "  -e, --exhaustive     Perform full exhaustive search (extremely slow)\n"
-        << "  -c, --candidates N   Ranked search: fully evaluate only the N most\n"
-        << "                       promising (window, order) pairs per subframe,\n"
-        << "                       ranked by Levinson-Durbin prediction error.\n"
-        << "                       Sits between the default and -e. Larger N is\n"
-        << "                       slower and compresses better. Unlike the other\n"
-        << "                       options this one changes the output.\n"
+        << "  -e, --exhaustive     Exact search: fully encode every block-size and\n"
+        << "                       stereo-mode choice instead of estimating them,\n"
+        << "                       and offer all windows (extremely slow)\n"
+        << "  -c, --candidates N   Fully evaluate only the N most promising\n"
+        << "                       (window, order) pairs per subframe, ranked by\n"
+        << "                       Levinson-Durbin prediction error. 0 = no limit.\n"
+        << "                       Default: 8, or 0 when -e is given without -c.\n"
+        << "                       Composes with -e (e.g. -e -c 8). Larger N is\n"
+        << "                       slower and compresses better.\n"
         << "  -n, --no-metadata    Do not copy metadata from input to output\n"
         << "  -q, --quiet          Suppress all progress output\n"
         << "  -t, --threads N      Limit parallel worker threads (default: all CPUs)\n"
@@ -44,6 +46,7 @@ int main(int argc, char* argv[]) {
 
     flacoutcpp::Config cfg;
     std::vector<std::string> positional;
+    bool candidates_given = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -66,15 +69,14 @@ int main(int argc, char* argv[]) {
             }
             ++i;
             try {
+                // stoul accepts a leading '-' by wrapping; reject it explicitly.
+                if (argv[i][0] == '-') throw std::invalid_argument("negative");
                 cfg.max_candidates = static_cast<unsigned>(std::stoul(argv[i]));
             } catch (const std::exception&) {
-                std::cerr << "Error: -c requires a positive integer, got '" << argv[i] << "'.\n";
+                std::cerr << "Error: -c requires a non-negative integer, got '" << argv[i] << "'.\n";
                 return EXIT_FAILURE;
             }
-            if (cfg.max_candidates == 0) {
-                std::cerr << "Error: -c requires a value of at least 1.\n";
-                return EXIT_FAILURE;
-            }
+            candidates_given = true;
 
         } else if (arg == "-q" || arg == "--quiet") {
             cfg.verbose = false;
@@ -130,18 +132,23 @@ int main(int argc, char* argv[]) {
                                  ? positional[1]
                                  : input + ".optimized.flac";
 
-    if (cfg.exhaustive && cfg.max_candidates > 0) {
-        std::cerr << "Error: -e and -c are mutually exclusive (-e already "
-                     "evaluates every candidate).\n";
-        return EXIT_FAILURE;
-    }
+    // -e alone means the classic unlimited sweep; -c composes with it to bound
+    // the per-subframe search while keeping the exact block-partitioning DP.
+    if (!candidates_given && cfg.exhaustive)
+        cfg.max_candidates = 0;
 
     if (cfg.verbose) {
         if (cfg.max_candidates > 0)
             std::cout << "Ranked search: " << cfg.max_candidates
                       << " candidates/subframe\n";
-        if (cfg.windows.empty())
-            std::cout << "Windows: all (" << all_window_types().size() << " functions)\n";
+        else
+            std::cout << "Ranked search: unlimited (full sweep)\n";
+        if (cfg.windows.empty()) {
+            if (cfg.exhaustive)
+                std::cout << "Windows: all (" << all_window_types().size() << " functions)\n";
+            else
+                std::cout << "Windows: default short list (tukey050, hann, welch, rect)\n";
+        }
         else {
             std::cout << "Windows: ";
             for (size_t i = 0; i < cfg.windows.size(); ++i) {

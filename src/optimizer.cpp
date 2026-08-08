@@ -185,9 +185,11 @@ Optimizer::Optimizer(uint32_t channels, uint32_t bps, uint32_t sample_rate,
       m_exhaustive(exhaustive), m_verbose(verbose), m_max_candidates(max_candidates)
 {
     if (windows.empty()) {
-        // Ranked search wants the widest window set to choose from: it pays per
-        // candidate evaluated, not per window offered, so restricting the set
-        // only removes options the ranking could have picked.
+        // Exact-DP mode (-e) affords the widest window set; the ranking pays
+        // per candidate evaluated, not per window offered, so offering more
+        // windows there only adds options. The heuristic default keeps the
+        // short list because its analysis cost (windowing + autocorrelation
+        // per window) is paid on every block it touches.
         if (full_search()) {
             m_windows = all_window_types();
         } else {
@@ -1174,27 +1176,12 @@ uint32_t Optimizer::estimate_subframe_cost(
 // Exhaustive multi-window subframe optimisation
 // ============================================================
 
+
 SubframeParams Optimizer::optimize_subframe(
     const int32_t* samples, uint32_t bsize, uint32_t bps,
-    const std::vector<WindowType>& windows, bool exhaustive,
+    const std::vector<WindowType>& windows,
     unsigned max_candidates)
 {
-    // Heuristic mode ranks candidates too, just with its smaller window set.
-    // The Levinson-error scoring below prices every (window, order) pair for
-    // the cost of the analysis alone, so sweeping all of them through the
-    // (much more expensive) exact evaluation buys little over fully evaluating
-    // the most promising few. Note this makes the precision sweep the full
-    // 8-15 ladder rather than {12,15}, same as -c.
-    //
-    // 8 candidates costs ~0.03% size on real music (16- and 24-bit alike) for
-    // ~1.75x. Known weak spot: near-white 24-bit content, where the Levinson
-    // errors are almost flat across orders and the ranking is noise — 24-bit
-    // whitenoise fixtures grew 2-2.8% at N=8 and needed N=32 for parity. Real
-    // music does not behave that way, and pricing all content at N=32 keeps
-    // only 1.17x, so the flat 8 stands.
-    if (!exhaustive && max_candidates == 0)
-        max_candidates = 8;
-
     SubframeParams best{};
     best.bits_cost = std::numeric_limits<uint32_t>::max();
 #ifdef FLACOUT_INSTRUMENT
@@ -1257,11 +1244,8 @@ SubframeParams Optimizer::optimize_subframe(
         for (uint32_t i = 0; i < bsize; ++i) shifted[i] = samples[i] >> wasted;
 
         // precision set is constant for the whole subframe; build once
-        // Ranked search evaluates only a handful of candidates, so it can
-        // afford the full precision sweep on each of them.
         std::vector<int> precisions;
-        if (exhaustive || max_candidates > 0) { for (int p = 8; p <= 15; ++p) precisions.push_back(p); }
-        else                                  { precisions = {12, 15}; }
+        for (int p = 8; p <= 15; ++p) precisions.push_back(p);
         const uint32_t min_prec  = (uint32_t)precisions.front();
         const uint32_t hdr_fixed = 8u + (wasted ? (uint32_t)(1 + wasted) : 0u) + 4u + 5u;
 
@@ -1578,7 +1562,7 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
         if (m_channels == 1) {
             bp.stereo_mode  = 0;
             bp.subframes[0] = optimize_subframe(pcm_data[0].data(),
-                                                (uint32_t)total_samples, m_bps, m_windows, m_exhaustive, m_max_candidates);
+                                                (uint32_t)total_samples, m_bps, m_windows, m_max_candidates);
         } else {
             uint32_t best_bits = std::numeric_limits<uint32_t>::max();
             for (int mode : {0, 8, 9, 10}) {
@@ -1593,8 +1577,8 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
                 // mode 9 = right+side: ch0 is side (needs +1 bit), ch1 is right
                 uint32_t bps0 = (mode == 9) ? m_bps + 1 : m_bps;
                 uint32_t bps1 = (mode == 9) ? m_bps     : (mode == 0 ? m_bps : m_bps + 1);
-                SubframeParams s0 = optimize_subframe(ch0.data(), (uint32_t)total_samples, bps0, m_windows, m_exhaustive, m_max_candidates);
-                SubframeParams s1 = optimize_subframe(ch1.data(), (uint32_t)total_samples, bps1, m_windows, m_exhaustive, m_max_candidates);
+                SubframeParams s0 = optimize_subframe(ch0.data(), (uint32_t)total_samples, bps0, m_windows, m_max_candidates);
+                SubframeParams s1 = optimize_subframe(ch1.data(), (uint32_t)total_samples, bps1, m_windows, m_max_candidates);
                 if (s0.bits_cost + s1.bits_cost < best_bits) {
                     best_bits = s0.bits_cost + s1.bits_cost;
                     bp.stereo_mode  = mode;
@@ -1810,7 +1794,7 @@ BlockParams Optimizer::compute_block(
     if (m_channels == 1) {
         bp.stereo_mode  = 0;
         bp.subframes[0] = optimize_subframe(
-            &pcm_data[0][sample_start], block_size, m_bps, m_windows, m_exhaustive, m_max_candidates);
+            &pcm_data[0][sample_start], block_size, m_bps, m_windows, m_max_candidates);
     } else {
         uint32_t best_bits = std::numeric_limits<uint32_t>::max();
 
@@ -1860,9 +1844,9 @@ BlockParams Optimizer::compute_block(
         auto get_sig = [&](int sig) -> const SubframeParams& {
             if (have[sig]) return cache[sig];
             if (sig == SIG_L) {
-                cache[sig] = optimize_subframe(&pcm_data[0][sample_start], block_size, m_bps, m_windows, m_exhaustive, m_max_candidates);
+                cache[sig] = optimize_subframe(&pcm_data[0][sample_start], block_size, m_bps, m_windows, m_max_candidates);
             } else if (sig == SIG_R) {
-                cache[sig] = optimize_subframe(&pcm_data[1][sample_start], block_size, m_bps, m_windows, m_exhaustive, m_max_candidates);
+                cache[sig] = optimize_subframe(&pcm_data[1][sample_start], block_size, m_bps, m_windows, m_max_candidates);
             } else {
                 std::vector<int32_t> ch(block_size);
                 uint32_t bps_s;
@@ -1875,7 +1859,7 @@ BlockParams Optimizer::compute_block(
                         ch[k] = (pcm_data[0][sample_start + k] + pcm_data[1][sample_start + k]) >> 1;
                     bps_s = m_bps;
                 }
-                cache[sig] = optimize_subframe(ch.data(), block_size, bps_s, m_windows, m_exhaustive, m_max_candidates);
+                cache[sig] = optimize_subframe(ch.data(), block_size, bps_s, m_windows, m_max_candidates);
             }
             have[sig] = true;
             return cache[sig];

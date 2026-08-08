@@ -21,7 +21,7 @@ static void print_usage(const char* prog) {
         << "  -q, --quiet          Suppress all progress output\n"
         << "  -t, --threads N      Limit parallel worker threads (default: all CPUs)\n"
         << "  -w, --windows <list> Comma-separated list of apodization windows to use\n"
-        << "                       (default: all windows — maximum compression)\n"
+        << "                       (default: all 26 with -e, else tukey050,hann,welch,rect)\n"
         << "Available window names:\n"
         << "  rect, bartlett, bartletthann, blackman, blackmanharris, connes, flattop,\n"
         << "  gauss025, gauss0125, hamming, hann, kaiserbessel, nuttall, triangle, welch,\n"

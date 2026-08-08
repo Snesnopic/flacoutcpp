@@ -59,22 +59,24 @@ bare `-e` implies `-c 0` (exact DP, unlimited sweep); `-e -c 8` prices blocks
 exactly but keeps the subframe search bounded — what plain `-c 8` meant before
 the flags composed.
 
-Measured on a 3-second excerpt of a 24-bit/44.1 kHz track, 16 threads, relative
-to `-e` (older numbers, from when the default evaluated every pair in its
-4-window set):
+Measured on a 3-second excerpt of a 24-bit/44.1 kHz track (batched runs,
+best-of-3, 16 threads), relative to `-e`:
 
 | mode | time vs `-e` | size vs `-e` |
 |---|---|---|
-| default (heuristic) | 717x faster | +1.14% |
-| `-e -c 1` | 32x faster | +0.37% |
-| `-e -c 8` | 25x faster | +0.27% |
-| `-e -c 32` | 15x faster | +0.14% |
+| default (= `-c 8`) | 572x faster | +0.93% |
+| `-c 0` | 196x faster | +0.89% |
+| `-e -c 1` | 65x faster | +0.37% |
+| `-e -c 8` | 42x faster | +0.27% |
+| `-e -c 32` | 19x faster | +0.14% |
 | `-e` | — | — |
 
-So `-e` buys about 1.1% over the default, and `-e -c 8` recovers roughly three
-quarters of that for a twenty-fifth of `-e`'s cost. The curve flattens quickly,
-and low `N` is dominated by fixed per-block costs rather than by `N` itself,
-which is why `-c 1` is not much faster than `-c 8`.
+So `-e` buys just under 1% over the default, and `-e -c 8` recovers roughly
+three quarters of that at a fortieth of `-e`'s cost. The curve flattens
+quickly at low `N`, which is dominated by fixed per-block costs rather than by
+`N` itself — `-e -c 1` is not much faster than `-e -c 8`. Note `-c 0` (the
+unlimited sweep on the heuristic's 4-window set) barely out-compresses the
+default: the ranking finds nearly everything the sweep finds.
 
 These figures are one excerpt of one track; the trade depends on the material.
 

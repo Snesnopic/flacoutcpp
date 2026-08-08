@@ -1074,7 +1074,15 @@ uint32_t Optimizer::calculate_rice_cost(
     uint32_t num_parts = 1u << max_p_order;
     uint32_t p_size    = block_size / num_parts;
 
+    // High-k extension for RICE2 (coding method 1, 5-bit parameters):
+    // Σ(u>>k) for k = 15..30 equals Σ(v>>(k-15)) with v = u>>15, so a second
+    // 16-lane pass over the shifted residuals gives the exact sums. It only
+    // runs for partitions whose folded residuals actually reach 2^15 —
+    // 16-bit content never does, so its cost and output are untouched.
+    static constexpr int NUM_K2 = 16; // k = 15..30
     uint64_t sums[MAX_PARTS][NUM_K];
+    uint64_t sums2[MAX_PARTS][NUM_K2];
+    bool     any_high = false;
     uint32_t n_res[MAX_PARTS];
     uint32_t max_abs_arr[MAX_PARTS];
 
@@ -1233,8 +1241,27 @@ uint32_t Optimizer::calculate_rice_cost(
         max_abs_arr[p]  = mabs;
     }
 
+    // Second pass for the high-k sums, only where they can be non-zero.
+    for (uint32_t p = 0; p < num_parts; ++p) {
+        if ((max_abs_arr[p] >> 14) == 0) continue; // all u < 2^15 → sums2 ≡ 0
+        if (!any_high) {
+            any_high = true;
+            std::memset(sums2, 0, sizeof(uint64_t) * num_parts * NUM_K2);
+        }
+        const uint32_t start = p * p_size;
+        const uint32_t end   = start + p_size;
+        const uint32_t first = std::max(start, order);
+        uint64_t* s2 = sums2[p];
+        // v ≤ 2^17 and n ≤ 65535, so plain 64-bit accumulation cannot wrap;
+        // no chunking needed. This path never runs for 16-bit content.
+        for (uint32_t i = first; i < end; ++i) {
+            const uint32_t v = zigzag(residuals[i]) >> 15;
+            for (int k = 0; k < NUM_K2; ++k) s2[k] += v >> k;
+        }
+    }
     uint64_t best_total = std::numeric_limits<uint64_t>::max();
     int      best_porder = 0;
+    int      best_method = 0;
     // Only tracked when the caller wants parameters back. During the candidate
     // search it does not, and skipping this drops a 1 KB zero-init plus a memcpy
     // per improving partition order from a call made millions of times.
@@ -1243,35 +1270,52 @@ uint32_t Optimizer::calculate_rice_cost(
 
     uint32_t cur_num_parts = num_parts;
     for (int p_order = max_p_order; p_order >= 0; --p_order) {
-        uint64_t total = 4 * cur_num_parts; // 4 bits rice-param per partition (method 0)
-        int      ks[MAX_PARTS];
+        uint64_t total0 = 4 * cur_num_parts; // method 0: 4-bit rice param per partition
+        uint64_t total1 = 5 * cur_num_parts; // method 1 (RICE2): 5-bit params, k up to 30
+        int      ks0[MAX_PARTS];
+        int      ks1[MAX_PARTS];
 
         for (uint32_t p = 0; p < cur_num_parts; ++p) {
             uint32_t   n = n_res[p];
             uint64_t*  s = sums[p];
 
-            uint64_t best_k_bits = std::numeric_limits<uint64_t>::max();
-            int      best_k = 0;
+            uint64_t best0_bits = std::numeric_limits<uint64_t>::max();
+            uint64_t best1_bits = std::numeric_limits<uint64_t>::max();
+            int      best0_k = 0, best1_k = 0;
 
-            // --- Try Rice parameters k = 0..14 ---
+            // --- Try Rice parameters, k ascending ---
             // bits(k) is exactly convex in k: s[k] = 2*s[k+1] + (count of
             // residuals with bit k set), so the forward difference
             // bits(k+1) - bits(k) = n - s[k+1] - o_k is nondecreasing in k.
             // Scanning ascending, the running best is bits(k-1) until the
             // minimum is passed, so the first k that fails to improve proves
             // every later k is no better — stop there. Strict '<' keeps the
-            // smallest k on ties, exactly like the full scan did.
+            // smallest k on ties, exactly like the full scan did. Convexity
+            // holds straight through the k=14/15 boundary (the sums2 rows are
+            // exact continuations), so when the scan is still improving at
+            // k=14 it carries on into the RICE2-only range.
             for (int k = 0; k < NUM_K; ++k) {
                 uint64_t bits = (uint64_t)n * (1 + k) + s[k];
-                if (bits < best_k_bits) { best_k_bits = bits; best_k = k; }
+                if (bits < best0_bits) { best0_bits = bits; best0_k = k; }
                 else break;
             }
+            best1_bits = best0_bits;
+            best1_k    = best0_k;
+            if (any_high && best0_k == NUM_K - 1) {
+                uint64_t* s2 = sums2[p];
+                for (int k = NUM_K; k <= 30; ++k) {
+                    uint64_t bits = (uint64_t)n * (1 + k) + s2[k - NUM_K];
+                    if (bits < best1_bits) { best1_bits = bits; best1_k = k; }
+                    else break;
+                }
+            }
 
-            // --- Try Rice escape code (k=15): verbatim residuals ---
-            // k=15 means: 4-bit marker + 5-bit bps + bps bits per residual.
-            // The bps field is 5 bits, so residuals wider than 31 bits cannot be
-            // represented by escape at all; skip it so normal Rice (which has no
-            // such limit) is chosen instead.
+            // --- Try the escape code: verbatim residuals ---
+            // marker + 5-bit bps + bps bits per residual (marker cost is the
+            // per-partition param cost already counted above, same as a k).
+            // The bps field is 5 bits, so residuals wider than 31 bits cannot
+            // be represented by escape at all; skip it so normal Rice (which
+            // has no such limit) is chosen instead.
             if (max_abs_arr[p] < (1u << 30)) {
                 uint32_t max_abs = max_abs_arr[p];
                 // Smallest width whose sign bit clears max_abs: 2 + floor(log2)
@@ -1285,21 +1329,37 @@ uint32_t Optimizer::calculate_rice_cost(
 #endif
 
                 uint64_t escape_bits = 5ull + (uint64_t)escape_bps * n;
-                if (escape_bits < best_k_bits) {
-                    best_k_bits = escape_bits;
-                    best_k = 15 + (escape_bps << 8); // encode bps in high bits for later
+                if (escape_bits < best0_bits) {
+                    best0_bits = escape_bits;
+                    best0_k = 15 + (escape_bps << 8); // escape: marker in low byte, bps above
+                }
+                if (escape_bits < best1_bits) {
+                    best1_bits = escape_bits;
+                    best1_k = 31 + (escape_bps << 8);
                 }
             }
 
-            total  += best_k_bits;
-            ks[p]   = best_k;
+            total0 += best0_bits;
+            ks0[p]  = best0_k;
+            total1 += best1_bits;
+            ks1[p]  = best1_k;
         }
 
-        // '<=' since we iterate p_order descending: keeps the smallest p_order on a tie, same as before
-        if (total <= best_total) {
-            best_total  = total;
+        // '<=' since we iterate p_order descending: keeps the smallest p_order
+        // on a tie, same as before. Method 0 is evaluated first and method 1
+        // must win strictly, so 16-bit content (where the methods tie at best)
+        // keeps its method-0 bitstream unchanged.
+        if (total0 <= best_total) {
+            best_total  = total0;
             best_porder = p_order;
-            if (out_params) std::memcpy(best_ks, ks, cur_num_parts * sizeof(int));
+            best_method = 0;
+            if (out_params) std::memcpy(best_ks, ks0, cur_num_parts * sizeof(int));
+        }
+        if (any_high && total1 < best_total) {
+            best_total  = total1;
+            best_porder = p_order;
+            best_method = 1;
+            if (out_params) std::memcpy(best_ks, ks1, cur_num_parts * sizeof(int));
         }
 
         if (p_order == 0) break;
@@ -1312,12 +1372,16 @@ uint32_t Optimizer::calculate_rice_cost(
             max_abs_arr[p] = std::max(max_abs_arr[left], max_abs_arr[right]);
             for (int k = 0; k < NUM_K; ++k)
                 sums[p][k] = sums[left][k] + sums[right][k];
+            if (any_high)
+                for (int k = 0; k < NUM_K2; ++k)
+                    sums2[p][k] = sums2[left][k] + sums2[right][k];
         }
         cur_num_parts = next_num_parts;
     }
 
     if (out_params) {
         out_params->rice_partition_order = best_porder;
+        out_params->rice_method          = best_method;
         std::memcpy(out_params->rice_k, best_ks, (1u << best_porder) * sizeof(int));
     }
     return best_total > std::numeric_limits<uint32_t>::max()

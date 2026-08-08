@@ -155,7 +155,8 @@ struct SubframeParams {
     int     lpc_shift;          ///< Right-shift applied after dot product during prediction.
     int     wasted_bits;        ///< Number of trailing zero bits common to all samples.
     int     rice_partition_order; ///< log2 of the number of Rice partitions (0–8).
-    int     rice_k[256];        ///< Rice parameter k for each partition (k=15 → escape code).
+    int     rice_method;        ///< Residual coding method: 0 = RICE (4-bit k, k ≤ 14), 1 = RICE2 (5-bit k, k ≤ 30; needed when residuals outgrow k=14, i.e. high-bps content).
+    int     rice_k[256];        ///< Rice parameter k per partition. Low byte: k, or the method's escape marker (15/31) with the raw bit-width in the high bits.
     int32_t q_coeffs[32];       ///< Quantized LPC coefficients (in prediction order).
     uint32_t bits_cost;         ///< Exact total bits for this subframe (header + payload).
 };

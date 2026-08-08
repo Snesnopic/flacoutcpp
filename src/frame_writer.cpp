@@ -388,7 +388,13 @@ void FrameWriter::write_residual(
     uint32_t              bsize,
     int                   order)
 {
-    bw.write_bits(0, 2); // coding method = PARTITIONED_RICE (method 0)
+    // Coding method 0 = PARTITIONED_RICE (4-bit parameters, k ≤ 14),
+    // 1 = PARTITIONED_RICE2 (5-bit parameters, k ≤ 30) — the optimizer picks
+    // per subframe; RICE2 pays one extra bit per partition and only wins when
+    // residuals want k > 14 (high-bps content).
+    const int  plen = sp.rice_method ? 5 : 4;
+    const int  esc  = sp.rice_method ? 31 : 15;
+    bw.write_bits((uint64_t)sp.rice_method, 2);
     bw.write_bits((uint64_t)sp.rice_partition_order, 4);
 
     uint32_t num_parts = 1u << sp.rice_partition_order;
@@ -396,23 +402,24 @@ void FrameWriter::write_residual(
 
     for (uint32_t p = 0; p < num_parts; ++p) {
         int      raw_k = sp.rice_k[p];
+        int      k     = raw_k & 0xFF;
         uint32_t start = p * p_size;
         uint32_t end   = start + p_size;
         uint32_t first = std::max(start, (uint32_t)order); // skip warm-up in partition 0
 
-        if (raw_k < 15) {
+        if (k < esc) {
             // Normal Rice coding
-            bw.write_bits((uint64_t)raw_k, 4);
+            bw.write_bits((uint64_t)k, plen);
             for (uint32_t i = first; i < end; ++i)
-                bw.write_rice_sample(residuals[i], raw_k);
+                bw.write_rice_sample(residuals[i], k);
         } else {
-            // Escape code (k = 15): verbatim residuals.
+            // Escape code: verbatim residuals.
             // The escape_bps is stored in the upper bits of raw_k (see optimizer.cpp).
             int escape_bps = raw_k >> 8;
             if (escape_bps < 1)  escape_bps = 1;
             if (escape_bps > 31) escape_bps = 31; // 5-bit bps field holds 0..31
-            bw.write_bits(15u, 4);          // 4-bit escape marker
-            bw.write_bits((uint64_t)escape_bps, 5); // 5-bit bits-per-sample
+            bw.write_bits((uint64_t)esc, plen);      // escape marker
+            bw.write_bits((uint64_t)escape_bps, 5);  // 5-bit bits-per-sample
             for (uint32_t i = first; i < end; ++i)
                 bw.write_signed_bits(residuals[i], escape_bps);
         }

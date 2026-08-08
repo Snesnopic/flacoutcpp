@@ -369,23 +369,75 @@ bool Processor::process() {
     }
     out.close();
 
-    // Whole-file guarantee: if the finished file is still larger than the
-    // input, ship the input unchanged. Only with copy_metadata — the copy
-    // preserves the input's metadata, which -n explicitly asked to drop.
+    // Whole-file guarantee: if the finished file is still larger than what
+    // shipping the input's own frames would cost, do that instead.
+    //
+    // Per-segment reuse alone does not get us here. It picks min(ours,
+    // theirs), but "theirs" is the input's frames *rewritten* — and
+    // rewrite_frame emits variable blocking strategy with a sample number
+    // where libFLAC's fixed-blocksize output carried a frame number, which is
+    // 1-2 UTF-8 bytes longer per frame. A segment can also fall back to our
+    // side regardless of size if any input frame fails to rewrite. So reuse
+    // bounds the output against what we could emit, not against the input,
+    // and this fallback is what closes the gap.
     bool copied_through = false;
-    if (m_config.reuse_frames && m_config.copy_metadata) {
+    if (m_config.reuse_frames) {
         std::ifstream a(tmp_output, std::ios::binary | std::ios::ate);
-        std::ifstream b(m_input,    std::ios::binary | std::ios::ate);
-        if (a && b && a.tellg() > b.tellg()) {
-            b.seekg(0, std::ios::beg);
-            std::ofstream repl(tmp_output, std::ios::binary | std::ios::trunc);
-            repl << b.rdbuf();
-            if (!repl) {
-                std::cerr << "Error: copy-through write failed.\n";
-                std::remove(tmp_output.c_str());
-                return false;
+        const std::streamoff out_sz = a ? (std::streamoff)a.tellg() : -1;
+
+        if (m_config.copy_metadata) {
+            std::ifstream b(m_input, std::ios::binary | std::ios::ate);
+            if (a && b && out_sz > (std::streamoff)b.tellg()) {
+                b.seekg(0, std::ios::beg);
+                std::ofstream repl(tmp_output, std::ios::binary | std::ios::trunc);
+                repl << b.rdbuf();
+                if (!repl) {
+                    std::cerr << "Error: copy-through write failed.\n";
+                    std::remove(tmp_output.c_str());
+                    return false;
+                }
+                copied_through = true;
             }
-            copied_through = true;
+        } else if (reuse && !m_input_frames.empty() && out_sz >= 0) {
+            // -n asked for the metadata to be dropped, not for the guarantee
+            // to be dropped with it. Ship the input's audio frames verbatim
+            // under a fresh header carrying STREAMINFO alone: the input's own
+            // STREAMINFO already describes exactly these frames (framing,
+            // sample count, MD5), so it transfers unchanged apart from having
+            // to become the last metadata block.
+            constexpr uint64_t HDR = 4 + 4 + 34;  // "fLaC" + block header + payload
+            const uint64_t audio_start = m_input_frames.front().byte_start;
+            const uint64_t audio_end   = m_input_frames.back().byte_end;
+            if (audio_end > audio_start && (uint64_t)out_sz > HDR + (audio_end - audio_start)) {
+                std::ifstream b(m_input, std::ios::binary);
+                std::vector<char> head(HDR);
+                if (b && b.read(head.data(), (std::streamsize)HDR)
+                      && std::memcmp(head.data(), "fLaC", 4) == 0
+                      && (head[4] & 0x7F) == 0                       // STREAMINFO
+                      && ((uint8_t)head[5] << 16 | (uint8_t)head[6] << 8
+                          | (uint8_t)head[7]) == 34) {
+                    head[4] = (char)0x80;  // STREAMINFO, and now the last block
+                    std::ofstream repl(tmp_output, std::ios::binary | std::ios::trunc);
+                    repl.write(head.data(), (std::streamsize)HDR);
+                    b.seekg((std::streamoff)audio_start, std::ios::beg);
+                    std::vector<char> buf(1 << 16);
+                    uint64_t left = audio_end - audio_start;
+                    while (left > 0 && b && repl) {
+                        const std::streamsize n =
+                            (std::streamsize)std::min<uint64_t>(left, buf.size());
+                        b.read(buf.data(), n);
+                        repl.write(buf.data(), b.gcount());
+                        left -= (uint64_t)b.gcount();
+                        if (b.gcount() == 0) break;
+                    }
+                    if (!repl || left != 0) {
+                        std::cerr << "Error: copy-through write failed.\n";
+                        std::remove(tmp_output.c_str());
+                        return false;
+                    }
+                    copied_through = true;
+                }
+            }
         }
     }
 

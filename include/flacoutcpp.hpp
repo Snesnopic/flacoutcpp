@@ -145,9 +145,21 @@ struct Config {
      * the input frames are spliced into the output (payload verbatim,
      * header rewritten to this stream's conventions, CRCs recomputed);
      * under exact-DP mode they also compete inside the partitioning DP as
-     * exact-cost edges. If the finished file is still larger than the
-     * input, the input is copied through unchanged (only when
-     * @ref copy_metadata is true, since copy-through preserves metadata).
+     * exact-cost edges.
+     *
+     * Splicing alone is not the guarantee. It picks the cheaper side per
+     * segment, but the input side is priced as *rewritten* frames, and
+     * rewriting emits a variable-blocksize sample number where a
+     * fixed-blocksize input carried a frame number — 1-2 UTF-8 bytes more per
+     * frame. A segment also falls back to the re-encode regardless of size if
+     * any of its input frames fails to rewrite. So splicing bounds the output
+     * against what the search could emit, not against the input.
+     *
+     * The whole-file fallback is what closes that: if the finished file is
+     * still larger, the input ships instead — copied verbatim under
+     * @ref copy_metadata, or, under @c -n, as the input's audio frames
+     * verbatim beneath a fresh STREAMINFO-only header, since @c -n asks for
+     * the metadata to be dropped and not for the guarantee to go with it.
      * Together these guarantee re-encoding never grows a file.
      *
      * Disable only to measure the raw search without the input as a

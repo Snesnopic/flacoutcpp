@@ -130,8 +130,15 @@ verbatim, header rewritten to the output stream's conventions, CRCs
 recomputed. Under `-e` they additionally enter the block-partitioning DP as
 exact-cost edges, so the optimizer can interleave reused frames with
 re-encoded ones (including inputs whose frame boundaries don't align with the
-DP grid). If the finished file would still be larger than the input, the
-input is copied through unchanged (unless `-n` asked to drop its metadata).
+DP grid).
+
+Splicing on its own does not quite get there: it takes the cheaper side per
+segment, but the input side is priced as *rewritten* frames, and a rewritten
+frame carries a variable-blocksize sample number where a fixed-blocksize input
+carried a frame number — 1–2 bytes more per frame. So if the finished file
+would still be larger than the input, the input ships instead: copied
+verbatim, or under `-n` as the input's audio frames beneath a fresh
+STREAMINFO-only header, so dropping metadata doesn't also drop the guarantee.
 
 The net guarantee: **re-encoding never grows a file**, at any search level,
 and running flacoutcpp over its own output is byte-stable. `-R` turns all of

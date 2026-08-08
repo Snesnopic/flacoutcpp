@@ -27,7 +27,8 @@ struct ProcessorConfig {
     /**
      * @brief Apodization windows to test during the exhaustive LPC search.
      * 
-     * If empty, all 26 supported windows are evaluated to maximize compression.
+     * If empty, all 26 standard windows are evaluated to maximize compression
+     * (experimental windows must be named explicitly).
      */
     std::vector<WindowType> windows;
 
@@ -39,18 +40,46 @@ struct ProcessorConfig {
     unsigned max_threads = 0;
 
     /**
-     * @brief If true, performs full exhaustive search over all parameters.
+     * @brief Exact-search mode: fully encode every block-partitioning choice
+     * (and every stereo mode) instead of pricing them by estimate. Orthogonal
+     * to `max_candidates`.
      */
     bool exhaustive = false;
 
     /**
-     * @brief Ranked-search budget: (window, order) pairs evaluated per subframe.
-     *
-     * 0 (default) disables ranked search; `exhaustive` then decides between the
-     * full sweep and the fast heuristic. Non-zero selects the intermediate mode
-     * and can change the output — it trades compression for speed.
+     * @brief Ranked-search budget: (window, order) pairs fully evaluated per
+     * subframe, ranked by Levinson-Durbin prediction error. 0 = no limit
+     * (exhaustive sweep). Changing it changes the output — it trades
+     * compression for speed.
      */
-    unsigned max_candidates = 0;
+    unsigned max_candidates = 8;
+
+    /**
+     * @brief Consecutive non-improving candidates before the ranked scan
+     * stops, making `max_candidates` a floor rather than a ceiling.
+     * -1 = 2 x `max_candidates`; 0 = plain top-N cut.
+     * See flacoutcpp::Config::patience.
+     */
+    int patience = -1;
+
+    /**
+     * @brief Adaptive per-subframe window selection (experimental,
+     * estimated-DP modes only). See flacoutcpp::Config::adaptive_windows.
+     */
+    bool adaptive_windows = false;
+
+    /**
+     * @brief Splice input frames that beat the re-encoded ones, and copy the
+     * whole input through if the output would still be larger. On by
+     * default; see flacoutcpp::Config::reuse_frames.
+     */
+    bool reuse_frames = true;
+
+    /**
+     * @brief Warn on stderr when input frames beat the re-encode. See
+     * flacoutcpp::Config::warn_superior.
+     */
+    bool warn_superior = false;
 
     /**
      * @brief If false, suppresses progress/statistics stdout output.
@@ -114,6 +143,18 @@ private:
     std::string     m_input;
     std::string     m_output;
     ProcessorConfig m_config;
+
+    // Input frame map for frame reuse: sample span and byte range of every
+    // frame in the input file, recorded during decode (reuse_frames only).
+    struct InputFrame {
+        uint64_t first_sample;
+        uint32_t block_size;
+        uint64_t byte_start;
+        uint64_t byte_end;
+    };
+    std::vector<InputFrame> m_input_frames;
+    uint64_t m_prev_frame_end = 0;   // rolling byte offset during decode
+    bool     m_frame_pos_ok   = true; // false if the decoder can't report positions
 
     // Decoded PCM (per-channel, arrays of channel samples)
     std::vector<std::vector<int32_t>> m_pcm_data;

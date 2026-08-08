@@ -4,8 +4,8 @@
  *
  * flacoutcpp is a FLAC re-encoder that achieves better compression than
  * `flac --best` by exhaustively searching the LPC parameter space
- * (26 apodization windows × 32 orders × 8 quantization precisions × 4 stereo
- * modes per block) and selecting the globally optimal variable block-size
+ * (26 standard apodization windows × 32 orders × 8 quantization precisions ×
+ * 4 stereo modes per block) and selecting the globally optimal variable block-size
  * partition via dynamic programming.
  *
  * ### Typical usage
@@ -50,9 +50,11 @@ struct Config {
     /**
      * @brief Apodization windows to test during LPC optimisation.
      *
-     * An empty vector (the default) enables all 26 built-in windows, which
-     * yields maximum compression at the cost of higher CPU usage.  Supply a
-     * smaller set to trade compression for speed.
+     * An empty vector (the default) enables all 26 standard windows under
+     * exhaustive mode, which yields maximum compression at the cost of higher
+     * CPU usage.  Supply a smaller set to trade compression for speed.
+     * Experimental windows (WindowType values from EXPERIMENTAL_BEGIN on)
+     * are used only when named here explicitly.
      *
      * @see WindowType for the list of available windows.
      */
@@ -68,31 +70,102 @@ struct Config {
     unsigned max_threads = 0;
 
     /**
-     * @brief If true, performs full exhaustive search over all parameters.
-     * 
-     * Bypasses all heuristics for window, precision, stereo, and DP pruning.
-     * Can be extremely slow.
+     * @brief Exact-search mode: price every block-partitioning choice exactly.
+     *
+     * When true, every (position, block size) pair in the partitioning DP is
+     * fully encoded rather than estimated from granule autocorrelations, all
+     * four stereo modes are fully evaluated per block, and the default window
+     * set widens to all 26 standard windows. Can be extremely slow.
+     *
+     * Orthogonal to @ref max_candidates: this option decides how *blocks* are
+     * priced; @c max_candidates decides how deep the per-subframe LPC search
+     * goes within whatever blocks get encoded.
      */
     bool exhaustive = false;
 
     /**
      * @brief Ranked-search budget: (window, order) pairs evaluated per subframe.
      *
-     * @c 0 (default) disables ranked search entirely — @ref exhaustive then
-     * decides between the full sweep and the fast heuristic, as before.
+     * Levinson-Durbin already computes the prediction error at every order as
+     * a by-product; the ranking uses it to estimate each (window, order)
+     * pair's cost up front, and only the best @c max_candidates of them are
+     * fully evaluated (each across the whole precision ladder). @c 0 means no
+     * limit — every pair is fully evaluated, the classic exhaustive sweep.
      *
-     * A non-zero value selects an intermediate mode. Levinson-Durbin already
-     * computes the prediction error at every order as a by-product; ranked
-     * search uses it to estimate each (window, order) pair's cost up front and
-     * fully evaluates only the best @c max_candidates of them. Everything else
-     * matches exhaustive mode: exact DP over block sizes, all four stereo
-     * modes, the full precision sweep, and all 26 windows offered to the
-     * ranking.
-     *
-     * Unlike the other options this one can change the output: it is a
-     * compression-for-speed trade, and larger values approach @ref exhaustive.
+     * The default of 8 costs ~0.03% size on real music for ~1.75x speed over
+     * the unlimited sweep. Known weak spot: near-white high-bps content, where
+     * the Levinson errors are almost flat across orders and the ranking is
+     * noise — 24-bit whitenoise fixtures grew 2-2.8% at 8 and needed 32 for
+     * parity. Real music does not behave that way.
      */
-    unsigned max_candidates = 0;
+    unsigned max_candidates = 8;
+
+    /**
+     * @brief Consecutive non-improving candidates before the ranked scan stops.
+     *
+     * @ref max_candidates alone cuts the ranked list at a fixed depth, which
+     * assumes the ranking is right about what lies below the cut. It often is
+     * not: measured over every candidate, the winner's rank is heavy-tailed —
+     * rank 0 takes 56% of subframes on a 24-bit pure sine but the tail reaches
+     * rank 59, and on real music only ~51% of winners fall inside rank 7. The
+     * misses are not near-ties with rank 0, so no widening around the top can
+     * reach them.
+     *
+     * Patience uses the exact costs the scan is already computing as its own
+     * stopping signal: descend the ranked list and keep going while it is
+     * still producing improvements, stopping only after this many consecutive
+     * candidates fail to beat the best so far. @ref max_candidates becomes a
+     * floor rather than a ceiling. Subframes the ranking ordered well stop
+     * near the floor; the ones it ordered badly pay for the tail they need.
+     *
+     * @c -1 (default) means 2 x @ref max_candidates, which costs ~1.34x time
+     * for ~59% of the unlimited sweep's remaining compression on real music.
+     * @c 0 disables patience and restores the plain top-N cut. Irrelevant when
+     * @ref max_candidates is 0, since every candidate is evaluated anyway.
+     */
+    int patience = -1;
+
+    /**
+     * @brief Adaptive per-subframe window selection (experimental).
+     *
+     * Estimated-DP modes only: instead of the fixed 4-window shortlist, each
+     * encoded block picks a 4-window set from its cached granule statistics
+     * (stationarity, transient position, spectral tilt) at identical analysis
+     * cost. Incompatible with @ref exhaustive and an explicit @ref windows
+     * list, both of which define their own window sets.
+     */
+    bool adaptive_windows = false;
+
+    /**
+     * @brief Reuse input frames that beat the new encoding (default: on).
+     *
+     * The input file arrives already partitioned into frames whose exact
+     * compressed sizes are known. Wherever the input's frames tile a span
+     * of the chosen partition in fewer bytes than the re-encoded frames,
+     * the input frames are spliced into the output (payload verbatim,
+     * header rewritten to this stream's conventions, CRCs recomputed);
+     * under exact-DP mode they also compete inside the partitioning DP as
+     * exact-cost edges. If the finished file is still larger than the
+     * input, the input is copied through unchanged (only when
+     * @ref copy_metadata is true, since copy-through preserves metadata).
+     * Together these guarantee re-encoding never grows a file.
+     *
+     * Disable only to measure the raw search without the input as a
+     * competitor (bench/check.sh does this to pin search behavior).
+     */
+    bool reuse_frames = true;
+
+    /**
+     * @brief Warn (stderr) when the input's own frames beat the re-encode.
+     *
+     * If any input frames were reused — or the whole input was copied
+     * through — the search lost to whatever encoder produced the input
+     * somewhere. The warning reports how many frames and the input's
+     * encoder vendor string (from its VORBIS_COMMENT block) when present.
+     * Prints even with @ref verbose off; requires @ref reuse_frames, whose
+     * comparison machinery is what detects superiority.
+     */
+    bool warn_superior = false;
 
     /**
      * @brief Print progress and statistics to stdout during the run.

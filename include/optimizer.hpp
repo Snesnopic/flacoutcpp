@@ -4,7 +4,8 @@
  *
  * The Optimizer class is the computational core of flacoutcpp.  For each
  * candidate block it evaluates every combination of:
- *   - 26 apodization windows (WindowType)
+ *   - 26 standard apodization windows (WindowType; plus experimental
+ *     windows opt-in via an explicit window list)
  *   - LPC orders 1–32 (Levinson-Durbin via compute_lpc_all_orders)
  *   - Quantization precisions 8–15 bits
  *   - 4 stereo modes: Independent, Left-Side, Right-Side, Mid-Side
@@ -66,7 +67,47 @@ enum class WindowType : uint8_t {
     PARTIAL_TUKEY_2_067,      ///< Partial Tukey (2 partitions, offset 0.67).
     PUNCHOUT_TUKEY_2_033,     ///< Punchout Tukey (2 partitions, offset 0.33).
     PUNCHOUT_TUKEY_2_067,     ///< Punchout Tukey (2 partitions, offset 0.67).
-    COUNT                     ///< Sentinel — total number of window types.
+    // Experimental windows: reachable only via an explicit -w list; excluded
+    // from all_window_types() until measurement earns them promotion
+    // (WINDOWS_PLAN.md). Keeping them past this line keeps every default
+    // window set — and therefore every default-mode bitstream — unchanged.
+    LANCZOS,                  ///< Lanczos (sinc) window. Experimental, -w only.
+    BOHMAN,                   ///< Bohman window. Experimental, -w only.
+    PARZEN,                   ///< Parzen (cubic B-spline) window. Experimental, -w only.
+    PLANCKTAPER_010,          ///< Planck-taper window, ε = 0.10. Experimental, -w only.
+    PLANCKTAPER_025,          ///< Planck-taper window, ε = 0.25. Experimental, -w only.
+    // Tier 2: 3-partition Tukeys, libFLAC-faithful geometry — the exact
+    // windows `flac -A partial_tukey(3)` / `punchout_tukey(3)` builds
+    // (parts at thirds, 10%/20% overlap, taper p = 0.2).
+    PARTIAL_TUKEY_3_1,        ///< partial_tukey(3) part 1 of 3. Experimental, -w only.
+    PARTIAL_TUKEY_3_2,        ///< partial_tukey(3) part 2 of 3. Experimental, -w only.
+    PARTIAL_TUKEY_3_3,        ///< partial_tukey(3) part 3 of 3. Experimental, -w only.
+    PUNCHOUT_TUKEY_3_1,       ///< punchout_tukey(3) hole 1 of 3. Experimental, -w only.
+    PUNCHOUT_TUKEY_3_2,       ///< punchout_tukey(3) hole 2 of 3. Experimental, -w only.
+    PUNCHOUT_TUKEY_3_3,       ///< punchout_tukey(3) hole 3 of 3. Experimental, -w only.
+    // Tier 2: 3-partition Tukeys, house geometry — extends the existing
+    // 2-partition style (span/hole + offset, p = 0.5).
+    PARTIAL_TUKEY_3H_000,     ///< House partial Tukey, span 1/3 at 0.00. Experimental, -w only.
+    PARTIAL_TUKEY_3H_033,     ///< House partial Tukey, span 1/3 at 0.33. Experimental, -w only.
+    PARTIAL_TUKEY_3H_067,     ///< House partial Tukey, span 1/3 at 0.67. Experimental, -w only.
+    PUNCHOUT_TUKEY_3H_025,    ///< House punchout Tukey, hole 0.25 at 0.25. Experimental, -w only.
+    PUNCHOUT_TUKEY_3H_050,    ///< House punchout Tukey, hole 0.25 at 0.50. Experimental, -w only.
+    // Tier 2: asymmetric windows (absent from libFLAC entirely).
+    EXPDECAY_2,               ///< e^(-2·i/(N-1)) decaying exponential. Experimental, -w only.
+    EXPDECAY_4,               ///< e^(-4·i/(N-1)) decaying exponential. Experimental, -w only.
+    EXPATTACK_2,              ///< Mirrored EXPDECAY_2 (rising). Experimental, -w only.
+    EXPATTACK_4,              ///< Mirrored EXPDECAY_4 (rising). Experimental, -w only.
+    ATTACKDECAY_005,          ///< Exp rise over first 5%, half-cosine decay. Experimental, -w only.
+    ATTACKDECAY_010,          ///< Exp rise over first 10%, half-cosine decay. Experimental, -w only.
+    ATTACKDECAY_020,          ///< Exp rise over first 20%, half-cosine decay. Experimental, -w only.
+    // Tier 3: DPSS (Slepian) — maximal spectral-energy concentration for a
+    // given time-bandwidth product NW. Computed by a deterministic
+    // fixed-iteration eigensolve (see compute_dpss).
+    DPSS_2,                   ///< DPSS window, NW = 2. Experimental, -w only.
+    DPSS_3,                   ///< DPSS window, NW = 3. Experimental, -w only.
+    DPSS_4,                   ///< DPSS window, NW = 4. Experimental, -w only.
+    COUNT,                    ///< Sentinel — total number of window types.
+    EXPERIMENTAL_BEGIN = LANCZOS ///< First experimental (opt-in) window.
 };
 
 /**
@@ -84,12 +125,13 @@ WindowType window_from_name(const std::string& raw);
 std::string window_to_name(WindowType wt);
 
 /**
- * @brief Return a vector containing all 26 window types (excluding COUNT).
+ * @brief Return a vector of window types (excluding COUNT).
  *
- * Passing this set to the Optimizer enables maximum compression at full
- * CPU cost.
+ * By default returns the 26 standard windows — the set exact-DP mode (-e)
+ * sweeps. Pass @p include_experimental to also get the experimental windows,
+ * which are otherwise reachable only through an explicit @c -w list.
  */
-std::vector<WindowType> all_window_types();
+std::vector<WindowType> all_window_types(bool include_experimental = false);
 
 /// @}
 
@@ -113,7 +155,8 @@ struct SubframeParams {
     int     lpc_shift;          ///< Right-shift applied after dot product during prediction.
     int     wasted_bits;        ///< Number of trailing zero bits common to all samples.
     int     rice_partition_order; ///< log2 of the number of Rice partitions (0–8).
-    int     rice_k[256];        ///< Rice parameter k for each partition (k=15 → escape code).
+    int     rice_method;        ///< Residual coding method: 0 = RICE (4-bit k, k ≤ 14), 1 = RICE2 (5-bit k, k ≤ 30; needed when residuals outgrow k=14, i.e. high-bps content).
+    int     rice_k[256];        ///< Rice parameter k per partition. Low byte: k, or the method's escape marker (15/31) with the raw bit-width in the high bits.
     int32_t q_coeffs[32];       ///< Quantized LPC coefficients (in prediction order).
     uint32_t bits_cost;         ///< Exact total bits for this subframe (header + payload).
 };
@@ -129,6 +172,22 @@ struct BlockParams {
     int            stereo_mode;   ///< Channel coupling: 0=Independent, 8=Left-Side, 9=Right-Side, 10=Mid-Side.
     SubframeParams subframes[2];  ///< Per-channel subframe parameters (index 0 = left/mid, 1 = right/side).
     uint32_t       total_bits;    ///< Sum of subframe bits (header bits excluded).
+    int32_t        reuse_index = -1; ///< ≥0: emit input frame #reuse_index verbatim (frame reuse) instead of encoding; other fields besides block_size are unused.
+};
+
+/**
+ * @brief One input frame offered to the partitioning DP as an exact-cost
+ *        alternative edge (frame reuse under exact-DP mode).
+ *
+ * The caller (Processor) computes @c frame_bytes by actually rewriting the
+ * input frame to this stream's header conventions, so the DP compares it
+ * against re-encoded candidates on equal, exact terms.
+ */
+struct ReuseEdge {
+    uint64_t start_sample;  ///< Absolute first sample (must lie on the DP grid).
+    uint32_t block_size;    ///< Samples covered (must end on the DP grid).
+    uint32_t frame_bytes;   ///< Size of the rewritten frame, in bytes.
+    uint32_t input_index;   ///< Caller's index for emitting the frame later.
 };
 
 /// @}
@@ -165,18 +224,24 @@ public:
      * @param channels     Number of audio channels (1 or 2).
      * @param bps          Bits per sample (e.g. 16, 24).
      * @param sample_rate  Stream sample rate in Hz (prices frame headers in the DP).
-     * @param windows      Apodization windows to test.  Empty → all 26 windows.
+     * @param windows      Apodization windows to test.  Empty → the default
+     *                     set (all 26 standard windows under -e).
      * @param max_threads  Worker thread limit.  0 → all logical CPUs.
      * @param max_candidates  Ranked-search budget: the number of
      *        (window, order) pairs fully evaluated per subframe.  0 (default)
      *        evaluates every pair, which is the exhaustive behaviour.
+     * @param patience  Consecutive non-improving candidates tolerated before
+     *        the ranked scan stops; @c max_candidates becomes a floor rather
+     *        than a ceiling.  0 (default) keeps the plain top-N cut.
      */
     Optimizer(uint32_t channels, uint32_t bps, uint32_t sample_rate,
               std::vector<WindowType> windows = {},
               unsigned max_threads = 0,
               bool exhaustive = false,
               bool verbose = true,
-              unsigned max_candidates = 0);
+              unsigned max_candidates = 0,
+              bool adaptive_windows = false,
+              unsigned patience = 0);
 
     /**
      * @brief Find the optimal variable block-size partition for the stream.
@@ -191,30 +256,46 @@ public:
         const std::vector<std::vector<int32_t>>& pcm_data);
 
     /**
+     * @brief Offer input frames to the partitioning DP as alternative edges.
+     *
+     * Exact-DP mode only (the estimated DP would compare exact reuse costs
+     * against granule estimates, biasing the partition toward copying);
+     * ignored otherwise. Blocks chosen from these edges come back with
+     * BlockParams::reuse_index set instead of encoded parameters.
+     */
+    void set_reuse_edges(std::vector<ReuseEdge> edges) { m_reuse_edges = std::move(edges); }
+
+    /**
      * @brief Find the cheapest encoding for a single channel block.
      *
-     * Tries all windows, orders, precisions, and subframe types (Constant,
-     * Verbatim, Fixed, LPC).  Picks the combination with the lowest bit cost.
+     * Tries every subframe type (Constant, Verbatim, Fixed, LPC); for LPC,
+     * ranks all (window, order) pairs by Levinson-Durbin prediction error and
+     * fully evaluates the best @p max_candidates of them across the whole
+     * precision ladder. Picks the combination with the lowest bit cost.
      *
-     * @param samples     Pointer to the first sample of this block.
-     * @param bsize  Number of samples.
-     * @param bps         Bits per sample for this channel.
-     * @param windows     Windows to test.
-     * @return            Best SubframeParams found.
+     * @param samples        Pointer to the first sample of this block.
+     * @param bsize          Number of samples.
+     * @param bps            Bits per sample for this channel.
+     * @param windows        Windows to test.
+     * @param max_candidates Ranked (window, order) pairs to fully evaluate;
+     *                       0 means no limit (exhaustive sweep).
+     * @return               Best SubframeParams found.
      */
     [[nodiscard]] static SubframeParams optimize_subframe(
         const int32_t*              samples,
         uint32_t                    bsize,
         uint32_t                    bps,
         const std::vector<WindowType>& windows,
-        bool                        exhaustive,
-        unsigned                    max_candidates = 0);
+        unsigned                    max_candidates = 0,
+        unsigned                    patience = 0);
 
 private:
     /// @cond INTERNAL
 
     // --- DP fast-path helpers (granule-based autocorrelation cache) ----------
-    struct Granule { double autoc[33]; }; ///< Cached autocorrelation for one 1024-sample granule.
+    // Lags 0..8 only: estimate_lpc_bits_fast runs Levinson at fixed order 8,
+    // which never reads past autoc[8].
+    struct Granule { double autoc[9]; }; ///< Cached autocorrelation for one 16-sample granule.
     std::vector<std::vector<Granule>> m_granules;
     void precompute_granules(const std::vector<std::vector<int32_t>>& pcm_data);
     [[nodiscard]] uint32_t estimate_lpc_bits_fast(int channel,
@@ -258,6 +339,15 @@ private:
         const std::vector<std::vector<int32_t>>& pcm_data,
         uint64_t sample_start, uint32_t block_size) const;
 
+    /// Adaptive per-subframe window selection (estimated-DP modes only):
+    /// pick a 4-window set for the block spanning [sample_start,
+    /// sample_start + block_size) from the cached granule statistics —
+    /// stationarity (variance of granule energies), transient position
+    /// (energy argmax), and spectral tilt (lag1/lag0). Same set size as the
+    /// fixed shortlist, so analysis cost is unchanged; only membership adapts.
+    [[nodiscard]] std::vector<WindowType> select_windows(
+        uint64_t sample_start, uint32_t block_size) const;
+
     // --- Member state -------------------------------------------------------
     uint32_t              m_channels;
     uint32_t              m_bps;
@@ -267,11 +357,18 @@ private:
     bool                  m_exhaustive;
     bool                  m_verbose;
     unsigned              m_max_candidates;
+    bool                  m_adaptive;
+    unsigned              m_patience;
+    std::vector<ReuseEdge> m_reuse_edges;
 
     /// True when block costs come from real encodes rather than the granule
     /// estimate: exact DP, all four stereo modes, full precision sweep.
     /// Ranked search is cheap enough per block to afford all of that.
-    [[nodiscard]] bool full_search() const { return m_exhaustive || m_max_candidates > 0; }
+    // Exact-DP mode: every (node, candidate) block in the partitioning DP is
+    // fully encoded (and all four stereo modes evaluated), rather than priced
+    // by the granule estimates. Orthogonal to m_max_candidates, which bounds
+    // the per-subframe LPC search depth in every mode.
+    [[nodiscard]] bool full_search() const { return m_exhaustive; }
 
     /// @endcond
 };

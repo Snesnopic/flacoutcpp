@@ -8,24 +8,49 @@ static void print_usage(const char* prog) {
     std::cerr
         << "Usage: " << prog << " [options] <input.flac> [output.flac]\n"
         << "Options:\n"
-        << "  -e, --exhaustive     Perform full exhaustive search (extremely slow)\n"
-        << "  -c, --candidates N   Ranked search: fully evaluate only the N most\n"
-        << "                       promising (window, order) pairs per subframe,\n"
-        << "                       ranked by Levinson-Durbin prediction error.\n"
-        << "                       Sits between the default and -e. Larger N is\n"
-        << "                       slower and compresses better. Unlike the other\n"
-        << "                       options this one changes the output.\n"
+        << "  -e, --exhaustive     Exact search: fully encode every block-size and\n"
+        << "                       stereo-mode choice instead of estimating them,\n"
+        << "                       and offer all windows (extremely slow)\n"
+        << "  -c, --candidates N   Fully evaluate only the N most promising\n"
+        << "                       (window, order) pairs per subframe, ranked by\n"
+        << "                       Levinson-Durbin prediction error. 0 = no limit.\n"
+        << "                       Default: 8, or 0 when -e is given without -c.\n"
+        << "                       Composes with -e (e.g. -e -c 8). Larger N is\n"
+        << "                       slower and compresses better.\n"
+        << "  -p, --patience N     Keep scanning past -c N while candidates are\n"
+        << "                       still improving; stop after N consecutive that\n"
+        << "                       are not. Makes -c a floor, not a ceiling.\n"
+        << "                       Default: 2x -c. 0 disables it (plain top-N cut).\n"
         << "  -n, --no-metadata    Do not copy metadata from input to output\n"
+        << "  -a, --adaptive-windows  Experimental: pick each block's 4-window set\n"
+        << "                       from its signal statistics instead of the fixed\n"
+        << "                       shortlist (estimated-DP only; excludes -e/-w)\n"
+        << "  -R, --no-reuse       Disable input-frame reuse. By default, input\n"
+        << "                       frames that beat the re-encoded ones are spliced\n"
+        << "                       into the output (and the input is copied through\n"
+        << "                       if the output would still be larger), so\n"
+        << "                       re-encoding never grows a file. -R measures the\n"
+        << "                       raw search alone — mainly for testing\n"
+        << "  -W, --warn-superior  Warn on stderr when the input's own frames beat\n"
+        << "                       the re-encode (i.e. frame reuse fired), naming\n"
+        << "                       the input's encoder when its metadata says.\n"
+        << "                       Prints even with -q; incompatible with -R\n"
         << "  -q, --quiet          Suppress all progress output\n"
         << "  -t, --threads N      Limit parallel worker threads (default: all CPUs)\n"
         << "  -w, --windows <list> Comma-separated list of apodization windows to use\n"
-        << "                       (default: all windows — maximum compression)\n"
+        << "                       (default: all 26 with -e, else tukey050,hann,welch,rect)\n"
         << "Available window names:\n"
         << "  rect, bartlett, bartletthann, blackman, blackmanharris, connes, flattop,\n"
         << "  gauss025, gauss0125, hamming, hann, kaiserbessel, nuttall, triangle, welch,\n"
         << "  tukey005, tukey010, tukey020, tukey050, tukey075, tukey090,\n"
         << "  partialtukey2, partialtukey2_033, partialtukey2_067,\n"
-        << "  punchouttukey2_033, punchouttukey2_067\n";
+        << "  punchouttukey2_033, punchouttukey2_067\n"
+        << "Experimental windows (never in a default set; explicit -w only):\n"
+        << "  lanczos, bohman, parzen, plancktaper010, plancktaper025,\n"
+        << "  partialtukey3_{1,2,3}, punchouttukey3_{1,2,3},\n"
+        << "  partialtukey3h_{000,033,067}, punchouttukey3h_{025,050},\n"
+        << "  expdecay{2,4}, expattack{2,4}, attackdecay{005,010,020},\n"
+        << "  dpss{2,3,4}\n";
 }
 
 // Split a comma-separated string into tokens.
@@ -44,6 +69,7 @@ int main(int argc, char* argv[]) {
 
     flacoutcpp::Config cfg;
     std::vector<std::string> positional;
+    bool candidates_given = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -66,15 +92,37 @@ int main(int argc, char* argv[]) {
             }
             ++i;
             try {
+                // stoul accepts a leading '-' by wrapping; reject it explicitly.
+                if (argv[i][0] == '-') throw std::invalid_argument("negative");
                 cfg.max_candidates = static_cast<unsigned>(std::stoul(argv[i]));
             } catch (const std::exception&) {
-                std::cerr << "Error: -c requires a positive integer, got '" << argv[i] << "'.\n";
+                std::cerr << "Error: -c requires a non-negative integer, got '" << argv[i] << "'.\n";
                 return EXIT_FAILURE;
             }
-            if (cfg.max_candidates == 0) {
-                std::cerr << "Error: -c requires a value of at least 1.\n";
+            candidates_given = true;
+
+        } else if (arg == "-p" || arg == "--patience") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: -p requires a number.\n";
                 return EXIT_FAILURE;
             }
+            ++i;
+            try {
+                if (argv[i][0] == '-') throw std::invalid_argument("negative");
+                cfg.patience = static_cast<int>(std::stoul(argv[i]));
+            } catch (const std::exception&) {
+                std::cerr << "Error: -p requires a non-negative integer, got '" << argv[i] << "'.\n";
+                return EXIT_FAILURE;
+            }
+
+        } else if (arg == "-a" || arg == "--adaptive-windows") {
+            cfg.adaptive_windows = true;
+
+        } else if (arg == "-R" || arg == "--no-reuse") {
+            cfg.reuse_frames = false;
+
+        } else if (arg == "-W" || arg == "--warn-superior") {
+            cfg.warn_superior = true;
 
         } else if (arg == "-q" || arg == "--quiet") {
             cfg.verbose = false;
@@ -130,18 +178,46 @@ int main(int argc, char* argv[]) {
                                  ? positional[1]
                                  : input + ".optimized.flac";
 
-    if (cfg.exhaustive && cfg.max_candidates > 0) {
-        std::cerr << "Error: -e and -c are mutually exclusive (-e already "
-                     "evaluates every candidate).\n";
+    // -e alone means the classic unlimited sweep; -c composes with it to bound
+    // the per-subframe search while keeping the exact block-partitioning DP.
+    if (!candidates_given && cfg.exhaustive)
+        cfg.max_candidates = 0;
+
+    // -W reads the reuse comparison's results, so it needs reuse enabled.
+    if (cfg.warn_superior && !cfg.reuse_frames) {
+        std::cerr << "Error: -W detects superior input frames via the reuse "
+                     "comparison; it cannot be combined with -R.\n";
         return EXIT_FAILURE;
     }
+
+    // Adaptive selection chooses the window set itself; -e and -w each define
+    // their own set, so the combinations are contradictory rather than merely
+    // redundant — reject them.
+    if (cfg.adaptive_windows && (cfg.exhaustive || !cfg.windows.empty())) {
+        std::cerr << "Error: -a is estimated-DP only and picks its own windows; "
+                     "it cannot be combined with -e or -w.\n";
+        return EXIT_FAILURE;
+    }
+
+    // Patience defaults to twice the candidate budget; resolve it here so the
+    // rest of the program sees a concrete number.
+    if (cfg.patience < 0)
+        cfg.patience = static_cast<int>(cfg.max_candidates) * 2;
 
     if (cfg.verbose) {
         if (cfg.max_candidates > 0)
             std::cout << "Ranked search: " << cfg.max_candidates
-                      << " candidates/subframe\n";
-        if (cfg.windows.empty())
-            std::cout << "Windows: all (" << all_window_types().size() << " functions)\n";
+                      << " candidates/subframe, patience "
+                      << (cfg.patience > 0 ? std::to_string(cfg.patience) : std::string("off"))
+                      << "\n";
+        else
+            std::cout << "Ranked search: unlimited (full sweep)\n";
+        if (cfg.windows.empty()) {
+            if (cfg.exhaustive)
+                std::cout << "Windows: all (" << all_window_types().size() << " functions)\n";
+            else
+                std::cout << "Windows: default short list (tukey050, hann, welch, rect)\n";
+        }
         else {
             std::cout << "Windows: ";
             for (size_t i = 0; i < cfg.windows.size(); ++i) {

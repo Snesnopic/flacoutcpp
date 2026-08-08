@@ -7,6 +7,7 @@
 #include <atomic>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <future>
 #include <iostream>
@@ -41,7 +42,7 @@ struct InstrCounters {
     std::atomic<uint64_t> win_order_hist[33]{};
     std::atomic<uint64_t> best_order_hist[33]{};
     std::atomic<uint64_t> best_prec_hist[16]{};
-    std::atomic<uint64_t> best_window_hist[32]{};
+    std::atomic<uint64_t> best_window_hist[(size_t)WindowType::COUNT]{};
     ~InstrCounters() {
         std::fprintf(stderr, "\n===== INSTRUMENTATION =====\n");
         std::fprintf(stderr, "subframes optimized     : %llu\n", (unsigned long long)subframes);
@@ -72,7 +73,7 @@ struct InstrCounters {
         for (int i = 0; i < 16; ++i)
             if (best_prec_hist[i]) std::fprintf(stderr, "   prec %2d: %llu\n", i, (unsigned long long)best_prec_hist[i]);
         std::fprintf(stderr, "WINNING window histogram:\n");
-        for (int i = 0; i < 32; ++i)
+        for (int i = 0; i < (int)WindowType::COUNT; ++i)
             if (best_window_hist[i]) std::fprintf(stderr, "   %-22s: %llu\n",
                 window_to_name((WindowType)i).c_str(), (unsigned long long)best_window_hist[i]);
         std::fprintf(stderr, "===========================\n");
@@ -95,9 +96,11 @@ static InstrCounters g_instr;
 // WindowType utilities
 // ============================================================
 
-std::vector<WindowType> all_window_types() {
+std::vector<WindowType> all_window_types(bool include_experimental) {
     std::vector<WindowType> out;
-    for (int i = 0; i < (int)WindowType::COUNT; ++i)
+    const int end = include_experimental ? (int)WindowType::COUNT
+                                         : (int)WindowType::EXPERIMENTAL_BEGIN;
+    for (int i = 0; i < end; ++i)
         out.push_back((WindowType)i);
     return out;
 }
@@ -130,6 +133,32 @@ std::string window_to_name(WindowType wt) {
         case WindowType::PARTIAL_TUKEY_2_067:      return "partialtukey2_067";
         case WindowType::PUNCHOUT_TUKEY_2_033:     return "punchouttukey2_033";
         case WindowType::PUNCHOUT_TUKEY_2_067:     return "punchouttukey2_067";
+        case WindowType::LANCZOS:                  return "lanczos";
+        case WindowType::BOHMAN:                   return "bohman";
+        case WindowType::PARZEN:                   return "parzen";
+        case WindowType::PLANCKTAPER_010:          return "plancktaper010";
+        case WindowType::PLANCKTAPER_025:          return "plancktaper025";
+        case WindowType::PARTIAL_TUKEY_3_1:        return "partialtukey3_1";
+        case WindowType::PARTIAL_TUKEY_3_2:        return "partialtukey3_2";
+        case WindowType::PARTIAL_TUKEY_3_3:        return "partialtukey3_3";
+        case WindowType::PUNCHOUT_TUKEY_3_1:       return "punchouttukey3_1";
+        case WindowType::PUNCHOUT_TUKEY_3_2:       return "punchouttukey3_2";
+        case WindowType::PUNCHOUT_TUKEY_3_3:       return "punchouttukey3_3";
+        case WindowType::PARTIAL_TUKEY_3H_000:     return "partialtukey3h_000";
+        case WindowType::PARTIAL_TUKEY_3H_033:     return "partialtukey3h_033";
+        case WindowType::PARTIAL_TUKEY_3H_067:     return "partialtukey3h_067";
+        case WindowType::PUNCHOUT_TUKEY_3H_025:    return "punchouttukey3h_025";
+        case WindowType::PUNCHOUT_TUKEY_3H_050:    return "punchouttukey3h_050";
+        case WindowType::EXPDECAY_2:               return "expdecay2";
+        case WindowType::EXPDECAY_4:               return "expdecay4";
+        case WindowType::EXPATTACK_2:              return "expattack2";
+        case WindowType::EXPATTACK_4:              return "expattack4";
+        case WindowType::ATTACKDECAY_005:          return "attackdecay005";
+        case WindowType::ATTACKDECAY_010:          return "attackdecay010";
+        case WindowType::ATTACKDECAY_020:          return "attackdecay020";
+        case WindowType::DPSS_2:                   return "dpss2";
+        case WindowType::DPSS_3:                   return "dpss3";
+        case WindowType::DPSS_4:                   return "dpss4";
         default:                                   return "unknown";
     }
 }
@@ -167,6 +196,32 @@ WindowType window_from_name(const std::string& raw) {
     if (clean == "partialtukey2067")                      return WindowType::PARTIAL_TUKEY_2_067;
     if (clean == "punchouttukey2033")                     return WindowType::PUNCHOUT_TUKEY_2_033;
     if (clean == "punchouttukey2067")                     return WindowType::PUNCHOUT_TUKEY_2_067;
+    if (clean == "lanczos")                               return WindowType::LANCZOS;
+    if (clean == "bohman")                                return WindowType::BOHMAN;
+    if (clean == "parzen")                                return WindowType::PARZEN;
+    if (clean == "plancktaper010")                        return WindowType::PLANCKTAPER_010;
+    if (clean == "plancktaper025")                        return WindowType::PLANCKTAPER_025;
+    if (clean == "partialtukey31")                        return WindowType::PARTIAL_TUKEY_3_1;
+    if (clean == "partialtukey32")                        return WindowType::PARTIAL_TUKEY_3_2;
+    if (clean == "partialtukey33")                        return WindowType::PARTIAL_TUKEY_3_3;
+    if (clean == "punchouttukey31")                       return WindowType::PUNCHOUT_TUKEY_3_1;
+    if (clean == "punchouttukey32")                       return WindowType::PUNCHOUT_TUKEY_3_2;
+    if (clean == "punchouttukey33")                       return WindowType::PUNCHOUT_TUKEY_3_3;
+    if (clean == "partialtukey3h000")                     return WindowType::PARTIAL_TUKEY_3H_000;
+    if (clean == "partialtukey3h033")                     return WindowType::PARTIAL_TUKEY_3H_033;
+    if (clean == "partialtukey3h067")                     return WindowType::PARTIAL_TUKEY_3H_067;
+    if (clean == "punchouttukey3h025")                    return WindowType::PUNCHOUT_TUKEY_3H_025;
+    if (clean == "punchouttukey3h050")                    return WindowType::PUNCHOUT_TUKEY_3H_050;
+    if (clean == "expdecay2")                             return WindowType::EXPDECAY_2;
+    if (clean == "expdecay4")                             return WindowType::EXPDECAY_4;
+    if (clean == "expattack2")                            return WindowType::EXPATTACK_2;
+    if (clean == "expattack4")                            return WindowType::EXPATTACK_4;
+    if (clean == "attackdecay005")                        return WindowType::ATTACKDECAY_005;
+    if (clean == "attackdecay010")                        return WindowType::ATTACKDECAY_010;
+    if (clean == "attackdecay020")                        return WindowType::ATTACKDECAY_020;
+    if (clean == "dpss2")                                 return WindowType::DPSS_2;
+    if (clean == "dpss3")                                 return WindowType::DPSS_3;
+    if (clean == "dpss4")                                 return WindowType::DPSS_4;
     return WindowType::COUNT; // unrecognised
 }
 
@@ -179,15 +234,20 @@ Optimizer::Optimizer(uint32_t channels, uint32_t bps, uint32_t sample_rate,
                      unsigned max_threads,
                      bool exhaustive,
                      bool verbose,
-                     unsigned max_candidates)
+                     unsigned max_candidates,
+                     bool adaptive_windows,
+                     unsigned patience)
     : m_channels(channels), m_bps(bps), m_sample_rate(sample_rate),
       m_max_threads(max_threads),
-      m_exhaustive(exhaustive), m_verbose(verbose), m_max_candidates(max_candidates)
+      m_exhaustive(exhaustive), m_verbose(verbose), m_max_candidates(max_candidates),
+      m_adaptive(adaptive_windows), m_patience(patience)
 {
     if (windows.empty()) {
-        // Ranked search wants the widest window set to choose from: it pays per
-        // candidate evaluated, not per window offered, so restricting the set
-        // only removes options the ranking could have picked.
+        // Exact-DP mode (-e) affords the widest window set; the ranking pays
+        // per candidate evaluated, not per window offered, so offering more
+        // windows there only adds options. The heuristic default keeps the
+        // short list because its analysis cost (windowing + autocorrelation
+        // per window) is paid on every block it touches.
         if (full_search()) {
             m_windows = all_window_types();
         } else {
@@ -201,17 +261,111 @@ Optimizer::Optimizer(uint32_t channels, uint32_t bps, uint32_t sample_rate,
 // ============================================================
 // Window application
 // ============================================================
-// All window formulas match libFLAC's window.c exactly.
+// All window formulas up to EXPERIMENTAL_BEGIN match libFLAC's window.c
+// exactly; experimental windows past it are our own additions.
 
-void Optimizer::apply_window(
-    const int32_t* samples, uint32_t N, int wasted_bits,
-    WindowType wt, double* out)
+// Note for future profilers: a 16-thread `sample` of -c once attributed ~24%
+// of runtime to the trig here; a single-threaded profile put it at ~2%. The
+// 24% was heterogeneous-core sampling distortion — verify shares
+// single-threaded before optimizing this function. The table cache below is
+// NOT here to skip the trig (that saved nothing measurable); it exists so
+// apply_window stays a tiny multiply loop at its call site, which keeps the
+// register allocator honest in the surrounding analyse_window code — the
+// wide-band autocorrelation loop spills without it.
+
+// DPSS (Slepian) window: the eigenvector for the largest eigenvalue of the
+// symmetric tridiagonal Slepian matrix (diag ((N-1-2i)/2)^2 cos(2piW),
+// off-diag i(N-i)/2, W = NW/N). Everything is fixed-count for determinism:
+// 100 Sturm-bisection steps pin the eigenvalue (interval shrinks by 2^100,
+// far below double resolution), then 4 inverse-iteration solves recover the
+// eigenvector — no tolerance loops, straight double arithmetic, so it is on
+// the same footing as the closed-form windows under -ffp-contract=off. Cost
+// is ~100 O(N) passes at table-build time; the on-the-fly path (non-DP
+// sizes, short streams) pays it per block, which is rare and still cheap
+// next to encoding the block.
+static void compute_dpss(uint32_t N, double NW, double* out)
+{
+    const double W = NW / (double)N;
+    const double c = std::cos(2.0 * M_PI * W);
+    std::vector<double> d(N), e(N); // e[i] couples rows i-1 and i; e[0] unused
+    for (uint32_t i = 0; i < N; ++i) {
+        double k = ((double)(N - 1) - 2.0 * (double)i) / 2.0;
+        d[i] = k * k * c;
+        e[i] = (double)i * (double)(N - i) / 2.0;
+    }
+
+    // Gershgorin interval containing every eigenvalue.
+    double lo = d[0], hi = d[0], scale = 0.0;
+    for (uint32_t i = 0; i < N; ++i) {
+        double r = std::abs(e[i]) + (i + 1 < N ? std::abs(e[i + 1]) : 0.0);
+        lo = std::min(lo, d[i] - r);
+        hi = std::max(hi, d[i] + r);
+        scale = std::max(scale, std::abs(d[i]) + r);
+    }
+
+    // Sturm-sequence bisection down to the largest eigenvalue: count_below(s)
+    // is the number of eigenvalues < s via the LDL^T pivot signs.
+    auto count_below = [&](double s) {
+        uint32_t cnt = 0;
+        double q = 1.0;
+        for (uint32_t i = 0; i < N; ++i) {
+            q = (i == 0) ? d[0] - s : d[i] - s - e[i] * e[i] / q;
+            if (q == 0.0) q = -1e-300; // pivot guard; count a zero pivot as below
+            if (q < 0.0) ++cnt;
+        }
+        return cnt;
+    };
+    for (int it = 0; it < 100; ++it) {
+        double mid = 0.5 * (lo + hi);
+        if (count_below(mid) == N) hi = mid; else lo = mid;
+    }
+    const double lam = hi; // λmax to machine precision
+
+    // Inverse iteration: repeatedly solve (T - λI) x = v (Thomas algorithm
+    // with a relative pivot floor — the matrix is singular by construction,
+    // which is what makes the iteration converge) and renormalize.
+    const double piv_floor = 1e-14 * scale;
+    std::vector<double> v(N), m(N), z(N);
+    for (uint32_t i = 0; i < N; ++i) // Hann start: right symmetry, no zeros inside
+        v[i] = 0.5 - 0.5 * std::cos(2.0 * M_PI * (double)i / (double)(N - 1));
+    for (int it = 0; it < 4; ++it) {
+        m[0] = d[0] - lam;
+        if (std::abs(m[0]) < piv_floor) m[0] = piv_floor;
+        z[0] = v[0];
+        for (uint32_t i = 1; i < N; ++i) {
+            double f = e[i] / m[i - 1];
+            m[i] = d[i] - lam - f * e[i];
+            if (std::abs(m[i]) < piv_floor) m[i] = piv_floor;
+            z[i] = v[i] - f * z[i - 1];
+        }
+        v[N - 1] = z[N - 1] / m[N - 1];
+        for (uint32_t i = N - 1; i-- > 0;)
+            v[i] = (z[i] - e[i + 1] * v[i + 1]) / m[i];
+        double mx = 0.0;
+        for (uint32_t i = 0; i < N; ++i) mx = std::max(mx, std::abs(v[i]));
+        for (uint32_t i = 0; i < N; ++i) v[i] /= mx;
+    }
+
+    // Peak-normalize to +1 (eigenvector sign is arbitrary; DPSS is unimodal).
+    double peak = 0.0;
+    for (uint32_t i = 0; i < N; ++i)
+        if (std::abs(v[i]) > std::abs(peak)) peak = v[i];
+    for (uint32_t i = 0; i < N; ++i) out[i] = v[i] / peak;
+}
+
+static void compute_window_coeffs(WindowType wt, uint32_t N, double* out)
 {
     auto fN = (double)(N - 1);
     auto fNh = fN / 2.0;
 
+    if (wt == WindowType::DPSS_2 || wt == WindowType::DPSS_3 ||
+        wt == WindowType::DPSS_4) {
+        compute_dpss(N, (wt == WindowType::DPSS_2) ? 2.0
+                      : (wt == WindowType::DPSS_3) ? 3.0 : 4.0, out);
+        return;
+    }
+
     for (uint32_t i = 0; i < N; ++i) {
-        double x = (double)(samples[i] >> wasted_bits);
         double w = 1.0;
         double fi = (double)i;
 
@@ -325,13 +479,22 @@ void Optimizer::apply_window(
             break;
         }
 
-        // Partial Tukey: split into 2 sub-windows, each covering part of the block
+        // Partial Tukey: sub-window covering part of the block. The _2 set
+        // spans 0.5; the experimental house _3H set spans 0.33 (-w only).
         case WindowType::PARTIAL_TUKEY_2_000:
         case WindowType::PARTIAL_TUKEY_2_033:
-        case WindowType::PARTIAL_TUKEY_2_067: {
-            double start = (wt == WindowType::PARTIAL_TUKEY_2_000) ? 0.0
-                         : (wt == WindowType::PARTIAL_TUKEY_2_033) ? 0.33 : 0.67;
-            double end   = start + 0.5;
+        case WindowType::PARTIAL_TUKEY_2_067:
+        case WindowType::PARTIAL_TUKEY_3H_000:
+        case WindowType::PARTIAL_TUKEY_3H_033:
+        case WindowType::PARTIAL_TUKEY_3H_067: {
+            double start = (wt == WindowType::PARTIAL_TUKEY_2_000 ||
+                            wt == WindowType::PARTIAL_TUKEY_3H_000) ? 0.0
+                         : (wt == WindowType::PARTIAL_TUKEY_2_033 ||
+                            wt == WindowType::PARTIAL_TUKEY_3H_033) ? 0.33 : 0.67;
+            double span  = (wt == WindowType::PARTIAL_TUKEY_3H_000 ||
+                            wt == WindowType::PARTIAL_TUKEY_3H_033 ||
+                            wt == WindowType::PARTIAL_TUKEY_3H_067) ? 0.33 : 0.5;
+            double end   = start + span;
             end   = std::min(end, 1.0);
             int sn = (int)(start * N), en = (int)(end * N);
             int Ng = en - sn;
@@ -349,10 +512,17 @@ void Optimizer::apply_window(
         }
 
         case WindowType::PUNCHOUT_TUKEY_2_033:
-        case WindowType::PUNCHOUT_TUKEY_2_067: {
-            // Punchout Tukey: full window with a "hole" punched out
-            double start = (wt == WindowType::PUNCHOUT_TUKEY_2_033) ? 0.33 : 0.67;
-            double end   = start + 0.33;
+        case WindowType::PUNCHOUT_TUKEY_2_067:
+        case WindowType::PUNCHOUT_TUKEY_3H_025:
+        case WindowType::PUNCHOUT_TUKEY_3H_050: {
+            // Punchout Tukey: full window with a "hole" punched out. The _2
+            // set punches 0.33; the experimental house _3H set 0.25 (-w only).
+            double start = (wt == WindowType::PUNCHOUT_TUKEY_2_033) ? 0.33
+                         : (wt == WindowType::PUNCHOUT_TUKEY_2_067) ? 0.67
+                         : (wt == WindowType::PUNCHOUT_TUKEY_3H_025) ? 0.25 : 0.50;
+            double hole  = (wt == WindowType::PUNCHOUT_TUKEY_3H_025 ||
+                            wt == WindowType::PUNCHOUT_TUKEY_3H_050) ? 0.25 : 0.33;
+            double end   = start + hole;
             int sn = (int)(start * N), en = (int)(end * N);
             double p = 0.5;
             int Ns = (int)(p / 2.0 * sn);
@@ -375,12 +545,240 @@ void Optimizer::apply_window(
             break;
         }
 
+        case WindowType::LANCZOS: {
+            // sinc(2i/(N-1) - 1); not in libFLAC. Experimental (-w only).
+            double x = 2.0*fi/fN - 1.0;
+            w = (x == 0.0) ? 1.0 : std::sin(M_PI*x) / (M_PI*x);
+            break;
+        }
+
+        case WindowType::BOHMAN: {
+            // (1-|x|)cos(pi|x|) + sin(pi|x|)/pi, x in [-1,1]. Experimental.
+            double x = std::abs(2.0*fi/fN - 1.0);
+            w = (1.0 - x)*std::cos(M_PI*x) + std::sin(M_PI*x)/M_PI;
+            break;
+        }
+
+        case WindowType::PARZEN: {
+            // Piecewise cubic B-spline (scipy form), x = |i - (N-1)/2| / (N/2).
+            // Experimental.
+            double x = std::abs(fi - fNh) / ((double)N / 2.0);
+            if (x <= 0.5) w = 1.0 - 6.0*x*x*(1.0 - x);
+            else { double k = 1.0 - x; w = 2.0*k*k*k; }
+            break;
+        }
+
+        case WindowType::PLANCKTAPER_010:
+        case WindowType::PLANCKTAPER_025: {
+            // Flat center, C-infinity edges: w = 1/(e^Z + 1) over the first
+            // and last eps*N samples, Z = eps*N*(1/j + 1/(j - eps*N)), with
+            // w(0) = w(N-1) = 0. Experimental.
+            double eps = (wt == WindowType::PLANCKTAPER_010) ? 0.10 : 0.25;
+            double t = eps * (double)N;
+            double j = std::min(fi, fN - fi);
+            if (j <= 0.0)     w = 0.0;
+            else if (j < t) { double Z = t*(1.0/j + 1.0/(j - t));
+                              w = 1.0 / (std::exp(Z) + 1.0); }
+            else              w = 1.0;
+            break;
+        }
+
+        // libFLAC-faithful partial_tukey(3): parts at thirds, 10% overlap,
+        // taper p = 0.2 — the geometry `flac -A partial_tukey(3)` builds
+        // (stream_encoder.c overlap_units math, window.c ramp indexing),
+        // re-derived per-index in doubles. Experimental (-w only).
+        case WindowType::PARTIAL_TUKEY_3_1:
+        case WindowType::PARTIAL_TUKEY_3_2:
+        case WindowType::PARTIAL_TUKEY_3_3: {
+            double m = (wt == WindowType::PARTIAL_TUKEY_3_1) ? 0.0
+                     : (wt == WindowType::PARTIAL_TUKEY_3_2) ? 1.0 : 2.0;
+            double u = 1.0/(1.0 - 0.1) - 1.0;              // overlap_units
+            int sn = (int)(m / (3.0 + u) * N);
+            int en = (int)((m + 1.0 + u) / (3.0 + u) * N);
+            int Np = (int)(0.2 / 2.0 * (en - sn));
+            int n = (int)i;
+            if (n < sn || n >= en)               w = 0.0;
+            else if (Np > 0 && n < sn + Np)      w = 0.5 - 0.5*std::cos(M_PI*(double)(n - sn + 1)/Np);
+            else if (Np > 0 && n >= en - Np)     w = 0.5 - 0.5*std::cos(M_PI*(double)(en - n)/Np);
+            else                                 w = 1.0;
+            break;
+        }
+
+        // libFLAC-faithful punchout_tukey(3): holes at thirds, 20% overlap,
+        // taper p = 0.2. Experimental (-w only).
+        case WindowType::PUNCHOUT_TUKEY_3_1:
+        case WindowType::PUNCHOUT_TUKEY_3_2:
+        case WindowType::PUNCHOUT_TUKEY_3_3: {
+            double m = (wt == WindowType::PUNCHOUT_TUKEY_3_1) ? 0.0
+                     : (wt == WindowType::PUNCHOUT_TUKEY_3_2) ? 1.0 : 2.0;
+            double u = 1.0/(1.0 - 0.2) - 1.0;              // overlap_units
+            int sn = (int)(m / (3.0 + u) * N);
+            int en = (int)((m + 1.0 + u) / (3.0 + u) * N);
+            int Ns = (int)(0.2 / 2.0 * sn);
+            int Ne = (int)(0.2 / 2.0 * ((int)N - en));
+            int n = (int)i;
+            if (n >= sn && n < en)                            w = 0.0;
+            else if (Ns > 0 && n < Ns)                        w = 0.5 - 0.5*std::cos(M_PI*(double)(n + 1)/Ns);
+            else if (Ns > 0 && n >= sn - Ns && n < sn)        w = 0.5 - 0.5*std::cos(M_PI*(double)(sn - n)/Ns);
+            else if (Ne > 0 && n >= en && n < en + Ne)        w = 0.5 - 0.5*std::cos(M_PI*(double)(n - en + 1)/Ne);
+            else if (Ne > 0 && n >= (int)N - Ne)              w = 0.5 - 0.5*std::cos(M_PI*(double)((int)N - n)/Ne);
+            else                                              w = 1.0;
+            break;
+        }
+
+        // Asymmetric exponentials: e^(-k·i/(N-1)) and its mirror. Not in
+        // libFLAC. Experimental (-w only).
+        case WindowType::EXPDECAY_2:  w = std::exp(-2.0*fi/fN);        break;
+        case WindowType::EXPDECAY_4:  w = std::exp(-4.0*fi/fN);        break;
+        case WindowType::EXPATTACK_2: w = std::exp(-2.0*(fN - fi)/fN); break;
+        case WindowType::EXPATTACK_4: w = std::exp(-4.0*(fN - fi)/fN); break;
+
+        // Attack-decay: exponential rise (rate 6, normalized to reach 1) over
+        // the first f·N samples, half-cosine decay to 0 after. Experimental
+        // (-w only).
+        case WindowType::ATTACKDECAY_005:
+        case WindowType::ATTACKDECAY_010:
+        case WindowType::ATTACKDECAY_020: {
+            double f = (wt == WindowType::ATTACKDECAY_005) ? 0.05
+                     : (wt == WindowType::ATTACKDECAY_010) ? 0.10 : 0.20;
+            double R = f * (double)N;
+            if (fi < R) {
+                double t = std::min((fi + 1.0) / R, 1.0);
+                w = (1.0 - std::exp(-6.0*t)) / (1.0 - std::exp(-6.0));
+            } else {
+                w = std::cos(0.5*M_PI*(fi - R)/(fN - R));
+            }
+            break;
+        }
+
         default:
             w = 1.0; break;
         }
 
-        out[i] = x * w;
+        out[i] = w;
     }
+}
+
+// The DP's candidate block sizes (shared with find_optimal_block_partitioning).
+// Window coefficient tables for these sizes are precomputed once; any other
+// size (the remainder block, the short-stream path) computes on the fly.
+static const uint32_t DP_CANDIDATES[] = { 1024, 2048, 4096, 8192, 16384 };
+static constexpr size_t NUM_DP_CANDIDATES = 5;
+
+static int candidate_slot(uint32_t N)
+{
+    for (size_t c = 0; c < NUM_DP_CANDIDATES; ++c)
+        if (DP_CANDIDATES[c] == N) return (int)c;
+    return -1;
+}
+
+// All windows (incl. experimental) x 5 candidate sizes, built once on first
+// use (~254 KB per window; ~13 MB at 51 windows,
+// thread-safe magic static — worker threads block on the first builder and
+// read lock-free forever after). The values are computed by the exact code
+// that used to run inline per block, so the output is bit-identical.
+static const double* window_table(WindowType wt, int slot)
+{
+    static const std::vector<double> tables = [] {
+        size_t total = 0;
+        for (size_t c = 0; c < NUM_DP_CANDIDATES; ++c) total += DP_CANDIDATES[c];
+        std::vector<double> t((size_t)WindowType::COUNT * total);
+        size_t off = 0;
+        for (int w = 0; w < (int)WindowType::COUNT; ++w)
+            for (size_t c = 0; c < NUM_DP_CANDIDATES; ++c) {
+                compute_window_coeffs((WindowType)w, DP_CANDIDATES[c], &t[off]);
+                off += DP_CANDIDATES[c];
+            }
+        return t;
+    }();
+
+    // offset of (wt, slot): wt strides the whole size set, then sizes before slot
+    size_t size_sum = 0, prefix = 0;
+    for (size_t c = 0; c < NUM_DP_CANDIDATES; ++c) size_sum += DP_CANDIDATES[c];
+    for (int c = 0; c < slot; ++c) prefix += DP_CANDIDATES[c];
+    return &tables[(size_t)wt * size_sum + prefix];
+}
+
+// Sum of squared window coefficients, the normalizer that turns a windowed
+// Levinson error into an absolute residual-variance estimate (see the ranked
+// scoring in optimize_subframe). Cached for the precomputed table sizes —
+// COUNT x 5 doubles, built lazily from the tables themselves — and computed on
+// the fly for the rare other sizes (remainder block, short-stream path).
+static double window_energy(WindowType wt, uint32_t N)
+{
+    const int slot = candidate_slot(N);
+    if (slot >= 0) {
+        static const std::vector<double> energies = [] {
+            std::vector<double> e((size_t)WindowType::COUNT * NUM_DP_CANDIDATES);
+            for (int w = 0; w < (int)WindowType::COUNT; ++w)
+                for (size_t c = 0; c < NUM_DP_CANDIDATES; ++c) {
+                    const double* t = window_table((WindowType)w, (int)c);
+                    double s = 0.0;
+                    for (uint32_t i = 0; i < DP_CANDIDATES[c]; ++i) s += t[i] * t[i];
+                    e[(size_t)w * NUM_DP_CANDIDATES + c] = s;
+                }
+            return e;
+        }();
+        return energies[(size_t)wt * NUM_DP_CANDIDATES + (size_t)slot];
+    }
+    std::vector<double> tmp(N);
+    compute_window_coeffs(wt, N, tmp.data());
+    double s = 0.0;
+    for (uint32_t i = 0; i < N; ++i) s += tmp[i] * tmp[i];
+    return s;
+}
+
+// Fraction of exactly-zero coefficients in a window — the block region the
+// window is blind to. Non-zero only for partial/punchout shapes (and the
+// single zero endpoint samples of e.g. Planck windows, which round to ~0
+// fraction). The ranked scorer uses it to price the blind region at the raw
+// signal's variance instead of pretending it is modeled. Cached like
+// window_energy for the table sizes.
+static double window_zero_frac(WindowType wt, uint32_t N)
+{
+    const int slot = candidate_slot(N);
+    if (slot >= 0) {
+        static const std::vector<double> fracs = [] {
+            std::vector<double> f((size_t)WindowType::COUNT * NUM_DP_CANDIDATES);
+            for (int w = 0; w < (int)WindowType::COUNT; ++w)
+                for (size_t c = 0; c < NUM_DP_CANDIDATES; ++c) {
+                    const double* t = window_table((WindowType)w, (int)c);
+                    uint32_t z = 0;
+                    for (uint32_t i = 0; i < DP_CANDIDATES[c]; ++i)
+                        if (t[i] == 0.0) ++z;
+                    f[(size_t)w * NUM_DP_CANDIDATES + c] =
+                        (double)z / (double)DP_CANDIDATES[c];
+                }
+            return f;
+        }();
+        return fracs[(size_t)wt * NUM_DP_CANDIDATES + (size_t)slot];
+    }
+    std::vector<double> tmp(N);
+    compute_window_coeffs(wt, N, tmp.data());
+    uint32_t z = 0;
+    for (uint32_t i = 0; i < N; ++i)
+        if (tmp[i] == 0.0) ++z;
+    return (double)z / (double)N;
+}
+
+void Optimizer::apply_window(
+    const int32_t* samples, uint32_t N, int wasted_bits,
+    WindowType wt, double* out)
+{
+    const int slot = candidate_slot(N);
+    const double* w;
+    std::vector<double> scratch;
+    if (slot >= 0) {
+        w = window_table(wt, slot);
+    } else {
+        scratch.resize(N);
+        compute_window_coeffs(wt, N, scratch.data());
+        w = scratch.data();
+    }
+    // One multiply per sample, same arithmetic as the fused version, and
+    // -ffp-contract=off means nothing can fuse into it: bit-exact.
+    for (uint32_t i = 0; i < N; ++i)
+        out[i] = (double)(samples[i] >> wasted_bits) * w[i];
 }
 
 // ============================================================
@@ -505,7 +903,10 @@ static inline uint32_t zigzag(int32_t r) {
 // `bsize` doubles — and each pass is a reduction, so loads dominate and the
 // serial accumulator chain gives the vectorizer nothing to work with. Handling
 // LAG_BAND lags together gets LAG_BAND multiply-accumulates out of every loaded
-// w[j] and cuts the number of passes by the same factor.
+// w[j] and cuts the number of passes by the same factor. At 33 the whole
+// max_lag=32 range is one pass; measured in isolation that is 2.0x over the
+// original band of 8 (register-pressure sweet spots are not monotonic — 16
+// measured no better than 8, so widen all the way or not at all).
 //
 // This is floating point, so unlike the integer loops the summation order is
 // *not* free to change — reassociating would perturb the coefficients and with
@@ -516,7 +917,7 @@ static inline uint32_t zigzag(int32_t r) {
 static void autocorrelation(
     const double* w, uint32_t n, int max_lag, double* autoc)
 {
-    constexpr int LAG_BAND = 8;
+    constexpr int LAG_BAND = 33;
 
     int lag0 = 0;
     for (; lag0 + LAG_BAND <= max_lag + 1; lag0 += LAG_BAND) {
@@ -675,7 +1076,15 @@ uint32_t Optimizer::calculate_rice_cost(
     uint32_t num_parts = 1u << max_p_order;
     uint32_t p_size    = block_size / num_parts;
 
+    // High-k extension for RICE2 (coding method 1, 5-bit parameters):
+    // Σ(u>>k) for k = 15..30 equals Σ(v>>(k-15)) with v = u>>15, so a second
+    // 16-lane pass over the shifted residuals gives the exact sums. It only
+    // runs for partitions whose folded residuals actually reach 2^15 —
+    // 16-bit content never does, so its cost and output are untouched.
+    static constexpr int NUM_K2 = 16; // k = 15..30
     uint64_t sums[MAX_PARTS][NUM_K];
+    uint64_t sums2[MAX_PARTS][NUM_K2];
+    bool     any_high = false;
     uint32_t n_res[MAX_PARTS];
     uint32_t max_abs_arr[MAX_PARTS];
 
@@ -834,8 +1243,27 @@ uint32_t Optimizer::calculate_rice_cost(
         max_abs_arr[p]  = mabs;
     }
 
+    // Second pass for the high-k sums, only where they can be non-zero.
+    for (uint32_t p = 0; p < num_parts; ++p) {
+        if ((max_abs_arr[p] >> 14) == 0) continue; // all u < 2^15 → sums2 ≡ 0
+        if (!any_high) {
+            any_high = true;
+            std::memset(sums2, 0, sizeof(uint64_t) * num_parts * NUM_K2);
+        }
+        const uint32_t start = p * p_size;
+        const uint32_t end   = start + p_size;
+        const uint32_t first = std::max(start, order);
+        uint64_t* s2 = sums2[p];
+        // v ≤ 2^17 and n ≤ 65535, so plain 64-bit accumulation cannot wrap;
+        // no chunking needed. This path never runs for 16-bit content.
+        for (uint32_t i = first; i < end; ++i) {
+            const uint32_t v = zigzag(residuals[i]) >> 15;
+            for (int k = 0; k < NUM_K2; ++k) s2[k] += v >> k;
+        }
+    }
     uint64_t best_total = std::numeric_limits<uint64_t>::max();
     int      best_porder = 0;
+    int      best_method = 0;
     // Only tracked when the caller wants parameters back. During the candidate
     // search it does not, and skipping this drops a 1 KB zero-init plus a memcpy
     // per improving partition order from a call made millions of times.
@@ -844,35 +1272,52 @@ uint32_t Optimizer::calculate_rice_cost(
 
     uint32_t cur_num_parts = num_parts;
     for (int p_order = max_p_order; p_order >= 0; --p_order) {
-        uint64_t total = 4 * cur_num_parts; // 4 bits rice-param per partition (method 0)
-        int      ks[MAX_PARTS];
+        uint64_t total0 = 4 * cur_num_parts; // method 0: 4-bit rice param per partition
+        uint64_t total1 = 5 * cur_num_parts; // method 1 (RICE2): 5-bit params, k up to 30
+        int      ks0[MAX_PARTS];
+        int      ks1[MAX_PARTS];
 
         for (uint32_t p = 0; p < cur_num_parts; ++p) {
             uint32_t   n = n_res[p];
             uint64_t*  s = sums[p];
 
-            uint64_t best_k_bits = std::numeric_limits<uint64_t>::max();
-            int      best_k = 0;
+            uint64_t best0_bits = std::numeric_limits<uint64_t>::max();
+            uint64_t best1_bits = std::numeric_limits<uint64_t>::max();
+            int      best0_k = 0, best1_k = 0;
 
-            // --- Try Rice parameters k = 0..14 ---
+            // --- Try Rice parameters, k ascending ---
             // bits(k) is exactly convex in k: s[k] = 2*s[k+1] + (count of
             // residuals with bit k set), so the forward difference
             // bits(k+1) - bits(k) = n - s[k+1] - o_k is nondecreasing in k.
             // Scanning ascending, the running best is bits(k-1) until the
             // minimum is passed, so the first k that fails to improve proves
             // every later k is no better — stop there. Strict '<' keeps the
-            // smallest k on ties, exactly like the full scan did.
+            // smallest k on ties, exactly like the full scan did. Convexity
+            // holds straight through the k=14/15 boundary (the sums2 rows are
+            // exact continuations), so when the scan is still improving at
+            // k=14 it carries on into the RICE2-only range.
             for (int k = 0; k < NUM_K; ++k) {
                 uint64_t bits = (uint64_t)n * (1 + k) + s[k];
-                if (bits < best_k_bits) { best_k_bits = bits; best_k = k; }
+                if (bits < best0_bits) { best0_bits = bits; best0_k = k; }
                 else break;
             }
+            best1_bits = best0_bits;
+            best1_k    = best0_k;
+            if (any_high && best0_k == NUM_K - 1) {
+                uint64_t* s2 = sums2[p];
+                for (int k = NUM_K; k <= 30; ++k) {
+                    uint64_t bits = (uint64_t)n * (1 + k) + s2[k - NUM_K];
+                    if (bits < best1_bits) { best1_bits = bits; best1_k = k; }
+                    else break;
+                }
+            }
 
-            // --- Try Rice escape code (k=15): verbatim residuals ---
-            // k=15 means: 4-bit marker + 5-bit bps + bps bits per residual.
-            // The bps field is 5 bits, so residuals wider than 31 bits cannot be
-            // represented by escape at all; skip it so normal Rice (which has no
-            // such limit) is chosen instead.
+            // --- Try the escape code: verbatim residuals ---
+            // marker + 5-bit bps + bps bits per residual (marker cost is the
+            // per-partition param cost already counted above, same as a k).
+            // The bps field is 5 bits, so residuals wider than 31 bits cannot
+            // be represented by escape at all; skip it so normal Rice (which
+            // has no such limit) is chosen instead.
             if (max_abs_arr[p] < (1u << 30)) {
                 uint32_t max_abs = max_abs_arr[p];
                 // Smallest width whose sign bit clears max_abs: 2 + floor(log2)
@@ -886,21 +1331,37 @@ uint32_t Optimizer::calculate_rice_cost(
 #endif
 
                 uint64_t escape_bits = 5ull + (uint64_t)escape_bps * n;
-                if (escape_bits < best_k_bits) {
-                    best_k_bits = escape_bits;
-                    best_k = 15 + (escape_bps << 8); // encode bps in high bits for later
+                if (escape_bits < best0_bits) {
+                    best0_bits = escape_bits;
+                    best0_k = 15 + (escape_bps << 8); // escape: marker in low byte, bps above
+                }
+                if (escape_bits < best1_bits) {
+                    best1_bits = escape_bits;
+                    best1_k = 31 + (escape_bps << 8);
                 }
             }
 
-            total  += best_k_bits;
-            ks[p]   = best_k;
+            total0 += best0_bits;
+            ks0[p]  = best0_k;
+            total1 += best1_bits;
+            ks1[p]  = best1_k;
         }
 
-        // '<=' since we iterate p_order descending: keeps the smallest p_order on a tie, same as before
-        if (total <= best_total) {
-            best_total  = total;
+        // '<=' since we iterate p_order descending: keeps the smallest p_order
+        // on a tie, same as before. Method 0 is evaluated first and method 1
+        // must win strictly, so 16-bit content (where the methods tie at best)
+        // keeps its method-0 bitstream unchanged.
+        if (total0 <= best_total) {
+            best_total  = total0;
             best_porder = p_order;
-            if (out_params) std::memcpy(best_ks, ks, cur_num_parts * sizeof(int));
+            best_method = 0;
+            if (out_params) std::memcpy(best_ks, ks0, cur_num_parts * sizeof(int));
+        }
+        if (any_high && total1 < best_total) {
+            best_total  = total1;
+            best_porder = p_order;
+            best_method = 1;
+            if (out_params) std::memcpy(best_ks, ks1, cur_num_parts * sizeof(int));
         }
 
         if (p_order == 0) break;
@@ -913,12 +1374,16 @@ uint32_t Optimizer::calculate_rice_cost(
             max_abs_arr[p] = std::max(max_abs_arr[left], max_abs_arr[right]);
             for (int k = 0; k < NUM_K; ++k)
                 sums[p][k] = sums[left][k] + sums[right][k];
+            if (any_high)
+                for (int k = 0; k < NUM_K2; ++k)
+                    sums2[p][k] = sums2[left][k] + sums2[right][k];
         }
         cur_num_parts = next_num_parts;
     }
 
     if (out_params) {
         out_params->rice_partition_order = best_porder;
+        out_params->rice_method          = best_method;
         std::memcpy(out_params->rice_k, best_ks, (1u << best_porder) * sizeof(int));
     }
     return best_total > std::numeric_limits<uint32_t>::max()
@@ -1106,10 +1571,11 @@ uint32_t Optimizer::estimate_subframe_cost(
 // Exhaustive multi-window subframe optimisation
 // ============================================================
 
+
 SubframeParams Optimizer::optimize_subframe(
     const int32_t* samples, uint32_t bsize, uint32_t bps,
-    const std::vector<WindowType>& windows, bool exhaustive,
-    unsigned max_candidates)
+    const std::vector<WindowType>& windows,
+    unsigned max_candidates, unsigned patience)
 {
     SubframeParams best{};
     best.bits_cost = std::numeric_limits<uint32_t>::max();
@@ -1173,11 +1639,8 @@ SubframeParams Optimizer::optimize_subframe(
         for (uint32_t i = 0; i < bsize; ++i) shifted[i] = samples[i] >> wasted;
 
         // precision set is constant for the whole subframe; build once
-        // Ranked search evaluates only a handful of candidates, so it can
-        // afford the full precision sweep on each of them.
         std::vector<int> precisions;
-        if (exhaustive || max_candidates > 0) { for (int p = 8; p <= 15; ++p) precisions.push_back(p); }
-        else                                  { precisions = {12, 15}; }
+        for (int p = 8; p <= 15; ++p) precisions.push_back(p);
         const uint32_t min_prec  = (uint32_t)precisions.front();
         const uint32_t hdr_fixed = 8u + (wasted ? (uint32_t)(1 + wasted) : 0u) + 4u + 5u;
 
@@ -1337,21 +1800,52 @@ SubframeParams Optimizer::optimize_subframe(
             //      evaluate only the most promising `max_candidates` of them.
             //
             // Levinson-Durbin already produces the residual energy at each
-            // order as a by-product; the exhaustive path just discards it.
-            // err[ord]/err[0] is the fraction of signal energy the predictor
-            // fails to remove, which turns into an estimated residual bit cost
-            // via the Gaussian entropy 0.5*log2(2*pi*e*var) that
-            // estimate_lpc_bits_fast already uses. The constant term and the
-            // signal's own variance are identical for every candidate, so they
-            // drop out of the comparison and only the log of the ratio remains.
+            // order as a by-product; the exhaustive path just discards it. For
+            // a residual that is roughly stationary across the block, that
+            // windowed-domain energy is ~ var_e x sum(w^2), so dividing by the
+            // window's energy estimates the absolute residual variance, which
+            // the Gaussian entropy 0.5*log2(2*pi*e*var) (the same model
+            // estimate_lpc_bits_fast uses) turns into estimated residual bits.
+            // Absolute variance is what makes scores comparable across windows:
+            // each window scales the signal differently, so raw err[ord]
+            // values are in different units.
             //
-            // Using the *ratio* rather than the raw energy is what makes scores
-            // comparable across windows at all: each window scales the signal
-            // differently, so raw err[ord] values are in different units, while
-            // the fraction removed is dimensionless.
+            // Scoring by the err[ord]/err[0] *ratio* instead (energy fraction
+            // removed) was tried first and measures ~0.02-0.26% worse across
+            // real music and synthetics: it normalizes by the signal power
+            // seen *through the window*, which flatters windows aimed at
+            // quiet parts of the block. Also tried and rejected: scoring by
+            // predicted residual energy on the RAW signal via the quadratic
+            // form a'Ra over the unwindowed autocorrelation — the
+            // autocorrelation method's zero-extension edge bias exceeds the
+            // true residual energy by orders of magnitude on predictable
+            // content, which is the very pathology windowing exists to kill.
+            //
+            // The *peephole* problem needs one more term: partial/punchout
+            // windows genuinely predict the slice of block they look at, so
+            // their windowed error says nothing about the samples they zero
+            // out — pricing those as free floods the top-N with slice-local
+            // candidates (measured: all-26 at N=8 lost to tukey050 alone).
+            // Fix: charge the zeroed fraction of the block at the raw
+            // signal's variance — the model has no information there, so the
+            // unpredicted signal is the honest estimate. Dense windows have
+            // zero_frac == 0 and score exactly as before.
             struct Cand { double score; int wi; int ord; };
             std::vector<Cand> cands;
             cands.reserve(windows.size() * (size_t)max_order);
+
+            // Entropy terms are clamped at zero: the Gaussian differential
+            // entropy goes negative once var < 1/(2πe), but Rice cannot code
+            // below ~0 bits/sample, and letting a peephole window's
+            // tiny-slice variance contribute large *negative* bits vaulted
+            // partial windows over every dense candidate on pure-tone
+            // content (+4523 B on the 3-min synthetic tonal fixture).
+            double var_raw = 0.0;
+            for (uint32_t i = 0; i < bsize; ++i)
+                var_raw += (double)shifted[i] * (double)shifted[i];
+            var_raw /= (double)bsize;
+            const double raw_bits_per_sample = (var_raw > 0.0)
+                ? std::max(0.0, 0.5 * std::log2(2.0 * M_PI * M_E * var_raw)) : 0.0;
 
             // all_lpc for every window, so the winning candidates do not have to
             // re-run apply_window + autocorrelation to get their coefficients
@@ -1364,19 +1858,56 @@ SubframeParams Optimizer::optimize_subframe(
                 if (!analyse_window(windows[wi], lderr)) continue;
                 std::memcpy(&lpc_store[wi * LPC_STRIDE], all_lpc, sizeof(all_lpc));
                 if (lderr[0] <= 0.0) continue;
+                const double wsq = window_energy(windows[wi], bsize);
+                if (!(wsq > 0.0)) continue;
+                const double zf = window_zero_frac(windows[wi], bsize);
                 for (int ord = 1; ord <= max_order; ++ord) {
                     if (lderr[ord] <= 0.0) continue; // recursion stopped short of this order
-                    const double ratio = lderr[ord] / lderr[0];
-                    if (!(ratio > 0.0)) continue;
-                    const double resid_bits = 0.5 * std::log2(ratio) * (double)(bsize - ord);
+                    const double var_e = lderr[ord] / wsq;
+                    const double model_bits_per_sample =
+                        std::max(0.0, 0.5 * std::log2(2.0 * M_PI * M_E * var_e));
+                    const double resid_bits =
+                        (model_bits_per_sample * (1.0 - zf)
+                         + raw_bits_per_sample * zf) * (double)(bsize - ord);
                     const double coef_bits  = (double)ord * (double)(eff_bps + min_prec);
                     cands.push_back({ resid_bits + coef_bits, (int)wi, ord });
                 }
             }
 
-            const size_t keep = std::min((size_t)max_candidates, cands.size());
-            std::partial_sort(cands.begin(), cands.begin() + keep, cands.end(),
-                              [](const Cand& a, const Cand& b) { return a.score < b.score; });
+            auto by_score = [](const Cand& a, const Cand& b) { return a.score < b.score; };
+            size_t keep = std::min((size_t)max_candidates, cands.size());
+            std::partial_sort(cands.begin(), cands.begin() + keep, cands.end(), by_score);
+
+            // ---- Patience ----
+            // The winner's rank is heavy-tailed, not tied: measured over all
+            // candidates, rank 0 wins 56% of sine24 subframes but the tail
+            // reaches rank 59, and on music only ~51% of winners fall inside
+            // rank 7. A fixed cut at N therefore misses a long tail that a
+            // wider tolerance band around rank 0 cannot reach.
+            //
+            // Use the exact costs already being computed as the stopping
+            // signal instead: descend the ranked list and keep going while it
+            // is still yielding improvements, stopping only after `patience`
+            // consecutive candidates fail to beat the best. Where the model
+            // ordered well, the first few confirm it and the scan stops near
+            // N; where it ordered badly, the scan follows the improvements
+            // down. Cost is paid only on the subframes that need it.
+            if (patience > 0) {
+                std::sort(cands.begin(), cands.end(), by_score);
+                uint32_t prev  = best_lpc_cost;
+                size_t   since = 0;
+                for (size_t c = 0; c < cands.size(); ++c) {
+                    if (c >= keep && since >= patience) break;
+                    const Cand& cd = cands[c];
+                    uint32_t hdr_min = hdr_fixed + (uint32_t)cd.ord * (eff_bps + min_prec);
+                    if (hdr_min >= best_lpc_cost) { ++since; continue; }
+                    eval_candidate(&lpc_store[cd.wi * LPC_STRIDE + (size_t)(cd.ord - 1) * 32],
+                                   cd.ord, windows[cd.wi]);
+                    if (best_lpc_cost < prev) { prev = best_lpc_cost; since = 0; }
+                    else ++since;
+                }
+                keep = 0;  // scan already done
+            }
 
             // Best-first, so the exact cost of a strong candidate tightens the
             // pruning bound before the weaker ones are tried.
@@ -1427,7 +1958,7 @@ void Optimizer::precompute_granules(
     for (uint32_t c = 0; c < m_channels; ++c)
         for (size_t g = 0; g < num_g; ++g) {
             const int32_t* src = &pcm_data[c][g * 16];
-            for (int i = 0; i <= 32; ++i) {
+            for (int i = 0; i <= 8; ++i) {
                 double s = 0;
                 for (int j = 0; j < 16 - i; ++j) s += (double)src[j] * src[j+i];
                 m_granules[c][g].autoc[i] = s;
@@ -1438,9 +1969,9 @@ void Optimizer::precompute_granules(
 uint32_t Optimizer::estimate_lpc_bits_fast(
     int channel, uint32_t n_start, uint32_t n_end, int bps) const
 {
-    double autoc[33] = {};
+    double autoc[9] = {};
     for (uint32_t g = n_start; g < n_end; ++g)
-        for (int i = 0; i <= 32; ++i)
+        for (int i = 0; i <= 8; ++i)
             autoc[i] += m_granules[channel][g].autoc[i];
 
     float coeffs[32];
@@ -1494,7 +2025,7 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
         if (m_channels == 1) {
             bp.stereo_mode  = 0;
             bp.subframes[0] = optimize_subframe(pcm_data[0].data(),
-                                                (uint32_t)total_samples, m_bps, m_windows, m_exhaustive, m_max_candidates);
+                                                (uint32_t)total_samples, m_bps, m_windows, m_max_candidates, m_patience);
         } else {
             uint32_t best_bits = std::numeric_limits<uint32_t>::max();
             for (int mode : {0, 8, 9, 10}) {
@@ -1509,8 +2040,8 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
                 // mode 9 = right+side: ch0 is side (needs +1 bit), ch1 is right
                 uint32_t bps0 = (mode == 9) ? m_bps + 1 : m_bps;
                 uint32_t bps1 = (mode == 9) ? m_bps     : (mode == 0 ? m_bps : m_bps + 1);
-                SubframeParams s0 = optimize_subframe(ch0.data(), (uint32_t)total_samples, bps0, m_windows, m_exhaustive, m_max_candidates);
-                SubframeParams s1 = optimize_subframe(ch1.data(), (uint32_t)total_samples, bps1, m_windows, m_exhaustive, m_max_candidates);
+                SubframeParams s0 = optimize_subframe(ch0.data(), (uint32_t)total_samples, bps0, m_windows, m_max_candidates, m_patience);
+                SubframeParams s1 = optimize_subframe(ch1.data(), (uint32_t)total_samples, bps1, m_windows, m_max_candidates, m_patience);
                 if (s0.bits_cost + s1.bits_cost < best_bits) {
                     best_bits = s0.bits_cost + s1.bits_cost;
                     bp.stereo_mode  = mode;
@@ -1543,8 +2074,10 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
     // Phase 2: sequential DP over precomputed cost table — O(N×K), instant.
     // Phase 3: back-trace to recover the optimal frame sequence.
 
-    static const uint32_t CANDIDATES[]   = { 1024, 2048, 4096, 8192, 16384 };
-    static const size_t   NUM_CANDS      = std::size(CANDIDATES);
+    // Shared with the window-table cache, which precomputes coefficients for
+    // exactly these sizes (see DP_CANDIDATES at file scope).
+    static const auto&    CANDIDATES     = DP_CANDIDATES;
+    static const size_t   NUM_CANDS      = std::size(DP_CANDIDATES);
     static constexpr uint32_t STEP = 1024u; // GCD of all candidates
 
     const size_t   num_nodes = total_samples / STEP;
@@ -1629,6 +2162,207 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
     if (remainder > 0)
         remainder_bp = compute_block(pcm_data, (uint64_t)num_nodes * STEP, remainder);
 
+    // ---- Irregular-node DP: frame reuse with off-grid input frames ------
+    // The regular DP below only accepts reuse edges whose boundaries lie on
+    // the 1024 grid. When any usable input frame is off-grid (a -b 4608
+    // stream, or the input's final remainder frame), switch to a node set of
+    // grid positions ∪ input-frame boundaries ∪ stream end. Input frames
+    // chain between their own boundaries; small exactly-encoded "bridge"
+    // blocks connect each irregular node to the grid, so the path can enter
+    // and leave an input-frame run anywhere. Everything stays exact-cost, so
+    // the DP remains optimal over the union of both partitions. This branch
+    // is bypassed entirely unless -e -r meets an off-grid frame, keeping the
+    // regular path byte-identical.
+    bool irregular = false;
+    if (full_search()) {
+        for (const auto& e : m_reuse_edges) {
+            if (e.start_sample % STEP != 0 || e.block_size % STEP != 0 ||
+                e.start_sample + e.block_size > (uint64_t)num_nodes * STEP) {
+                irregular = true;
+                break;
+            }
+        }
+    }
+    if (irregular) {
+        const uint64_t grid_end = (uint64_t)num_nodes * STEP;
+
+        std::vector<uint64_t> pos;
+        pos.reserve(num_nodes + 2 + m_reuse_edges.size() * 2);
+        for (size_t n = 0; n <= num_nodes; ++n) pos.push_back((uint64_t)n * STEP);
+        pos.push_back(total_samples);
+        for (const auto& e : m_reuse_edges) {
+            pos.push_back(e.start_sample);
+            pos.push_back(e.start_sample + e.block_size);
+        }
+        std::sort(pos.begin(), pos.end());
+        pos.erase(std::unique(pos.begin(), pos.end()), pos.end());
+        const size_t NN = pos.size();
+        auto node_of = [&](uint64_t p) -> size_t {
+            return (size_t)(std::lower_bound(pos.begin(), pos.end(), p) - pos.begin());
+        };
+        const size_t terminal = node_of(total_samples);
+
+        // Bridge spans (deduplicated), then encoded in parallel like phase 1.
+        struct Bridge { uint64_t start; uint32_t size; BlockParams bp; };
+        std::vector<std::pair<uint64_t, uint32_t>> spans;
+        auto add_span = [&](uint64_t s, uint64_t e2) {
+            if (e2 <= s || e2 - s < 16 || e2 - s > 65535) return;
+            spans.emplace_back(s, (uint32_t)(e2 - s));
+        };
+        for (size_t idx = 0; idx < NN; ++idx) {
+            const uint64_t p = pos[idx];
+            if (p % STEP == 0 && p <= grid_end) continue; // grid node
+            if (p == total_samples) continue;             // terminal
+            uint64_t g = (p / STEP) * STEP;               // entering bridge
+            if (p - g < 16 && g >= STEP) g -= STEP;
+            add_span(std::min(g, grid_end), p);
+            uint64_t q = ((p / STEP) + 1) * STEP;         // leaving bridge
+            if (q - p < 16) q += STEP;
+            if (q > grid_end) q = total_samples;
+            add_span(p, q);
+        }
+        std::sort(spans.begin(), spans.end());
+        spans.erase(std::unique(spans.begin(), spans.end()), spans.end());
+
+        std::vector<Bridge> bridges(spans.size());
+        {
+            std::atomic<size_t> next{0};
+            std::vector<std::thread> threads;
+            for (unsigned t = 0; t < nthreads; ++t) {
+                threads.emplace_back([&]() {
+                    for (;;) {
+                        size_t idx = next.fetch_add(1, std::memory_order_relaxed);
+                        if (idx >= spans.size()) break;
+                        auto [s, sz] = spans[idx];
+                        bridges[idx] = Bridge{ s, sz, compute_block(pcm_data, s, sz) };
+                    }
+                });
+            }
+            for (auto& th : threads) th.join();
+        }
+
+        if (m_verbose)
+            std::cout << "DP: irregular reuse graph — " << NN << " nodes, "
+                      << m_reuse_edges.size() << " input-frame edges, "
+                      << bridges.size() << " bridge blocks\n";
+
+        // Per-node edge lists for the non-grid edge types.
+        std::vector<std::vector<uint32_t>> reuse_at2(NN), bridge_at(NN);
+        for (size_t k = 0; k < m_reuse_edges.size(); ++k)
+            reuse_at2[node_of(m_reuse_edges[k].start_sample)].push_back((uint32_t)k);
+        for (size_t b = 0; b < bridges.size(); ++b)
+            bridge_at[node_of(bridges[b].start)].push_back((uint32_t)b);
+
+        // DP over node indices. Edge tags: 0..NUM_CANDS-1 grid candidate,
+        // then reuse edges, then bridges, then the remainder block.
+        const uint64_t INF = std::numeric_limits<uint64_t>::max();
+        const uint32_t TAG_REUSE  = (uint32_t)NUM_CANDS;
+        const uint32_t TAG_BRIDGE = TAG_REUSE + (uint32_t)m_reuse_edges.size();
+        const uint32_t TAG_REM    = TAG_BRIDGE + (uint32_t)bridges.size();
+        std::vector<uint64_t> dp2(NN, INF);
+        std::vector<int64_t>  par2(NN, -1);
+        std::vector<uint32_t> tag2(NN, 0);
+        dp2[0] = 0;
+        auto relax = [&](size_t i, size_t j, uint64_t w, uint32_t tag) {
+            if (dp2[i] == INF) return;
+            if (dp2[i] + w < dp2[j]) {
+                dp2[j] = dp2[i] + w;
+                par2[j] = (int64_t)i;
+                tag2[j] = tag;
+            }
+        };
+        for (size_t i = 0; i < NN; ++i) {
+            if (dp2[i] == INF) continue;
+            const uint64_t p = pos[i];
+            if (p % STEP == 0 && p < grid_end) {
+                const size_t g = (size_t)(p / STEP);
+                for (size_t c = 0; c < NUM_CANDS; ++c) {
+                    const uint64_t e2 = p + CANDIDATES[c];
+                    if (e2 > grid_end) continue;
+                    relax(i, node_of(e2),
+                          FrameWriter::frame_bits(p, CANDIDATES[c], m_sample_rate,
+                                                  cost_table[g * NUM_CANDS + c].total_bits),
+                          (uint32_t)c);
+                }
+            }
+            if (p == grid_end && remainder > 0)
+                relax(i, terminal,
+                      FrameWriter::frame_bits(p, remainder, m_sample_rate,
+                                              remainder_bp.total_bits),
+                      TAG_REM);
+            for (uint32_t k : reuse_at2[i]) {
+                const auto& e = m_reuse_edges[k];
+                relax(i, node_of(e.start_sample + e.block_size),
+                      (uint64_t)e.frame_bytes * 8u, TAG_REUSE + k);
+            }
+            for (uint32_t b : bridge_at[i]) {
+                const auto& br = bridges[b];
+                relax(i, node_of(br.start + br.size),
+                      FrameWriter::frame_bits(br.start, br.size, m_sample_rate,
+                                              br.bp.total_bits),
+                      TAG_BRIDGE + b);
+            }
+        }
+
+        // Back-trace and assemble. The path is guaranteed to exist: the grid
+        // candidates plus the remainder block alone already span the stream.
+        std::vector<BlockParams> result2;
+        std::vector<std::pair<size_t, uint32_t>> rpath;
+        for (size_t cur = terminal; cur != 0; ) {
+            if (par2[cur] < 0) { rpath.clear(); break; }
+            rpath.emplace_back((size_t)par2[cur], tag2[cur]);
+            cur = (size_t)par2[cur];
+        }
+        std::reverse(rpath.begin(), rpath.end());
+        for (auto [i, tag] : rpath) {
+            if (tag < (uint32_t)NUM_CANDS) {
+                result2.push_back(cost_table[(size_t)(pos[i] / STEP) * NUM_CANDS + tag]);
+            } else if (tag < TAG_BRIDGE) {
+                const auto& e = m_reuse_edges[tag - TAG_REUSE];
+                BlockParams bp{};
+                bp.block_size  = e.block_size;
+                bp.total_bits  = e.frame_bytes * 8u;
+                bp.reuse_index = (int32_t)e.input_index;
+                result2.push_back(bp);
+            } else if (tag < TAG_REM) {
+                result2.push_back(bridges[tag - TAG_BRIDGE].bp);
+            } else {
+                result2.push_back(remainder_bp);
+            }
+        }
+        if (!rpath.empty()) {
+            if (m_verbose) {
+                std::map<uint32_t, int> bs_hist;
+                for (const auto& bp : result2) ++bs_hist[bp.block_size];
+                std::cout << "DP done. Distribution:";
+                for (const auto& [bs, cnt] : bs_hist)
+                    std::cout << "  bs=" << bs << "×" << cnt;
+                std::cout << "\n";
+            }
+            return result2;
+        }
+        // Unreachable terminal would mean a malformed graph — fall through
+        // to the regular DP rather than fail.
+    }
+
+    // Reuse edges: input frames as exact-cost alternatives, bucketed by
+    // start node. Exact-DP only — both edge types are then exact bit counts
+    // (frame_bits for ours, the rewritten frame's size for reuse), so the DP
+    // is optimal over the union of both partitions and can mix them. On a
+    // tie the re-encoded frame wins (strict <), which keeps a re-encode of
+    // our own output byte-stable.
+    std::vector<std::vector<size_t>> reuse_at;
+    if (full_search() && !m_reuse_edges.empty()) {
+        reuse_at.resize(num_nodes);
+        for (size_t k = 0; k < m_reuse_edges.size(); ++k) {
+            const auto& e = m_reuse_edges[k];
+            if (e.start_sample % STEP != 0 || e.block_size % STEP != 0) continue;
+            const uint64_t end = e.start_sample + e.block_size;
+            if (end > (uint64_t)num_nodes * STEP) continue; // remainder region
+            reuse_at[(size_t)(e.start_sample / STEP)].push_back(k);
+        }
+    }
+
     // Phase 2: DP --------------------------------------------------------
     std::vector<uint64_t> dp       (num_nodes + 1, std::numeric_limits<uint64_t>::max());
     std::vector<int>      dp_parent(num_nodes + 1, -1);
@@ -1649,6 +2383,18 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
                 dp[j]        = cost;
                 dp_parent[j] = (int)i;
                 dp_cand  [j] = (int)c;
+            }
+        }
+        if (!reuse_at.empty()) {
+            for (size_t k : reuse_at[i]) {
+                const auto& e = m_reuse_edges[k];
+                size_t j = i + e.block_size / STEP;
+                uint64_t cost = dp[i] + (uint64_t)e.frame_bytes * 8u;
+                if (cost < dp[j]) {
+                    dp[j]        = cost;
+                    dp_parent[j] = (int)i;
+                    dp_cand  [j] = (int)(NUM_CANDS + k); // reuse edge marker
+                }
             }
         }
     }
@@ -1689,7 +2435,18 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
     } else {
         for (size_t idx = 0; idx < path.size(); ++idx) {
             auto [node, ci] = path[idx];
-            result[idx] = cost_table[node * NUM_CANDS + ci];
+            if (ci >= NUM_CANDS) {
+                // Reuse edge: no encoded parameters — the caller emits the
+                // rewritten input frame identified by reuse_index.
+                const auto& e = m_reuse_edges[ci - NUM_CANDS];
+                BlockParams bp{};
+                bp.block_size  = e.block_size;
+                bp.total_bits  = e.frame_bytes * 8u;
+                bp.reuse_index = (int32_t)e.input_index;
+                result[idx] = bp;
+            } else {
+                result[idx] = cost_table[node * NUM_CANDS + ci];
+            }
         }
     }
 
@@ -1714,6 +2471,75 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
 // compute_block: fully-optimised BlockParams for one frame
 // ============================================================
 
+// Adaptive window selection: a hand stat→set map over the free granule
+// statistics (WINDOWS_PLAN.md "Adaptive ICI window selection"). Every set has
+// exactly 4 windows so the analysis cost per encoded block matches the fixed
+// shortlist; only membership adapts. Thresholds are first-cut hand picks —
+// calibrate against measurement before trusting them.
+std::vector<WindowType> Optimizer::select_windows(
+    uint64_t sample_start, uint32_t block_size) const
+{
+    const std::vector<WindowType> def = {WindowType::TUKEY_050, WindowType::HANN,
+                                         WindowType::WELCH, WindowType::RECTANGULAR};
+    if (m_granules.empty() || m_granules[0].empty()) return def;
+    const size_t g0 = (size_t)(sample_start / 16);
+    const size_t g1 = std::min((size_t)((sample_start + block_size) / 16),
+                               m_granules[0].size());
+    if (g1 <= g0 + 8) return def; // too few granules for meaningful stats
+
+    const size_t n = g1 - g0;
+    double sumE = 0.0, sumE2 = 0.0, sumL1 = 0.0, maxE = -1.0;
+    size_t argmax = g0;
+    for (size_t g = g0; g < g1; ++g) {
+        double E = 0.0, L1 = 0.0;
+        for (uint32_t c = 0; c < m_channels; ++c) {
+            E  += m_granules[c][g].autoc[0];
+            L1 += m_granules[c][g].autoc[1];
+        }
+        sumE += E; sumE2 += E * E; sumL1 += L1;
+        if (E > maxE) { maxE = E; argmax = g; }
+    }
+    if (sumE <= 0.0) return def; // digital silence
+
+    const double mean = sumE / (double)n;
+    const double var  = std::max(0.0, sumE2 / (double)n - mean * mean);
+    const double cv2  = var / (mean * mean); // energy dispersion: high ⇒ transient
+    const double tilt = sumL1 / sumE;        // lag1/lag0: ~1 tonal, ~0 noisy
+    const double pos  = (double)(argmax - g0) / (double)n;
+
+    // Transient routing gate: 0.5 saturates (0.25 measured identical). Both
+    // search modes route: -c 0 prices partial/punchout windows exactly
+    // (music_20s −1991 B vs fixed-4, 3-min synthetic percussion −19983 B),
+    // and the ranked scorer's zero-fraction term (see optimize_subframe)
+    // prices their blind region honestly — before that term existed, routing
+    // under -c 8 lost (+2489 B music / +4151 B percussion); with it, it wins
+    // (−104 B / −17992 B).
+    if (cv2 > 0.5) {
+        // Transient content: offer the partial/punchout pair that isolates
+        // the energy peak, plus general-purpose tapers. rect stays in the set
+        // because the gate has a false-positive mode — amplitude-modulated
+        // tonal content (beats) has high energy dispersion too, and dropping
+        // rect there cost +4523 B on the 3-min synthetic tonal fixture. A
+        // routed block therefore analyses 5 windows instead of 4; routed
+        // blocks are a minority, so the extra analysis is marginal.
+        if (pos < 0.33)
+            return {WindowType::PARTIAL_TUKEY_2_000, WindowType::TUKEY_050,
+                    WindowType::HANN, WindowType::WELCH, WindowType::RECTANGULAR};
+        if (pos < 0.67)
+            return {WindowType::PARTIAL_TUKEY_2_033, WindowType::PUNCHOUT_TUKEY_2_033,
+                    WindowType::TUKEY_050, WindowType::HANN, WindowType::RECTANGULAR};
+        return {WindowType::PARTIAL_TUKEY_2_067, WindowType::PUNCHOUT_TUKEY_2_067,
+                WindowType::TUKEY_050, WindowType::HANN, WindowType::RECTANGULAR};
+    }
+    if (tilt > 0.95) // stationary tonal: mild tapers, keep the workhorse
+        return {WindowType::TUKEY_005, WindowType::TUKEY_010,
+                WindowType::TUKEY_050, WindowType::HANN};
+    if (tilt < 0.60) // noisy: heavy tapers, keep the workhorse
+        return {WindowType::TUKEY_050, WindowType::HANN,
+                WindowType::TUKEY_075, WindowType::TUKEY_090};
+    return def;
+}
+
 BlockParams Optimizer::compute_block(
     const std::vector<std::vector<int32_t>>& pcm_data,
     uint64_t sample_start, uint32_t block_size) const
@@ -1721,10 +2547,21 @@ BlockParams Optimizer::compute_block(
     BlockParams bp{};
     bp.block_size = block_size;
 
+    // Adaptive selection replaces the fixed window list per block. Estimated
+    // DP only: under -e the wide set is already offered, so a selector has
+    // nothing to add (and the DP's phase-1 blocks would pay it N×K times).
+    std::vector<WindowType> selected;
+    const std::vector<WindowType>* win_set = &m_windows;
+    if (m_adaptive && !full_search()) {
+        selected = select_windows(sample_start, block_size);
+        win_set = &selected;
+    }
+    const std::vector<WindowType>& wins = *win_set;
+
     if (m_channels == 1) {
         bp.stereo_mode  = 0;
         bp.subframes[0] = optimize_subframe(
-            &pcm_data[0][sample_start], block_size, m_bps, m_windows, m_exhaustive, m_max_candidates);
+            &pcm_data[0][sample_start], block_size, m_bps, wins, m_max_candidates, m_patience);
     } else {
         uint32_t best_bits = std::numeric_limits<uint32_t>::max();
 
@@ -1774,9 +2611,9 @@ BlockParams Optimizer::compute_block(
         auto get_sig = [&](int sig) -> const SubframeParams& {
             if (have[sig]) return cache[sig];
             if (sig == SIG_L) {
-                cache[sig] = optimize_subframe(&pcm_data[0][sample_start], block_size, m_bps, m_windows, m_exhaustive, m_max_candidates);
+                cache[sig] = optimize_subframe(&pcm_data[0][sample_start], block_size, m_bps, wins, m_max_candidates, m_patience);
             } else if (sig == SIG_R) {
-                cache[sig] = optimize_subframe(&pcm_data[1][sample_start], block_size, m_bps, m_windows, m_exhaustive, m_max_candidates);
+                cache[sig] = optimize_subframe(&pcm_data[1][sample_start], block_size, m_bps, wins, m_max_candidates, m_patience);
             } else {
                 std::vector<int32_t> ch(block_size);
                 uint32_t bps_s;
@@ -1789,7 +2626,7 @@ BlockParams Optimizer::compute_block(
                         ch[k] = (pcm_data[0][sample_start + k] + pcm_data[1][sample_start + k]) >> 1;
                     bps_s = m_bps;
                 }
-                cache[sig] = optimize_subframe(ch.data(), block_size, bps_s, m_windows, m_exhaustive, m_max_candidates);
+                cache[sig] = optimize_subframe(ch.data(), block_size, bps_s, wins, m_max_candidates, m_patience);
             }
             have[sig] = true;
             return cache[sig];

@@ -40,4 +40,18 @@ gen short.flac      -t 0.01 -ac 2 -sample_fmt s16   # < 1024 samples: short-stre
 gen micro.flac      -t 0.25 -ac 2 -sample_fmt s16
 gen micro_s24.flac  -t 0.25 -ac 2 -sample_fmt s32 -bits_per_raw_sample 24
 
+# Full-length (3 min) synthetic tracks, one per content regime, for testing
+# content-dependent behaviour (e.g. adaptive window selection) at realistic
+# stream lengths. Still synthetic — the usual caveat about mispredicting real
+# music applies; use them for robustness, not for compression conclusions.
+gen3() { # outfile, source-expr
+  local out=$1; shift
+  ffmpeg -y -loglevel error -f lavfi -i "aevalsrc=$1:s=44100:d=180" \
+         -ac 2 -sample_fmt s16 -c:a flac "$OUT/$out"
+}
+gen3 syn3m_mix.flac       "0.4*sin(2*PI*440*t)+0.2*sin(2*PI*1319*t)*sin(2*PI*3*t)+0.05*random(0)|0.4*sin(2*PI*443*t)+0.15*sin(2*PI*880*t)+0.05*random(1)"
+gen3 syn3m_tonal.flac     "0.35*sin(2*PI*440*t)+0.25*sin(2*PI*659*t)+0.15*sin(2*PI*1319*t)+0.005*random(0)|0.35*sin(2*PI*442*t)+0.25*sin(2*PI*661*t)+0.15*sin(2*PI*880*t)+0.005*random(1)"
+gen3 syn3m_noise.flac     "0.35*random(0)+0.08*sin(2*PI*440*t)|0.35*random(1)+0.08*sin(2*PI*443*t)"
+gen3 syn3m_transient.flac "0.7*sin(2*PI*880*t)*exp(-25*mod(t\,0.4))+0.02*random(0)|0.7*sin(2*PI*662*t)*exp(-25*mod(t\,0.4))+0.02*random(1)"
+
 ls -l "$OUT"

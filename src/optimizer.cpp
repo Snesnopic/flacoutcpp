@@ -430,6 +430,35 @@ static const double* window_table(WindowType wt, int slot)
     return &tables[(size_t)wt * size_sum + prefix];
 }
 
+// Sum of squared window coefficients, the normalizer that turns a windowed
+// Levinson error into an absolute residual-variance estimate (see the ranked
+// scoring in optimize_subframe). Cached for the precomputed table sizes —
+// 26 x 5 doubles, built lazily from the tables themselves — and computed on
+// the fly for the rare other sizes (remainder block, short-stream path).
+static double window_energy(WindowType wt, uint32_t N)
+{
+    const int slot = candidate_slot(N);
+    if (slot >= 0) {
+        static const std::vector<double> energies = [] {
+            std::vector<double> e((size_t)WindowType::COUNT * NUM_DP_CANDIDATES);
+            for (int w = 0; w < (int)WindowType::COUNT; ++w)
+                for (size_t c = 0; c < NUM_DP_CANDIDATES; ++c) {
+                    const double* t = window_table((WindowType)w, (int)c);
+                    double s = 0.0;
+                    for (uint32_t i = 0; i < DP_CANDIDATES[c]; ++i) s += t[i] * t[i];
+                    e[(size_t)w * NUM_DP_CANDIDATES + c] = s;
+                }
+            return e;
+        }();
+        return energies[(size_t)wt * NUM_DP_CANDIDATES + (size_t)slot];
+    }
+    std::vector<double> tmp(N);
+    compute_window_coeffs(wt, N, tmp.data());
+    double s = 0.0;
+    for (uint32_t i = 0; i < N; ++i) s += tmp[i] * tmp[i];
+    return s;
+}
+
 void Optimizer::apply_window(
     const int32_t* samples, uint32_t N, int wasted_bits,
     WindowType wt, double* out)
@@ -1405,18 +1434,32 @@ SubframeParams Optimizer::optimize_subframe(
             //      evaluate only the most promising `max_candidates` of them.
             //
             // Levinson-Durbin already produces the residual energy at each
-            // order as a by-product; the exhaustive path just discards it.
-            // err[ord]/err[0] is the fraction of signal energy the predictor
-            // fails to remove, which turns into an estimated residual bit cost
-            // via the Gaussian entropy 0.5*log2(2*pi*e*var) that
-            // estimate_lpc_bits_fast already uses. The constant term and the
-            // signal's own variance are identical for every candidate, so they
-            // drop out of the comparison and only the log of the ratio remains.
+            // order as a by-product; the exhaustive path just discards it. For
+            // a residual that is roughly stationary across the block, that
+            // windowed-domain energy is ~ var_e x sum(w^2), so dividing by the
+            // window's energy estimates the absolute residual variance, which
+            // the Gaussian entropy 0.5*log2(2*pi*e*var) (the same model
+            // estimate_lpc_bits_fast uses) turns into estimated residual bits.
+            // Absolute variance is what makes scores comparable across windows:
+            // each window scales the signal differently, so raw err[ord]
+            // values are in different units.
             //
-            // Using the *ratio* rather than the raw energy is what makes scores
-            // comparable across windows at all: each window scales the signal
-            // differently, so raw err[ord] values are in different units, while
-            // the fraction removed is dimensionless.
+            // Scoring by the err[ord]/err[0] *ratio* instead (energy fraction
+            // removed) was tried first and measures ~0.02-0.26% worse across
+            // real music and synthetics: it normalizes by the signal power
+            // seen *through the window*, which flatters windows aimed at
+            // quiet parts of the block. Also tried and rejected: scoring by
+            // predicted residual energy on the RAW signal via the quadratic
+            // form a'Ra over the unwindowed autocorrelation — the
+            // autocorrelation method's zero-extension edge bias exceeds the
+            // true residual energy by orders of magnitude on predictable
+            // content, which is the very pathology windowing exists to kill.
+            //
+            // No windowed-domain score fixes the *peephole* problem, though:
+            // partial/punchout windows genuinely predict the slice of block
+            // they look at, so offering all 26 windows still floods the top-N
+            // with slice-local candidates and compresses worse than a small
+            // set (measured: all-26 at N=8 loses to tukey050 alone).
             struct Cand { double score; int wi; int ord; };
             std::vector<Cand> cands;
             cands.reserve(windows.size() * (size_t)max_order);
@@ -1432,11 +1475,13 @@ SubframeParams Optimizer::optimize_subframe(
                 if (!analyse_window(windows[wi], lderr)) continue;
                 std::memcpy(&lpc_store[wi * LPC_STRIDE], all_lpc, sizeof(all_lpc));
                 if (lderr[0] <= 0.0) continue;
+                const double wsq = window_energy(windows[wi], bsize);
+                if (!(wsq > 0.0)) continue;
                 for (int ord = 1; ord <= max_order; ++ord) {
                     if (lderr[ord] <= 0.0) continue; // recursion stopped short of this order
-                    const double ratio = lderr[ord] / lderr[0];
-                    if (!(ratio > 0.0)) continue;
-                    const double resid_bits = 0.5 * std::log2(ratio) * (double)(bsize - ord);
+                    const double var_e = lderr[ord] / wsq;
+                    const double resid_bits =
+                        0.5 * std::log2(2.0 * M_PI * M_E * var_e) * (double)(bsize - ord);
                     const double coef_bits  = (double)ord * (double)(eff_bps + min_prec);
                     cands.push_back({ resid_bits + coef_bits, (int)wi, ord });
                 }

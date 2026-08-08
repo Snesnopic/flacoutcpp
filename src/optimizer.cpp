@@ -2065,6 +2065,189 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
     if (remainder > 0)
         remainder_bp = compute_block(pcm_data, (uint64_t)num_nodes * STEP, remainder);
 
+    // ---- Irregular-node DP: frame reuse with off-grid input frames ------
+    // The regular DP below only accepts reuse edges whose boundaries lie on
+    // the 1024 grid. When any usable input frame is off-grid (a -b 4608
+    // stream, or the input's final remainder frame), switch to a node set of
+    // grid positions ∪ input-frame boundaries ∪ stream end. Input frames
+    // chain between their own boundaries; small exactly-encoded "bridge"
+    // blocks connect each irregular node to the grid, so the path can enter
+    // and leave an input-frame run anywhere. Everything stays exact-cost, so
+    // the DP remains optimal over the union of both partitions. This branch
+    // is bypassed entirely unless -e -r meets an off-grid frame, keeping the
+    // regular path byte-identical.
+    bool irregular = false;
+    if (full_search()) {
+        for (const auto& e : m_reuse_edges) {
+            if (e.start_sample % STEP != 0 || e.block_size % STEP != 0 ||
+                e.start_sample + e.block_size > (uint64_t)num_nodes * STEP) {
+                irregular = true;
+                break;
+            }
+        }
+    }
+    if (irregular) {
+        const uint64_t grid_end = (uint64_t)num_nodes * STEP;
+
+        std::vector<uint64_t> pos;
+        pos.reserve(num_nodes + 2 + m_reuse_edges.size() * 2);
+        for (size_t n = 0; n <= num_nodes; ++n) pos.push_back((uint64_t)n * STEP);
+        pos.push_back(total_samples);
+        for (const auto& e : m_reuse_edges) {
+            pos.push_back(e.start_sample);
+            pos.push_back(e.start_sample + e.block_size);
+        }
+        std::sort(pos.begin(), pos.end());
+        pos.erase(std::unique(pos.begin(), pos.end()), pos.end());
+        const size_t NN = pos.size();
+        auto node_of = [&](uint64_t p) -> size_t {
+            return (size_t)(std::lower_bound(pos.begin(), pos.end(), p) - pos.begin());
+        };
+        const size_t terminal = node_of(total_samples);
+
+        // Bridge spans (deduplicated), then encoded in parallel like phase 1.
+        struct Bridge { uint64_t start; uint32_t size; BlockParams bp; };
+        std::vector<std::pair<uint64_t, uint32_t>> spans;
+        auto add_span = [&](uint64_t s, uint64_t e2) {
+            if (e2 <= s || e2 - s < 16 || e2 - s > 65535) return;
+            spans.emplace_back(s, (uint32_t)(e2 - s));
+        };
+        for (size_t idx = 0; idx < NN; ++idx) {
+            const uint64_t p = pos[idx];
+            if (p % STEP == 0 && p <= grid_end) continue; // grid node
+            if (p == total_samples) continue;             // terminal
+            uint64_t g = (p / STEP) * STEP;               // entering bridge
+            if (p - g < 16 && g >= STEP) g -= STEP;
+            add_span(std::min(g, grid_end), p);
+            uint64_t q = ((p / STEP) + 1) * STEP;         // leaving bridge
+            if (q - p < 16) q += STEP;
+            if (q > grid_end) q = total_samples;
+            add_span(p, q);
+        }
+        std::sort(spans.begin(), spans.end());
+        spans.erase(std::unique(spans.begin(), spans.end()), spans.end());
+
+        std::vector<Bridge> bridges(spans.size());
+        {
+            std::atomic<size_t> next{0};
+            std::vector<std::thread> threads;
+            for (unsigned t = 0; t < nthreads; ++t) {
+                threads.emplace_back([&]() {
+                    for (;;) {
+                        size_t idx = next.fetch_add(1, std::memory_order_relaxed);
+                        if (idx >= spans.size()) break;
+                        auto [s, sz] = spans[idx];
+                        bridges[idx] = Bridge{ s, sz, compute_block(pcm_data, s, sz) };
+                    }
+                });
+            }
+            for (auto& th : threads) th.join();
+        }
+
+        if (m_verbose)
+            std::cout << "DP: irregular reuse graph — " << NN << " nodes, "
+                      << m_reuse_edges.size() << " input-frame edges, "
+                      << bridges.size() << " bridge blocks\n";
+
+        // Per-node edge lists for the non-grid edge types.
+        std::vector<std::vector<uint32_t>> reuse_at2(NN), bridge_at(NN);
+        for (size_t k = 0; k < m_reuse_edges.size(); ++k)
+            reuse_at2[node_of(m_reuse_edges[k].start_sample)].push_back((uint32_t)k);
+        for (size_t b = 0; b < bridges.size(); ++b)
+            bridge_at[node_of(bridges[b].start)].push_back((uint32_t)b);
+
+        // DP over node indices. Edge tags: 0..NUM_CANDS-1 grid candidate,
+        // then reuse edges, then bridges, then the remainder block.
+        const uint64_t INF = std::numeric_limits<uint64_t>::max();
+        const uint32_t TAG_REUSE  = (uint32_t)NUM_CANDS;
+        const uint32_t TAG_BRIDGE = TAG_REUSE + (uint32_t)m_reuse_edges.size();
+        const uint32_t TAG_REM    = TAG_BRIDGE + (uint32_t)bridges.size();
+        std::vector<uint64_t> dp2(NN, INF);
+        std::vector<int64_t>  par2(NN, -1);
+        std::vector<uint32_t> tag2(NN, 0);
+        dp2[0] = 0;
+        auto relax = [&](size_t i, size_t j, uint64_t w, uint32_t tag) {
+            if (dp2[i] == INF) return;
+            if (dp2[i] + w < dp2[j]) {
+                dp2[j] = dp2[i] + w;
+                par2[j] = (int64_t)i;
+                tag2[j] = tag;
+            }
+        };
+        for (size_t i = 0; i < NN; ++i) {
+            if (dp2[i] == INF) continue;
+            const uint64_t p = pos[i];
+            if (p % STEP == 0 && p < grid_end) {
+                const size_t g = (size_t)(p / STEP);
+                for (size_t c = 0; c < NUM_CANDS; ++c) {
+                    const uint64_t e2 = p + CANDIDATES[c];
+                    if (e2 > grid_end) continue;
+                    relax(i, node_of(e2),
+                          FrameWriter::frame_bits(p, CANDIDATES[c], m_sample_rate,
+                                                  cost_table[g * NUM_CANDS + c].total_bits),
+                          (uint32_t)c);
+                }
+            }
+            if (p == grid_end && remainder > 0)
+                relax(i, terminal,
+                      FrameWriter::frame_bits(p, remainder, m_sample_rate,
+                                              remainder_bp.total_bits),
+                      TAG_REM);
+            for (uint32_t k : reuse_at2[i]) {
+                const auto& e = m_reuse_edges[k];
+                relax(i, node_of(e.start_sample + e.block_size),
+                      (uint64_t)e.frame_bytes * 8u, TAG_REUSE + k);
+            }
+            for (uint32_t b : bridge_at[i]) {
+                const auto& br = bridges[b];
+                relax(i, node_of(br.start + br.size),
+                      FrameWriter::frame_bits(br.start, br.size, m_sample_rate,
+                                              br.bp.total_bits),
+                      TAG_BRIDGE + b);
+            }
+        }
+
+        // Back-trace and assemble. The path is guaranteed to exist: the grid
+        // candidates plus the remainder block alone already span the stream.
+        std::vector<BlockParams> result2;
+        std::vector<std::pair<size_t, uint32_t>> rpath;
+        for (size_t cur = terminal; cur != 0; ) {
+            if (par2[cur] < 0) { rpath.clear(); break; }
+            rpath.emplace_back((size_t)par2[cur], tag2[cur]);
+            cur = (size_t)par2[cur];
+        }
+        std::reverse(rpath.begin(), rpath.end());
+        for (auto [i, tag] : rpath) {
+            if (tag < (uint32_t)NUM_CANDS) {
+                result2.push_back(cost_table[(size_t)(pos[i] / STEP) * NUM_CANDS + tag]);
+            } else if (tag < TAG_BRIDGE) {
+                const auto& e = m_reuse_edges[tag - TAG_REUSE];
+                BlockParams bp{};
+                bp.block_size  = e.block_size;
+                bp.total_bits  = e.frame_bytes * 8u;
+                bp.reuse_index = (int32_t)e.input_index;
+                result2.push_back(bp);
+            } else if (tag < TAG_REM) {
+                result2.push_back(bridges[tag - TAG_BRIDGE].bp);
+            } else {
+                result2.push_back(remainder_bp);
+            }
+        }
+        if (!rpath.empty()) {
+            if (m_verbose) {
+                std::map<uint32_t, int> bs_hist;
+                for (const auto& bp : result2) ++bs_hist[bp.block_size];
+                std::cout << "DP done. Distribution:";
+                for (const auto& [bs, cnt] : bs_hist)
+                    std::cout << "  bs=" << bs << "×" << cnt;
+                std::cout << "\n";
+            }
+            return result2;
+        }
+        // Unreachable terminal would mean a malformed graph — fall through
+        // to the regular DP rather than fail.
+    }
+
     // Reuse edges: input frames as exact-cost alternatives, bucketed by
     // start node. Exact-DP only — both edge types are then exact bit counts
     // (frame_bits for ours, the rewritten frame's size for reuse), so the DP

@@ -157,8 +157,8 @@ bool Processor::process() {
     if (reuse && m_config.exhaustive) {
         for (size_t i = 0; i < m_input_frames.size(); ++i) {
             const auto& f = m_input_frames[i];
-            if (f.first_sample % 1024 != 0 || f.block_size % 1024 != 0)
-                continue; // off the DP grid; the final splice pass still sees it
+            // Off-grid frames are usable too: the DP grows nodes at input
+            // frame boundaries and bridges them to its grid.
             auto fb = FrameWriter::rewrite_frame(
                 &input_bytes[f.byte_start], (size_t)(f.byte_end - f.byte_start),
                 f.first_sample, f.block_size, m_sample_rate);

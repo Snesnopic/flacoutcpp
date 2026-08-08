@@ -2065,6 +2065,24 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
     if (remainder > 0)
         remainder_bp = compute_block(pcm_data, (uint64_t)num_nodes * STEP, remainder);
 
+    // Reuse edges: input frames as exact-cost alternatives, bucketed by
+    // start node. Exact-DP only — both edge types are then exact bit counts
+    // (frame_bits for ours, the rewritten frame's size for reuse), so the DP
+    // is optimal over the union of both partitions and can mix them. On a
+    // tie the re-encoded frame wins (strict <), which keeps a re-encode of
+    // our own output byte-stable.
+    std::vector<std::vector<size_t>> reuse_at;
+    if (full_search() && !m_reuse_edges.empty()) {
+        reuse_at.resize(num_nodes);
+        for (size_t k = 0; k < m_reuse_edges.size(); ++k) {
+            const auto& e = m_reuse_edges[k];
+            if (e.start_sample % STEP != 0 || e.block_size % STEP != 0) continue;
+            const uint64_t end = e.start_sample + e.block_size;
+            if (end > (uint64_t)num_nodes * STEP) continue; // remainder region
+            reuse_at[(size_t)(e.start_sample / STEP)].push_back(k);
+        }
+    }
+
     // Phase 2: DP --------------------------------------------------------
     std::vector<uint64_t> dp       (num_nodes + 1, std::numeric_limits<uint64_t>::max());
     std::vector<int>      dp_parent(num_nodes + 1, -1);
@@ -2085,6 +2103,18 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
                 dp[j]        = cost;
                 dp_parent[j] = (int)i;
                 dp_cand  [j] = (int)c;
+            }
+        }
+        if (!reuse_at.empty()) {
+            for (size_t k : reuse_at[i]) {
+                const auto& e = m_reuse_edges[k];
+                size_t j = i + e.block_size / STEP;
+                uint64_t cost = dp[i] + (uint64_t)e.frame_bytes * 8u;
+                if (cost < dp[j]) {
+                    dp[j]        = cost;
+                    dp_parent[j] = (int)i;
+                    dp_cand  [j] = (int)(NUM_CANDS + k); // reuse edge marker
+                }
             }
         }
     }
@@ -2125,7 +2155,18 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
     } else {
         for (size_t idx = 0; idx < path.size(); ++idx) {
             auto [node, ci] = path[idx];
-            result[idx] = cost_table[node * NUM_CANDS + ci];
+            if (ci >= NUM_CANDS) {
+                // Reuse edge: no encoded parameters — the caller emits the
+                // rewritten input frame identified by reuse_index.
+                const auto& e = m_reuse_edges[ci - NUM_CANDS];
+                BlockParams bp{};
+                bp.block_size  = e.block_size;
+                bp.total_bits  = e.frame_bytes * 8u;
+                bp.reuse_index = (int32_t)e.input_index;
+                result[idx] = bp;
+            } else {
+                result[idx] = cost_table[node * NUM_CANDS + ci];
+            }
         }
     }
 

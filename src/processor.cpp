@@ -127,10 +127,53 @@ bool Processor::process() {
     }
     auto md5_digest = md5.digest();
 
+    // --- Step 2c: frame-reuse preparation ----
+    // Validate that the recorded input frames tile the stream and load the
+    // input bytes for payload splicing. Under exact-DP mode the grid-aligned
+    // frames are also offered to the partitioning DP as exact-cost edges, so
+    // the DP can mix the input's partition with its own.
+    bool reuse = m_config.reuse_frames && m_frame_pos_ok && !m_input_frames.empty();
+    std::vector<uint8_t> input_bytes;
+    if (reuse) {
+        uint64_t expect = 0;
+        for (const auto& f : m_input_frames) {
+            if (f.first_sample != expect || f.byte_end <= f.byte_start) { reuse = false; break; }
+            expect += f.block_size;
+        }
+        if (expect != m_total_samples) reuse = false;
+    }
+    if (reuse) {
+        std::ifstream inf(m_input, std::ios::binary);
+        inf.seekg(0, std::ios::end);
+        input_bytes.resize((size_t)inf.tellg());
+        inf.seekg(0, std::ios::beg);
+        inf.read(reinterpret_cast<char*>(input_bytes.data()),
+                 (std::streamsize)input_bytes.size());
+        if (!inf || input_bytes.size() < m_input_frames.back().byte_end)
+            reuse = false;
+    }
+
+    std::vector<ReuseEdge> reuse_edges;
+    if (reuse && m_config.exhaustive) {
+        for (size_t i = 0; i < m_input_frames.size(); ++i) {
+            const auto& f = m_input_frames[i];
+            if (f.first_sample % 1024 != 0 || f.block_size % 1024 != 0)
+                continue; // off the DP grid; the final splice pass still sees it
+            auto fb = FrameWriter::rewrite_frame(
+                &input_bytes[f.byte_start], (size_t)(f.byte_end - f.byte_start),
+                f.first_sample, f.block_size, m_sample_rate);
+            if (fb.empty()) continue;
+            reuse_edges.push_back(ReuseEdge{ f.first_sample, f.block_size,
+                                             (uint32_t)fb.size(), (uint32_t)i });
+        }
+    }
+
     // --- Step 3: run optimiser ----
     Optimizer opt(m_channels, m_bps, m_sample_rate, m_config.windows, m_config.max_threads,
                   m_config.exhaustive, m_config.verbose, m_config.max_candidates,
                   m_config.adaptive_windows);
+    if (!reuse_edges.empty())
+        opt.set_reuse_edges(std::move(reuse_edges));
     std::vector<BlockParams> blocks = opt.find_optimal_block_partitioning(m_pcm_data);
 
     if (blocks.empty()) {
@@ -202,46 +245,32 @@ bool Processor::process() {
         total_written += fb.size();
     };
 
-    // Frame reuse: the input's own frames compete against the re-encoded
-    // ones wherever both partitions share a boundary. Validate that the
-    // recorded frames tile the stream, then load the input bytes for
-    // payload splicing.
-    bool reuse = m_config.reuse_frames && m_frame_pos_ok && !m_input_frames.empty();
-    std::vector<uint8_t> input_bytes;
-    if (reuse) {
-        uint64_t expect = 0;
-        for (const auto& f : m_input_frames) {
-            if (f.first_sample != expect || f.byte_end <= f.byte_start) { reuse = false; break; }
-            expect += f.block_size;
+    // Build one frame from a DP block: either a re-encode, or — when the DP
+    // chose a reuse edge — the rewritten input frame it identified.
+    auto build_frame = [&](const BlockParams& block,
+                           uint64_t sample_number) -> std::vector<uint8_t> {
+        if (block.reuse_index >= 0) {
+            const auto& f = m_input_frames[(size_t)block.reuse_index];
+            return FrameWriter::rewrite_frame(
+                &input_bytes[f.byte_start], (size_t)(f.byte_end - f.byte_start),
+                f.first_sample, f.block_size, m_sample_rate);
         }
-        if (expect != m_total_samples) reuse = false;
-    }
-    if (reuse) {
-        std::ifstream inf(m_input, std::ios::binary);
-        inf.seekg(0, std::ios::end);
-        input_bytes.resize((size_t)inf.tellg());
-        inf.seekg(0, std::ios::beg);
-        inf.read(reinterpret_cast<char*>(input_bytes.data()),
-                 (std::streamsize)input_bytes.size());
-        if (!inf || input_bytes.size() < m_input_frames.back().byte_end)
-            reuse = false;
-    }
+        auto fb = fw.write_frame(block, m_pcm_data, sample_number,
+                                 m_sample_rate, m_bps);
+        // Debug builds: the optimizer's predicted frame size must equal what
+        // the writer actually emitted, or the DP is optimizing a cost the
+        // stream does not pay. (block.total_bits is exact here under -e;
+        // heuristic blocks also come from compute_block.)
+        assert(fb.size() * 8 ==
+               FrameWriter::frame_bits(sample_number, block.block_size,
+                                       m_sample_rate, block.total_bits));
+        return fb;
+    };
 
     if (!reuse) {
         uint64_t sample_number = 0;
         for (const auto& block : blocks) {
-            auto frame_bytes = fw.write_frame(
-                block, m_pcm_data, sample_number, m_sample_rate, m_bps);
-
-            // Debug builds: the optimizer's predicted frame size must equal what
-            // the writer actually emitted, or the DP is optimizing a cost the
-            // stream does not pay. (block.total_bits is exact here — every block
-            // in the final sequence came from compute_block.)
-            assert(frame_bytes.size() * 8 ==
-                   FrameWriter::frame_bits(sample_number, block.block_size,
-                                           m_sample_rate, block.total_bits));
-
-            emit(frame_bytes, block.block_size);
+            emit(build_frame(block, sample_number), block.block_size);
             sample_number += block.block_size;
         }
     } else {
@@ -252,17 +281,14 @@ bool Processor::process() {
         size_t bi = 0, ij = 0;
         uint64_t our_end = 0, in_end = 0;
         std::vector<std::pair<std::vector<uint8_t>, uint32_t>> ours, theirs;
-        size_t our_sz = 0, in_sz = 0;
+        size_t our_sz = 0, in_sz = 0, our_reused = 0;
         bool   seg_ok = true; // false if any input frame failed to rewrite
 
         while (bi < blocks.size() || ij < m_input_frames.size()) {
             if (our_end <= in_end && bi < blocks.size()) {
                 const auto& block = blocks[bi++];
-                auto fb = fw.write_frame(
-                    block, m_pcm_data, our_end, m_sample_rate, m_bps);
-                assert(fb.size() * 8 ==
-                       FrameWriter::frame_bits(our_end, block.block_size,
-                                               m_sample_rate, block.total_bits));
+                if (block.reuse_index >= 0) our_reused++;
+                auto fb = build_frame(block, our_end);
                 our_sz += fb.size();
                 our_end += block.block_size;
                 ours.emplace_back(std::move(fb), block.block_size);
@@ -283,10 +309,10 @@ bool Processor::process() {
             if (our_end == in_end && !ours.empty() && !theirs.empty()) {
                 const bool take_input = seg_ok && in_sz < our_sz;
                 auto& chosen = take_input ? theirs : ours;
-                if (take_input) frames_reused += theirs.size();
+                frames_reused += take_input ? theirs.size() : our_reused;
                 for (auto& [fb, bs] : chosen) emit(fb, bs);
                 ours.clear(); theirs.clear();
-                our_sz = in_sz = 0;
+                our_sz = in_sz = 0; our_reused = 0;
                 seg_ok = true;
             }
         }

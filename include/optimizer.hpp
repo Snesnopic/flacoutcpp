@@ -171,6 +171,22 @@ struct BlockParams {
     int            stereo_mode;   ///< Channel coupling: 0=Independent, 8=Left-Side, 9=Right-Side, 10=Mid-Side.
     SubframeParams subframes[2];  ///< Per-channel subframe parameters (index 0 = left/mid, 1 = right/side).
     uint32_t       total_bits;    ///< Sum of subframe bits (header bits excluded).
+    int32_t        reuse_index = -1; ///< ≥0: emit input frame #reuse_index verbatim (frame reuse) instead of encoding; other fields besides block_size are unused.
+};
+
+/**
+ * @brief One input frame offered to the partitioning DP as an exact-cost
+ *        alternative edge (frame reuse under exact-DP mode).
+ *
+ * The caller (Processor) computes @c frame_bytes by actually rewriting the
+ * input frame to this stream's header conventions, so the DP compares it
+ * against re-encoded candidates on equal, exact terms.
+ */
+struct ReuseEdge {
+    uint64_t start_sample;  ///< Absolute first sample (must lie on the DP grid).
+    uint32_t block_size;    ///< Samples covered (must end on the DP grid).
+    uint32_t frame_bytes;   ///< Size of the rewritten frame, in bytes.
+    uint32_t input_index;   ///< Caller's index for emitting the frame later.
 };
 
 /// @}
@@ -233,6 +249,16 @@ public:
      */
     std::vector<BlockParams> find_optimal_block_partitioning(
         const std::vector<std::vector<int32_t>>& pcm_data);
+
+    /**
+     * @brief Offer input frames to the partitioning DP as alternative edges.
+     *
+     * Exact-DP mode only (the estimated DP would compare exact reuse costs
+     * against granule estimates, biasing the partition toward copying);
+     * ignored otherwise. Blocks chosen from these edges come back with
+     * BlockParams::reuse_index set instead of encoded parameters.
+     */
+    void set_reuse_edges(std::vector<ReuseEdge> edges) { m_reuse_edges = std::move(edges); }
 
     /**
      * @brief Find the cheapest encoding for a single channel block.
@@ -326,6 +352,7 @@ private:
     bool                  m_verbose;
     unsigned              m_max_candidates;
     bool                  m_adaptive;
+    std::vector<ReuseEdge> m_reuse_edges;
 
     /// True when block costs come from real encodes rather than the granule
     /// estimate: exact DP, all four stereo modes, full precision sweep.

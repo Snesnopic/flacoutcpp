@@ -1,0 +1,32 @@
+# Learned window shape — found by bench/window_search.py, not hand-designed.
+#
+# Search: CMA-ES, 9 knots, 210 evaluations, objective = total encoded bytes
+# with this shape offered as a 5th window alongside the default set
+# (tukey050,hann,welch,rect) under the plain default search (-n -R -c 8).
+# Trained on 8 six-second excerpts from C418 / Jake Kaufman / MDK; validated
+# on 7 excerpts from a disjoint set of artists (Hiatus, Baron von Arrow,
+# Horcrux, Big Giant Circles).
+#
+# Measured as a 5th window, bytes saved vs the 4-window default:
+#   held-out excerpts (unseen artists)   -0.105%
+#   master_1s_mix (188 tracks)           -0.066%
+#   best compiled-in 5th window          -0.029% (tukey005)
+#
+# Two lobes with a near-silent middle: it looks at the first eighth and a
+# narrow band near the end, which is the sparse/punchout family the compiled-in
+# windows only cover at fixed offsets. Note the 1.7e-4 / 3.5e-4 knots are load
+# bearing under the *ranked* search — being near zero rather than exactly zero
+# keeps window_zero_frac's blind-region penalty from firing, which is worth
+# ~24% of this window's gain. See the commit message; that is a finding about
+# the scorer, not a property to imitate.
+#
+# Not promoted into any default set: one search, one corpus split.
+0.077478085993338719
+0.78428566045328896
+0.7185301721084435
+0.00017449787357266716
+0.00035440336937370154
+0.10284796608632378
+0.015361323225811555
+1
+0.011633581100949784

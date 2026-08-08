@@ -118,7 +118,12 @@ std::vector<uint8_t> FrameWriter::rewrite_frame(
     // sync(14) res(1) blocking(1) | bs code(4) sr code(4) | ch(4) bps(3)
     // res(1) | UTF-8 number (1-7 B) | bs extra (0-2 B) | sr extra (0-2 B) |
     // CRC-8. Subframes follow byte-aligned; the last 2 bytes are CRC-16.
-    if (len < 8 || in[0] != 0xFF || (in[1] & 0xF8u) != 0xF8u)
+    // The sync code is 14 bits (0b11111111111110), so in[1]'s top *six* bits
+    // are part of it — mask 0xFC, not 0xF8, which would leave the sync's last
+    // bit unchecked and accept 0b111111xx. Unreachable today (callers pass
+    // ranges libFLAC's own decode-position tracking identified as frames), but
+    // this is the guard that decides whether the fallback-to-{} path fires.
+    if (len < 8 || in[0] != 0xFF || (in[1] & 0xFCu) != 0xF8u)
         return {};
     const uint8_t bs_code_in = (uint8_t)(in[2] >> 4);
     const uint8_t sr_code_in = (uint8_t)(in[2] & 0x0F);

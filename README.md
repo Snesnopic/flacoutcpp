@@ -30,7 +30,15 @@ Options:
   -c, --candidates N   Fully evaluate only the N most promising
                        (window, order) pairs per subframe (0 = no limit;
                        default 8, or 0 when -e is given without -c)
+  -a, --adaptive-windows  Experimental: pick each block's window set from its
+                       signal statistics instead of the fixed shortlist
+                       (estimated-DP only; excludes -e/-w)
   -n, --no-metadata    Do not copy metadata from input to output
+  -R, --no-reuse       Disable input-frame reuse (see below); mainly for
+                       measuring the raw search
+  -W, --warn-superior  Warn on stderr when the input's own frames beat the
+                       re-encode, naming the input's encoder when its
+                       metadata says; incompatible with -R
   -q, --quiet          Suppress all progress output
   -t, --threads N      Limit parallel worker threads (default: all CPUs)
   -w, --windows <list> Comma-separated list of apodization windows to use
@@ -80,6 +88,42 @@ unlimited sweep on the heuristic's 4-window set) barely out-compresses the
 default: the ranking finds nearly everything the sweep finds.
 
 These figures are one excerpt of one track; the trade depends on the material.
+(They also predate the RICE2 residual coding and ranked-scorer improvements,
+which shrank 24-bit output by ~2% across all modes — treat the column as a
+shape, not gospel.)
+
+### Frame reuse (on by default)
+
+The input file arrives already partitioned into frames whose exact compressed
+sizes are known for free, so the encoder lets them compete: wherever the
+input's frames cover a span of the chosen partition in fewer bytes than the
+re-encoded frames, the input frames are spliced into the output — payload
+verbatim, header rewritten to the output stream's conventions, CRCs
+recomputed. Under `-e` they additionally enter the block-partitioning DP as
+exact-cost edges, so the optimizer can interleave reused frames with
+re-encoded ones (including inputs whose frame boundaries don't align with the
+DP grid). If the finished file would still be larger than the input, the
+input is copied through unchanged (unless `-n` asked to drop its metadata).
+
+The net guarantee: **re-encoding never grows a file**, at any search level,
+and running flacoutcpp over its own output is byte-stable. `-R` turns all of
+this off — useful only when measuring what the search itself produces.
+
+`-W` reports the flip side: when reuse fired, some encoder out there beat
+this one on part of the file, and the warning names it from the input's
+vendor string. Useful for surveying a library for material worth a deeper
+look.
+
+### Adaptive window selection (`-a`, experimental)
+
+Estimated-DP modes normally analyse a fixed 4-window shortlist. With `-a`,
+each block picks its window set from signal statistics the encoder has
+already computed (energy dispersion, transient position, spectral tilt):
+transient blocks bring in partial/punchout windows aimed at the energy peak,
+at unchanged analysis cost. Measured across a 9-album corpus at `-c 0` it
+saved 0.03–0.34% per album with zero regressing tracks; at the plain default
+it is nearly free but the gains are small. Excludes `-e` (which already
+offers every window) and `-w` (which fixes the set by hand).
 
 ### Reproducibility
 

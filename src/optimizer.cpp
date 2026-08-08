@@ -749,6 +749,27 @@ static int candidate_slot(uint32_t N)
     return -1;
 }
 
+// How small a window coefficient must be, relative to the window's peak, to
+// count the sample as one the window cannot see. 0.0 means "exactly zero",
+// which is what the blind-region term originally tested; see the calibration
+// note at the ranked scorer for why that is worth a threshold.
+#ifndef FLACOUT_BLIND_EPS
+#define FLACOUT_BLIND_EPS 0.0
+#endif
+
+// Fraction of a window's coefficients that are blind by the above rule.
+// At FLACOUT_BLIND_EPS == 0 this is |w[i]| <= 0, i.e. exactly zero.
+static double blind_fraction(const double* w, uint32_t n)
+{
+    double peak = 0.0;
+    for (uint32_t i = 0; i < n; ++i) peak = std::max(peak, std::abs(w[i]));
+    const double cut = (double)FLACOUT_BLIND_EPS * peak;
+    uint32_t z = 0;
+    for (uint32_t i = 0; i < n; ++i)
+        if (std::abs(w[i]) <= cut) ++z;
+    return (double)z / (double)n;
+}
+
 // All compiled-in windows (incl. experimental) x 5 candidate sizes, built once
 // on first use (~254 KB per window; ~13 MB at 51 windows,
 // thread-safe magic static — worker threads block on the first builder and
@@ -866,14 +887,10 @@ WindowType register_custom_window(const std::string& path, std::string* error)
     for (size_t c = 0; c < NUM_DP_CANDIDATES; ++c) {
         double* t = &cw.tables[cw.offsets[c]];
         interpolate_custom(cw.knots, DP_CANDIDATES[c], t);
-        double   e = 0.0;
-        uint32_t z = 0;
-        for (uint32_t i = 0; i < DP_CANDIDATES[c]; ++i) {
-            e += t[i] * t[i];
-            if (t[i] == 0.0) ++z;
-        }
+        double e = 0.0;
+        for (uint32_t i = 0; i < DP_CANDIDATES[c]; ++i) e += t[i] * t[i];
         cw.energy[c]    = e;
-        cw.zero_frac[c] = (double)z / (double)DP_CANDIDATES[c];
+        cw.zero_frac[c] = blind_fraction(t, DP_CANDIDATES[c]);
     }
 
     // Last: nothing may observe a half-built entry.
@@ -931,11 +948,8 @@ static double window_zero_frac(WindowType wt, uint32_t N)
             for (int w = 0; w < (int)WindowType::CUSTOM_BEGIN; ++w)
                 for (size_t c = 0; c < NUM_DP_CANDIDATES; ++c) {
                     const double* t = window_table((WindowType)w, (int)c);
-                    uint32_t z = 0;
-                    for (uint32_t i = 0; i < DP_CANDIDATES[c]; ++i)
-                        if (t[i] == 0.0) ++z;
                     f[(size_t)w * NUM_DP_CANDIDATES + c] =
-                        (double)z / (double)DP_CANDIDATES[c];
+                        blind_fraction(t, DP_CANDIDATES[c]);
                 }
             return f;
         }();
@@ -943,10 +957,7 @@ static double window_zero_frac(WindowType wt, uint32_t N)
     }
     std::vector<double> tmp(N);
     compute_window_coeffs(wt, N, tmp.data());
-    uint32_t z = 0;
-    for (uint32_t i = 0; i < N; ++i)
-        if (tmp[i] == 0.0) ++z;
-    return (double)z / (double)N;
+    return blind_fraction(tmp.data(), N);
 }
 
 void Optimizer::apply_window(
@@ -2014,13 +2025,45 @@ SubframeParams Optimizer::optimize_subframe(
             // their windowed error says nothing about the samples they zero
             // out — pricing those as free floods the top-N with slice-local
             // candidates (measured: all-26 at N=8 lost to tukey050 alone).
-            // Fix: charge the zeroed fraction of the block at the raw
-            // signal's variance — the model has no information there, so the
-            // unpredicted signal is the honest estimate. Dense windows have
-            // zero_frac == 0 and score exactly as before.
+            // Fix: charge the blind fraction of the block above what the
+            // model claims, toward the raw signal's variance. Dense windows
+            // have zero_frac == 0 and are unaffected either way.
+            //
+            // Calibration (FLACOUT_BLIND_BETA). Charging the blind region the
+            // *full* raw variance, as this first did, treats the predictor as
+            // worthless outside the window; it is not, because audio is
+            // locally stationary. Measured too pessimistic by about 4x: it
+            // priced sparse windows out of the ranked top-N even where exact
+            // costing shows them winning. On a 188-track corpus, moving beta
+            // 1.0 -> 0.25 leaves the dense-window default alone (+12 B) and
+            // takes 13,082 B (-0.078%) off -a adaptive mode, whose whole
+            // purpose is routing transient blocks to these windows. Offered
+            // punchouttukey2_033 as a 5th window on held-out excerpts, its
+            // gain goes from -2711 B to about -5600 B against a -9068 B
+            // exact-pricing ceiling. beta = 0 (no penalty) is not the answer:
+            // it re-floods the pool, costing +5762 B when all 26 windows are
+            // offered at -c 8.
+            //
+            // FLACOUT_BLIND_EPS exists because the blind test is an equality
+            // against zero, which a shape can dodge by sitting just above it
+            // — a CMA-ES window search (bench/window_search.py) found exactly
+            // that exploit, worth 1257 B of a 5332 B gain. A relative
+            // threshold closes it and buys a little more besides, but it also
+            // counts dense windows' taper skirts as blind, which cost +3442 B
+            // on the 3-minute tonal fixture at eps = 1e-2 for a further
+            // -558 B on the corpus. Left at 0 (exact zero) on that evidence;
+            // with beta at 0.25 the exploit is worth a quarter of what it was.
             struct Cand { double score; int wi; int ord; };
             std::vector<Cand> cands;
             cands.reserve(windows.size() * (size_t)max_order);
+// How much of the gap between the model's claim and the raw signal's cost a
+// blind sample is charged. 1.0 — the original — assumes the predictor has no
+// power at all outside the window, which measured 4x too pessimistic: audio
+// is locally stationary, so coefficients fit on the visible slice do predict
+// the rest. See the calibration note below.
+#ifndef FLACOUT_BLIND_BETA
+#define FLACOUT_BLIND_BETA 0.25
+#endif
 
             // Entropy terms are clamped at zero: the Gaussian differential
             // entropy goes negative once var < 1/(2πe), but Rice cannot code
@@ -2054,9 +2097,20 @@ SubframeParams Optimizer::optimize_subframe(
                     const double var_e = lderr[ord] / wsq;
                     const double model_bits_per_sample =
                         std::max(0.0, 0.5 * std::log2(2.0 * M_PI * M_E * var_e));
+                    // Blind samples are priced between what the model claims
+                    // and what the raw signal costs. FLACOUT_BLIND_BETA == 1
+                    // charges them the full raw entropy — no predictive power
+                    // at all outside the window — which is the pessimistic
+                    // end; the coefficients are fit on the visible slice but
+                    // audio is locally stationary, so they do predict the rest
+                    // somewhat.
+                    const double blind_bits_per_sample =
+                        model_bits_per_sample
+                        + (double)FLACOUT_BLIND_BETA
+                          * (raw_bits_per_sample - model_bits_per_sample);
                     const double resid_bits =
                         (model_bits_per_sample * (1.0 - zf)
-                         + raw_bits_per_sample * zf) * (double)(bsize - ord);
+                         + blind_bits_per_sample * zf) * (double)(bsize - ord);
                     const double coef_bits  = (double)ord * (double)(eff_bps + min_prec);
                     cands.push_back({ resid_bits + coef_bits, (int)wi, ord });
                 }

@@ -29,7 +29,11 @@ static void print_usage(const char* prog) {
         << "  partialtukey2, partialtukey2_033, partialtukey2_067,\n"
         << "  punchouttukey2_033, punchouttukey2_067\n"
         << "Experimental windows (never in a default set; explicit -w only):\n"
-        << "  lanczos, bohman, parzen, plancktaper010, plancktaper025\n";
+        << "  lanczos, bohman, parzen, plancktaper010, plancktaper025,\n"
+        << "  partialtukey3_{1,2,3}, punchouttukey3_{1,2,3},\n"
+        << "  partialtukey3h_{000,033,067}, punchouttukey3h_{025,050},\n"
+        << "  expdecay{2,4}, expattack{2,4}, attackdecay{005,010,020},\n"
+        << "  dpss{2,3,4}\n";
 }
 
 // Split a comma-separated string into tokens.

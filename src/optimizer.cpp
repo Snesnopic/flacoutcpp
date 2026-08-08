@@ -137,6 +137,27 @@ std::string window_to_name(WindowType wt) {
         case WindowType::PARZEN:                   return "parzen";
         case WindowType::PLANCKTAPER_010:          return "plancktaper010";
         case WindowType::PLANCKTAPER_025:          return "plancktaper025";
+        case WindowType::PARTIAL_TUKEY_3_1:        return "partialtukey3_1";
+        case WindowType::PARTIAL_TUKEY_3_2:        return "partialtukey3_2";
+        case WindowType::PARTIAL_TUKEY_3_3:        return "partialtukey3_3";
+        case WindowType::PUNCHOUT_TUKEY_3_1:       return "punchouttukey3_1";
+        case WindowType::PUNCHOUT_TUKEY_3_2:       return "punchouttukey3_2";
+        case WindowType::PUNCHOUT_TUKEY_3_3:       return "punchouttukey3_3";
+        case WindowType::PARTIAL_TUKEY_3H_000:     return "partialtukey3h_000";
+        case WindowType::PARTIAL_TUKEY_3H_033:     return "partialtukey3h_033";
+        case WindowType::PARTIAL_TUKEY_3H_067:     return "partialtukey3h_067";
+        case WindowType::PUNCHOUT_TUKEY_3H_025:    return "punchouttukey3h_025";
+        case WindowType::PUNCHOUT_TUKEY_3H_050:    return "punchouttukey3h_050";
+        case WindowType::EXPDECAY_2:               return "expdecay2";
+        case WindowType::EXPDECAY_4:               return "expdecay4";
+        case WindowType::EXPATTACK_2:              return "expattack2";
+        case WindowType::EXPATTACK_4:              return "expattack4";
+        case WindowType::ATTACKDECAY_005:          return "attackdecay005";
+        case WindowType::ATTACKDECAY_010:          return "attackdecay010";
+        case WindowType::ATTACKDECAY_020:          return "attackdecay020";
+        case WindowType::DPSS_2:                   return "dpss2";
+        case WindowType::DPSS_3:                   return "dpss3";
+        case WindowType::DPSS_4:                   return "dpss4";
         default:                                   return "unknown";
     }
 }
@@ -179,6 +200,27 @@ WindowType window_from_name(const std::string& raw) {
     if (clean == "parzen")                                return WindowType::PARZEN;
     if (clean == "plancktaper010")                        return WindowType::PLANCKTAPER_010;
     if (clean == "plancktaper025")                        return WindowType::PLANCKTAPER_025;
+    if (clean == "partialtukey31")                        return WindowType::PARTIAL_TUKEY_3_1;
+    if (clean == "partialtukey32")                        return WindowType::PARTIAL_TUKEY_3_2;
+    if (clean == "partialtukey33")                        return WindowType::PARTIAL_TUKEY_3_3;
+    if (clean == "punchouttukey31")                       return WindowType::PUNCHOUT_TUKEY_3_1;
+    if (clean == "punchouttukey32")                       return WindowType::PUNCHOUT_TUKEY_3_2;
+    if (clean == "punchouttukey33")                       return WindowType::PUNCHOUT_TUKEY_3_3;
+    if (clean == "partialtukey3h000")                     return WindowType::PARTIAL_TUKEY_3H_000;
+    if (clean == "partialtukey3h033")                     return WindowType::PARTIAL_TUKEY_3H_033;
+    if (clean == "partialtukey3h067")                     return WindowType::PARTIAL_TUKEY_3H_067;
+    if (clean == "punchouttukey3h025")                    return WindowType::PUNCHOUT_TUKEY_3H_025;
+    if (clean == "punchouttukey3h050")                    return WindowType::PUNCHOUT_TUKEY_3H_050;
+    if (clean == "expdecay2")                             return WindowType::EXPDECAY_2;
+    if (clean == "expdecay4")                             return WindowType::EXPDECAY_4;
+    if (clean == "expattack2")                            return WindowType::EXPATTACK_2;
+    if (clean == "expattack4")                            return WindowType::EXPATTACK_4;
+    if (clean == "attackdecay005")                        return WindowType::ATTACKDECAY_005;
+    if (clean == "attackdecay010")                        return WindowType::ATTACKDECAY_010;
+    if (clean == "attackdecay020")                        return WindowType::ATTACKDECAY_020;
+    if (clean == "dpss2")                                 return WindowType::DPSS_2;
+    if (clean == "dpss3")                                 return WindowType::DPSS_3;
+    if (clean == "dpss4")                                 return WindowType::DPSS_4;
     return WindowType::COUNT; // unrecognised
 }
 
@@ -227,10 +269,97 @@ Optimizer::Optimizer(uint32_t channels, uint32_t bps, uint32_t sample_rate,
 // register allocator honest in the surrounding analyse_window code — the
 // wide-band autocorrelation loop spills without it.
 
+// DPSS (Slepian) window: the eigenvector for the largest eigenvalue of the
+// symmetric tridiagonal Slepian matrix (diag ((N-1-2i)/2)^2 cos(2piW),
+// off-diag i(N-i)/2, W = NW/N). Everything is fixed-count for determinism:
+// 100 Sturm-bisection steps pin the eigenvalue (interval shrinks by 2^100,
+// far below double resolution), then 4 inverse-iteration solves recover the
+// eigenvector — no tolerance loops, straight double arithmetic, so it is on
+// the same footing as the closed-form windows under -ffp-contract=off. Cost
+// is ~100 O(N) passes at table-build time; the on-the-fly path (non-DP
+// sizes, short streams) pays it per block, which is rare and still cheap
+// next to encoding the block.
+static void compute_dpss(uint32_t N, double NW, double* out)
+{
+    const double W = NW / (double)N;
+    const double c = std::cos(2.0 * M_PI * W);
+    std::vector<double> d(N), e(N); // e[i] couples rows i-1 and i; e[0] unused
+    for (uint32_t i = 0; i < N; ++i) {
+        double k = ((double)(N - 1) - 2.0 * (double)i) / 2.0;
+        d[i] = k * k * c;
+        e[i] = (double)i * (double)(N - i) / 2.0;
+    }
+
+    // Gershgorin interval containing every eigenvalue.
+    double lo = d[0], hi = d[0], scale = 0.0;
+    for (uint32_t i = 0; i < N; ++i) {
+        double r = std::abs(e[i]) + (i + 1 < N ? std::abs(e[i + 1]) : 0.0);
+        lo = std::min(lo, d[i] - r);
+        hi = std::max(hi, d[i] + r);
+        scale = std::max(scale, std::abs(d[i]) + r);
+    }
+
+    // Sturm-sequence bisection down to the largest eigenvalue: count_below(s)
+    // is the number of eigenvalues < s via the LDL^T pivot signs.
+    auto count_below = [&](double s) {
+        uint32_t cnt = 0;
+        double q = 1.0;
+        for (uint32_t i = 0; i < N; ++i) {
+            q = (i == 0) ? d[0] - s : d[i] - s - e[i] * e[i] / q;
+            if (q == 0.0) q = -1e-300; // pivot guard; count a zero pivot as below
+            if (q < 0.0) ++cnt;
+        }
+        return cnt;
+    };
+    for (int it = 0; it < 100; ++it) {
+        double mid = 0.5 * (lo + hi);
+        if (count_below(mid) == N) hi = mid; else lo = mid;
+    }
+    const double lam = hi; // λmax to machine precision
+
+    // Inverse iteration: repeatedly solve (T - λI) x = v (Thomas algorithm
+    // with a relative pivot floor — the matrix is singular by construction,
+    // which is what makes the iteration converge) and renormalize.
+    const double piv_floor = 1e-14 * scale;
+    std::vector<double> v(N), m(N), z(N);
+    for (uint32_t i = 0; i < N; ++i) // Hann start: right symmetry, no zeros inside
+        v[i] = 0.5 - 0.5 * std::cos(2.0 * M_PI * (double)i / (double)(N - 1));
+    for (int it = 0; it < 4; ++it) {
+        m[0] = d[0] - lam;
+        if (std::abs(m[0]) < piv_floor) m[0] = piv_floor;
+        z[0] = v[0];
+        for (uint32_t i = 1; i < N; ++i) {
+            double f = e[i] / m[i - 1];
+            m[i] = d[i] - lam - f * e[i];
+            if (std::abs(m[i]) < piv_floor) m[i] = piv_floor;
+            z[i] = v[i] - f * z[i - 1];
+        }
+        v[N - 1] = z[N - 1] / m[N - 1];
+        for (uint32_t i = N - 1; i-- > 0;)
+            v[i] = (z[i] - e[i + 1] * v[i + 1]) / m[i];
+        double mx = 0.0;
+        for (uint32_t i = 0; i < N; ++i) mx = std::max(mx, std::abs(v[i]));
+        for (uint32_t i = 0; i < N; ++i) v[i] /= mx;
+    }
+
+    // Peak-normalize to +1 (eigenvector sign is arbitrary; DPSS is unimodal).
+    double peak = 0.0;
+    for (uint32_t i = 0; i < N; ++i)
+        if (std::abs(v[i]) > std::abs(peak)) peak = v[i];
+    for (uint32_t i = 0; i < N; ++i) out[i] = v[i] / peak;
+}
+
 static void compute_window_coeffs(WindowType wt, uint32_t N, double* out)
 {
     auto fN = (double)(N - 1);
     auto fNh = fN / 2.0;
+
+    if (wt == WindowType::DPSS_2 || wt == WindowType::DPSS_3 ||
+        wt == WindowType::DPSS_4) {
+        compute_dpss(N, (wt == WindowType::DPSS_2) ? 2.0
+                      : (wt == WindowType::DPSS_3) ? 3.0 : 4.0, out);
+        return;
+    }
 
     for (uint32_t i = 0; i < N; ++i) {
         double w = 1.0;
@@ -346,13 +475,22 @@ static void compute_window_coeffs(WindowType wt, uint32_t N, double* out)
             break;
         }
 
-        // Partial Tukey: split into 2 sub-windows, each covering part of the block
+        // Partial Tukey: sub-window covering part of the block. The _2 set
+        // spans 0.5; the experimental house _3H set spans 0.33 (-w only).
         case WindowType::PARTIAL_TUKEY_2_000:
         case WindowType::PARTIAL_TUKEY_2_033:
-        case WindowType::PARTIAL_TUKEY_2_067: {
-            double start = (wt == WindowType::PARTIAL_TUKEY_2_000) ? 0.0
-                         : (wt == WindowType::PARTIAL_TUKEY_2_033) ? 0.33 : 0.67;
-            double end   = start + 0.5;
+        case WindowType::PARTIAL_TUKEY_2_067:
+        case WindowType::PARTIAL_TUKEY_3H_000:
+        case WindowType::PARTIAL_TUKEY_3H_033:
+        case WindowType::PARTIAL_TUKEY_3H_067: {
+            double start = (wt == WindowType::PARTIAL_TUKEY_2_000 ||
+                            wt == WindowType::PARTIAL_TUKEY_3H_000) ? 0.0
+                         : (wt == WindowType::PARTIAL_TUKEY_2_033 ||
+                            wt == WindowType::PARTIAL_TUKEY_3H_033) ? 0.33 : 0.67;
+            double span  = (wt == WindowType::PARTIAL_TUKEY_3H_000 ||
+                            wt == WindowType::PARTIAL_TUKEY_3H_033 ||
+                            wt == WindowType::PARTIAL_TUKEY_3H_067) ? 0.33 : 0.5;
+            double end   = start + span;
             end   = std::min(end, 1.0);
             int sn = (int)(start * N), en = (int)(end * N);
             int Ng = en - sn;
@@ -370,10 +508,17 @@ static void compute_window_coeffs(WindowType wt, uint32_t N, double* out)
         }
 
         case WindowType::PUNCHOUT_TUKEY_2_033:
-        case WindowType::PUNCHOUT_TUKEY_2_067: {
-            // Punchout Tukey: full window with a "hole" punched out
-            double start = (wt == WindowType::PUNCHOUT_TUKEY_2_033) ? 0.33 : 0.67;
-            double end   = start + 0.33;
+        case WindowType::PUNCHOUT_TUKEY_2_067:
+        case WindowType::PUNCHOUT_TUKEY_3H_025:
+        case WindowType::PUNCHOUT_TUKEY_3H_050: {
+            // Punchout Tukey: full window with a "hole" punched out. The _2
+            // set punches 0.33; the experimental house _3H set 0.25 (-w only).
+            double start = (wt == WindowType::PUNCHOUT_TUKEY_2_033) ? 0.33
+                         : (wt == WindowType::PUNCHOUT_TUKEY_2_067) ? 0.67
+                         : (wt == WindowType::PUNCHOUT_TUKEY_3H_025) ? 0.25 : 0.50;
+            double hole  = (wt == WindowType::PUNCHOUT_TUKEY_3H_025 ||
+                            wt == WindowType::PUNCHOUT_TUKEY_3H_050) ? 0.25 : 0.33;
+            double end   = start + hole;
             int sn = (int)(start * N), en = (int)(end * N);
             double p = 0.5;
             int Ns = (int)(p / 2.0 * sn);
@@ -434,6 +579,74 @@ static void compute_window_coeffs(WindowType wt, uint32_t N, double* out)
             break;
         }
 
+        // libFLAC-faithful partial_tukey(3): parts at thirds, 10% overlap,
+        // taper p = 0.2 — the geometry `flac -A partial_tukey(3)` builds
+        // (stream_encoder.c overlap_units math, window.c ramp indexing),
+        // re-derived per-index in doubles. Experimental (-w only).
+        case WindowType::PARTIAL_TUKEY_3_1:
+        case WindowType::PARTIAL_TUKEY_3_2:
+        case WindowType::PARTIAL_TUKEY_3_3: {
+            double m = (wt == WindowType::PARTIAL_TUKEY_3_1) ? 0.0
+                     : (wt == WindowType::PARTIAL_TUKEY_3_2) ? 1.0 : 2.0;
+            double u = 1.0/(1.0 - 0.1) - 1.0;              // overlap_units
+            int sn = (int)(m / (3.0 + u) * N);
+            int en = (int)((m + 1.0 + u) / (3.0 + u) * N);
+            int Np = (int)(0.2 / 2.0 * (en - sn));
+            int n = (int)i;
+            if (n < sn || n >= en)               w = 0.0;
+            else if (Np > 0 && n < sn + Np)      w = 0.5 - 0.5*std::cos(M_PI*(double)(n - sn + 1)/Np);
+            else if (Np > 0 && n >= en - Np)     w = 0.5 - 0.5*std::cos(M_PI*(double)(en - n)/Np);
+            else                                 w = 1.0;
+            break;
+        }
+
+        // libFLAC-faithful punchout_tukey(3): holes at thirds, 20% overlap,
+        // taper p = 0.2. Experimental (-w only).
+        case WindowType::PUNCHOUT_TUKEY_3_1:
+        case WindowType::PUNCHOUT_TUKEY_3_2:
+        case WindowType::PUNCHOUT_TUKEY_3_3: {
+            double m = (wt == WindowType::PUNCHOUT_TUKEY_3_1) ? 0.0
+                     : (wt == WindowType::PUNCHOUT_TUKEY_3_2) ? 1.0 : 2.0;
+            double u = 1.0/(1.0 - 0.2) - 1.0;              // overlap_units
+            int sn = (int)(m / (3.0 + u) * N);
+            int en = (int)((m + 1.0 + u) / (3.0 + u) * N);
+            int Ns = (int)(0.2 / 2.0 * sn);
+            int Ne = (int)(0.2 / 2.0 * ((int)N - en));
+            int n = (int)i;
+            if (n >= sn && n < en)                            w = 0.0;
+            else if (Ns > 0 && n < Ns)                        w = 0.5 - 0.5*std::cos(M_PI*(double)(n + 1)/Ns);
+            else if (Ns > 0 && n >= sn - Ns && n < sn)        w = 0.5 - 0.5*std::cos(M_PI*(double)(sn - n)/Ns);
+            else if (Ne > 0 && n >= en && n < en + Ne)        w = 0.5 - 0.5*std::cos(M_PI*(double)(n - en + 1)/Ne);
+            else if (Ne > 0 && n >= (int)N - Ne)              w = 0.5 - 0.5*std::cos(M_PI*(double)((int)N - n)/Ne);
+            else                                              w = 1.0;
+            break;
+        }
+
+        // Asymmetric exponentials: e^(-k·i/(N-1)) and its mirror. Not in
+        // libFLAC. Experimental (-w only).
+        case WindowType::EXPDECAY_2:  w = std::exp(-2.0*fi/fN);        break;
+        case WindowType::EXPDECAY_4:  w = std::exp(-4.0*fi/fN);        break;
+        case WindowType::EXPATTACK_2: w = std::exp(-2.0*(fN - fi)/fN); break;
+        case WindowType::EXPATTACK_4: w = std::exp(-4.0*(fN - fi)/fN); break;
+
+        // Attack-decay: exponential rise (rate 6, normalized to reach 1) over
+        // the first f·N samples, half-cosine decay to 0 after. Experimental
+        // (-w only).
+        case WindowType::ATTACKDECAY_005:
+        case WindowType::ATTACKDECAY_010:
+        case WindowType::ATTACKDECAY_020: {
+            double f = (wt == WindowType::ATTACKDECAY_005) ? 0.05
+                     : (wt == WindowType::ATTACKDECAY_010) ? 0.10 : 0.20;
+            double R = f * (double)N;
+            if (fi < R) {
+                double t = std::min((fi + 1.0) / R, 1.0);
+                w = (1.0 - std::exp(-6.0*t)) / (1.0 - std::exp(-6.0));
+            } else {
+                w = std::cos(0.5*M_PI*(fi - R)/(fN - R));
+            }
+            break;
+        }
+
         default:
             w = 1.0; break;
         }
@@ -456,7 +669,7 @@ static int candidate_slot(uint32_t N)
 }
 
 // All windows (incl. experimental) x 5 candidate sizes, built once on first
-// use (~254 KB per window; ~7.6 MB at 30 windows,
+// use (~254 KB per window; ~13 MB at 51 windows,
 // thread-safe magic static — worker threads block on the first builder and
 // read lock-free forever after). The values are computed by the exact code
 // that used to run inline per block, so the output is bit-identical.

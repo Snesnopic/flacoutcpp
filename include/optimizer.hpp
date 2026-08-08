@@ -76,6 +76,36 @@ enum class WindowType : uint8_t {
     PARZEN,                   ///< Parzen (cubic B-spline) window. Experimental, -w only.
     PLANCKTAPER_010,          ///< Planck-taper window, ε = 0.10. Experimental, -w only.
     PLANCKTAPER_025,          ///< Planck-taper window, ε = 0.25. Experimental, -w only.
+    // Tier 2: 3-partition Tukeys, libFLAC-faithful geometry — the exact
+    // windows `flac -A partial_tukey(3)` / `punchout_tukey(3)` builds
+    // (parts at thirds, 10%/20% overlap, taper p = 0.2).
+    PARTIAL_TUKEY_3_1,        ///< partial_tukey(3) part 1 of 3. Experimental, -w only.
+    PARTIAL_TUKEY_3_2,        ///< partial_tukey(3) part 2 of 3. Experimental, -w only.
+    PARTIAL_TUKEY_3_3,        ///< partial_tukey(3) part 3 of 3. Experimental, -w only.
+    PUNCHOUT_TUKEY_3_1,       ///< punchout_tukey(3) hole 1 of 3. Experimental, -w only.
+    PUNCHOUT_TUKEY_3_2,       ///< punchout_tukey(3) hole 2 of 3. Experimental, -w only.
+    PUNCHOUT_TUKEY_3_3,       ///< punchout_tukey(3) hole 3 of 3. Experimental, -w only.
+    // Tier 2: 3-partition Tukeys, house geometry — extends the existing
+    // 2-partition style (span/hole + offset, p = 0.5).
+    PARTIAL_TUKEY_3H_000,     ///< House partial Tukey, span 1/3 at 0.00. Experimental, -w only.
+    PARTIAL_TUKEY_3H_033,     ///< House partial Tukey, span 1/3 at 0.33. Experimental, -w only.
+    PARTIAL_TUKEY_3H_067,     ///< House partial Tukey, span 1/3 at 0.67. Experimental, -w only.
+    PUNCHOUT_TUKEY_3H_025,    ///< House punchout Tukey, hole 0.25 at 0.25. Experimental, -w only.
+    PUNCHOUT_TUKEY_3H_050,    ///< House punchout Tukey, hole 0.25 at 0.50. Experimental, -w only.
+    // Tier 2: asymmetric windows (absent from libFLAC entirely).
+    EXPDECAY_2,               ///< e^(-2·i/(N-1)) decaying exponential. Experimental, -w only.
+    EXPDECAY_4,               ///< e^(-4·i/(N-1)) decaying exponential. Experimental, -w only.
+    EXPATTACK_2,              ///< Mirrored EXPDECAY_2 (rising). Experimental, -w only.
+    EXPATTACK_4,              ///< Mirrored EXPDECAY_4 (rising). Experimental, -w only.
+    ATTACKDECAY_005,          ///< Exp rise over first 5%, half-cosine decay. Experimental, -w only.
+    ATTACKDECAY_010,          ///< Exp rise over first 10%, half-cosine decay. Experimental, -w only.
+    ATTACKDECAY_020,          ///< Exp rise over first 20%, half-cosine decay. Experimental, -w only.
+    // Tier 3: DPSS (Slepian) — maximal spectral-energy concentration for a
+    // given time-bandwidth product NW. Computed by a deterministic
+    // fixed-iteration eigensolve (see compute_dpss).
+    DPSS_2,                   ///< DPSS window, NW = 2. Experimental, -w only.
+    DPSS_3,                   ///< DPSS window, NW = 3. Experimental, -w only.
+    DPSS_4,                   ///< DPSS window, NW = 4. Experimental, -w only.
     COUNT,                    ///< Sentinel — total number of window types.
     EXPERIMENTAL_BEGIN = LANCZOS ///< First experimental (opt-in) window.
 };

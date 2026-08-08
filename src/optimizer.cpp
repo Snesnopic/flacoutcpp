@@ -724,6 +724,39 @@ static double window_energy(WindowType wt, uint32_t N)
     return s;
 }
 
+// Fraction of exactly-zero coefficients in a window — the block region the
+// window is blind to. Non-zero only for partial/punchout shapes (and the
+// single zero endpoint samples of e.g. Planck windows, which round to ~0
+// fraction). The ranked scorer uses it to price the blind region at the raw
+// signal's variance instead of pretending it is modeled. Cached like
+// window_energy for the table sizes.
+static double window_zero_frac(WindowType wt, uint32_t N)
+{
+    const int slot = candidate_slot(N);
+    if (slot >= 0) {
+        static const std::vector<double> fracs = [] {
+            std::vector<double> f((size_t)WindowType::COUNT * NUM_DP_CANDIDATES);
+            for (int w = 0; w < (int)WindowType::COUNT; ++w)
+                for (size_t c = 0; c < NUM_DP_CANDIDATES; ++c) {
+                    const double* t = window_table((WindowType)w, (int)c);
+                    uint32_t z = 0;
+                    for (uint32_t i = 0; i < DP_CANDIDATES[c]; ++i)
+                        if (t[i] == 0.0) ++z;
+                    f[(size_t)w * NUM_DP_CANDIDATES + c] =
+                        (double)z / (double)DP_CANDIDATES[c];
+                }
+            return f;
+        }();
+        return fracs[(size_t)wt * NUM_DP_CANDIDATES + (size_t)slot];
+    }
+    std::vector<double> tmp(N);
+    compute_window_coeffs(wt, N, tmp.data());
+    uint32_t z = 0;
+    for (uint32_t i = 0; i < N; ++i)
+        if (tmp[i] == 0.0) ++z;
+    return (double)z / (double)N;
+}
+
 void Optimizer::apply_window(
     const int32_t* samples, uint32_t N, int wasted_bits,
     WindowType wt, double* out)
@@ -1720,14 +1753,32 @@ SubframeParams Optimizer::optimize_subframe(
             // true residual energy by orders of magnitude on predictable
             // content, which is the very pathology windowing exists to kill.
             //
-            // No windowed-domain score fixes the *peephole* problem, though:
-            // partial/punchout windows genuinely predict the slice of block
-            // they look at, so offering all 26 windows still floods the top-N
-            // with slice-local candidates and compresses worse than a small
-            // set (measured: all-26 at N=8 loses to tukey050 alone).
+            // The *peephole* problem needs one more term: partial/punchout
+            // windows genuinely predict the slice of block they look at, so
+            // their windowed error says nothing about the samples they zero
+            // out — pricing those as free floods the top-N with slice-local
+            // candidates (measured: all-26 at N=8 lost to tukey050 alone).
+            // Fix: charge the zeroed fraction of the block at the raw
+            // signal's variance — the model has no information there, so the
+            // unpredicted signal is the honest estimate. Dense windows have
+            // zero_frac == 0 (bar their two endpoint samples) and score as
+            // before.
             struct Cand { double score; int wi; int ord; };
             std::vector<Cand> cands;
             cands.reserve(windows.size() * (size_t)max_order);
+
+            // Entropy terms are clamped at zero: the Gaussian differential
+            // entropy goes negative once var < 1/(2πe), but Rice cannot code
+            // below ~0 bits/sample, and letting a peephole window's
+            // tiny-slice variance contribute large *negative* bits vaulted
+            // partial windows over every dense candidate on pure-tone
+            // content (+4523 B on the 3-min synthetic tonal fixture).
+            double var_raw = 0.0;
+            for (uint32_t i = 0; i < bsize; ++i)
+                var_raw += (double)shifted[i] * (double)shifted[i];
+            var_raw /= (double)bsize;
+            const double raw_bits_per_sample = (var_raw > 0.0)
+                ? std::max(0.0, 0.5 * std::log2(2.0 * M_PI * M_E * var_raw)) : 0.0;
 
             // all_lpc for every window, so the winning candidates do not have to
             // re-run apply_window + autocorrelation to get their coefficients
@@ -1742,11 +1793,15 @@ SubframeParams Optimizer::optimize_subframe(
                 if (lderr[0] <= 0.0) continue;
                 const double wsq = window_energy(windows[wi], bsize);
                 if (!(wsq > 0.0)) continue;
+                const double zf = window_zero_frac(windows[wi], bsize);
                 for (int ord = 1; ord <= max_order; ++ord) {
                     if (lderr[ord] <= 0.0) continue; // recursion stopped short of this order
                     const double var_e = lderr[ord] / wsq;
+                    const double model_bits_per_sample =
+                        std::max(0.0, 0.5 * std::log2(2.0 * M_PI * M_E * var_e));
                     const double resid_bits =
-                        0.5 * std::log2(2.0 * M_PI * M_E * var_e) * (double)(bsize - ord);
+                        (model_bits_per_sample * (1.0 - zf)
+                         + raw_bits_per_sample * zf) * (double)(bsize - ord);
                     const double coef_bits  = (double)ord * (double)(eff_bps + min_prec);
                     cands.push_back({ resid_bits + coef_bits, (int)wi, ord });
                 }

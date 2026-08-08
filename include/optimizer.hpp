@@ -219,7 +219,8 @@ public:
               unsigned max_threads = 0,
               bool exhaustive = false,
               bool verbose = true,
-              unsigned max_candidates = 0);
+              unsigned max_candidates = 0,
+              bool adaptive_windows = false);
 
     /**
      * @brief Find the optimal variable block-size partition for the stream.
@@ -306,6 +307,15 @@ private:
         const std::vector<std::vector<int32_t>>& pcm_data,
         uint64_t sample_start, uint32_t block_size) const;
 
+    /// Adaptive per-subframe window selection (estimated-DP modes only):
+    /// pick a 4-window set for the block spanning [sample_start,
+    /// sample_start + block_size) from the cached granule statistics —
+    /// stationarity (variance of granule energies), transient position
+    /// (energy argmax), and spectral tilt (lag1/lag0). Same set size as the
+    /// fixed shortlist, so analysis cost is unchanged; only membership adapts.
+    [[nodiscard]] std::vector<WindowType> select_windows(
+        uint64_t sample_start, uint32_t block_size) const;
+
     // --- Member state -------------------------------------------------------
     uint32_t              m_channels;
     uint32_t              m_bps;
@@ -315,6 +325,7 @@ private:
     bool                  m_exhaustive;
     bool                  m_verbose;
     unsigned              m_max_candidates;
+    bool                  m_adaptive;
 
     /// True when block costs come from real encodes rather than the granule
     /// estimate: exact DP, all four stereo modes, full precision sweep.

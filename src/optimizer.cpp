@@ -233,10 +233,12 @@ Optimizer::Optimizer(uint32_t channels, uint32_t bps, uint32_t sample_rate,
                      unsigned max_threads,
                      bool exhaustive,
                      bool verbose,
-                     unsigned max_candidates)
+                     unsigned max_candidates,
+                     bool adaptive_windows)
     : m_channels(channels), m_bps(bps), m_sample_rate(sample_rate),
       m_max_threads(max_threads),
-      m_exhaustive(exhaustive), m_verbose(verbose), m_max_candidates(max_candidates)
+      m_exhaustive(exhaustive), m_verbose(verbose), m_max_candidates(max_candidates),
+      m_adaptive(adaptive_windows)
 {
     if (windows.empty()) {
         // Exact-DP mode (-e) affords the widest window set; the ranking pays
@@ -1761,8 +1763,7 @@ SubframeParams Optimizer::optimize_subframe(
             // Fix: charge the zeroed fraction of the block at the raw
             // signal's variance — the model has no information there, so the
             // unpredicted signal is the honest estimate. Dense windows have
-            // zero_frac == 0 (bar their two endpoint samples) and score as
-            // before.
+            // zero_frac == 0 and score exactly as before.
             struct Cand { double score; int wi; int ord; };
             std::vector<Cand> cands;
             cands.reserve(windows.size() * (size_t)max_order);
@@ -2149,6 +2150,75 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
 // compute_block: fully-optimised BlockParams for one frame
 // ============================================================
 
+// Adaptive window selection: a hand stat→set map over the free granule
+// statistics (WINDOWS_PLAN.md "Adaptive ICI window selection"). Every set has
+// exactly 4 windows so the analysis cost per encoded block matches the fixed
+// shortlist; only membership adapts. Thresholds are first-cut hand picks —
+// calibrate against measurement before trusting them.
+std::vector<WindowType> Optimizer::select_windows(
+    uint64_t sample_start, uint32_t block_size) const
+{
+    const std::vector<WindowType> def = {WindowType::TUKEY_050, WindowType::HANN,
+                                         WindowType::WELCH, WindowType::RECTANGULAR};
+    if (m_granules.empty() || m_granules[0].empty()) return def;
+    const size_t g0 = (size_t)(sample_start / 16);
+    const size_t g1 = std::min((size_t)((sample_start + block_size) / 16),
+                               m_granules[0].size());
+    if (g1 <= g0 + 8) return def; // too few granules for meaningful stats
+
+    const size_t n = g1 - g0;
+    double sumE = 0.0, sumE2 = 0.0, sumL1 = 0.0, maxE = -1.0;
+    size_t argmax = g0;
+    for (size_t g = g0; g < g1; ++g) {
+        double E = 0.0, L1 = 0.0;
+        for (uint32_t c = 0; c < m_channels; ++c) {
+            E  += m_granules[c][g].autoc[0];
+            L1 += m_granules[c][g].autoc[1];
+        }
+        sumE += E; sumE2 += E * E; sumL1 += L1;
+        if (E > maxE) { maxE = E; argmax = g; }
+    }
+    if (sumE <= 0.0) return def; // digital silence
+
+    const double mean = sumE / (double)n;
+    const double var  = std::max(0.0, sumE2 / (double)n - mean * mean);
+    const double cv2  = var / (mean * mean); // energy dispersion: high ⇒ transient
+    const double tilt = sumL1 / sumE;        // lag1/lag0: ~1 tonal, ~0 noisy
+    const double pos  = (double)(argmax - g0) / (double)n;
+
+    // Transient routing gate: 0.5 saturates (0.25 measured identical). Both
+    // search modes route: -c 0 prices partial/punchout windows exactly
+    // (music_20s −1991 B vs fixed-4, 3-min synthetic percussion −19983 B),
+    // and the ranked scorer's zero-fraction term (see optimize_subframe)
+    // prices their blind region honestly — before that term existed, routing
+    // under -c 8 lost (+2489 B music / +4151 B percussion); with it, it wins
+    // (−104 B / −17992 B).
+    if (cv2 > 0.5) {
+        // Transient content: offer the partial/punchout pair that isolates
+        // the energy peak, plus general-purpose tapers. rect stays in the set
+        // because the gate has a false-positive mode — amplitude-modulated
+        // tonal content (beats) has high energy dispersion too, and dropping
+        // rect there cost +4523 B on the 3-min synthetic tonal fixture. A
+        // routed block therefore analyses 5 windows instead of 4; routed
+        // blocks are a minority, so the extra analysis is marginal.
+        if (pos < 0.33)
+            return {WindowType::PARTIAL_TUKEY_2_000, WindowType::TUKEY_050,
+                    WindowType::HANN, WindowType::WELCH, WindowType::RECTANGULAR};
+        if (pos < 0.67)
+            return {WindowType::PARTIAL_TUKEY_2_033, WindowType::PUNCHOUT_TUKEY_2_033,
+                    WindowType::TUKEY_050, WindowType::HANN, WindowType::RECTANGULAR};
+        return {WindowType::PARTIAL_TUKEY_2_067, WindowType::PUNCHOUT_TUKEY_2_067,
+                WindowType::TUKEY_050, WindowType::HANN, WindowType::RECTANGULAR};
+    }
+    if (tilt > 0.95) // stationary tonal: mild tapers, keep the workhorse
+        return {WindowType::TUKEY_005, WindowType::TUKEY_010,
+                WindowType::TUKEY_050, WindowType::HANN};
+    if (tilt < 0.60) // noisy: heavy tapers, keep the workhorse
+        return {WindowType::TUKEY_050, WindowType::HANN,
+                WindowType::TUKEY_075, WindowType::TUKEY_090};
+    return def;
+}
+
 BlockParams Optimizer::compute_block(
     const std::vector<std::vector<int32_t>>& pcm_data,
     uint64_t sample_start, uint32_t block_size) const
@@ -2156,10 +2226,21 @@ BlockParams Optimizer::compute_block(
     BlockParams bp{};
     bp.block_size = block_size;
 
+    // Adaptive selection replaces the fixed window list per block. Estimated
+    // DP only: under -e the wide set is already offered, so a selector has
+    // nothing to add (and the DP's phase-1 blocks would pay it N×K times).
+    std::vector<WindowType> selected;
+    const std::vector<WindowType>* win_set = &m_windows;
+    if (m_adaptive && !full_search()) {
+        selected = select_windows(sample_start, block_size);
+        win_set = &selected;
+    }
+    const std::vector<WindowType>& wins = *win_set;
+
     if (m_channels == 1) {
         bp.stereo_mode  = 0;
         bp.subframes[0] = optimize_subframe(
-            &pcm_data[0][sample_start], block_size, m_bps, m_windows, m_max_candidates);
+            &pcm_data[0][sample_start], block_size, m_bps, wins, m_max_candidates);
     } else {
         uint32_t best_bits = std::numeric_limits<uint32_t>::max();
 
@@ -2209,9 +2290,9 @@ BlockParams Optimizer::compute_block(
         auto get_sig = [&](int sig) -> const SubframeParams& {
             if (have[sig]) return cache[sig];
             if (sig == SIG_L) {
-                cache[sig] = optimize_subframe(&pcm_data[0][sample_start], block_size, m_bps, m_windows, m_max_candidates);
+                cache[sig] = optimize_subframe(&pcm_data[0][sample_start], block_size, m_bps, wins, m_max_candidates);
             } else if (sig == SIG_R) {
-                cache[sig] = optimize_subframe(&pcm_data[1][sample_start], block_size, m_bps, m_windows, m_max_candidates);
+                cache[sig] = optimize_subframe(&pcm_data[1][sample_start], block_size, m_bps, wins, m_max_candidates);
             } else {
                 std::vector<int32_t> ch(block_size);
                 uint32_t bps_s;
@@ -2224,7 +2305,7 @@ BlockParams Optimizer::compute_block(
                         ch[k] = (pcm_data[0][sample_start + k] + pcm_data[1][sample_start + k]) >> 1;
                     bps_s = m_bps;
                 }
-                cache[sig] = optimize_subframe(ch.data(), block_size, bps_s, m_windows, m_max_candidates);
+                cache[sig] = optimize_subframe(ch.data(), block_size, bps_s, wins, m_max_candidates);
             }
             have[sig] = true;
             return cache[sig];

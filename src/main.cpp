@@ -18,6 +18,9 @@ static void print_usage(const char* prog) {
         << "                       Composes with -e (e.g. -e -c 8). Larger N is\n"
         << "                       slower and compresses better.\n"
         << "  -n, --no-metadata    Do not copy metadata from input to output\n"
+        << "  -a, --adaptive-windows  Experimental: pick each block's 4-window set\n"
+        << "                       from its signal statistics instead of the fixed\n"
+        << "                       shortlist (estimated-DP only; excludes -e/-w)\n"
         << "  -q, --quiet          Suppress all progress output\n"
         << "  -t, --threads N      Limit parallel worker threads (default: all CPUs)\n"
         << "  -w, --windows <list> Comma-separated list of apodization windows to use\n"
@@ -84,6 +87,9 @@ int main(int argc, char* argv[]) {
             }
             candidates_given = true;
 
+        } else if (arg == "-a" || arg == "--adaptive-windows") {
+            cfg.adaptive_windows = true;
+
         } else if (arg == "-q" || arg == "--quiet") {
             cfg.verbose = false;
 
@@ -142,6 +148,15 @@ int main(int argc, char* argv[]) {
     // the per-subframe search while keeping the exact block-partitioning DP.
     if (!candidates_given && cfg.exhaustive)
         cfg.max_candidates = 0;
+
+    // Adaptive selection chooses the window set itself; -e and -w each define
+    // their own set, so the combinations are contradictory rather than merely
+    // redundant — reject them.
+    if (cfg.adaptive_windows && (cfg.exhaustive || !cfg.windows.empty())) {
+        std::cerr << "Error: -a is estimated-DP only and picks its own windows; "
+                     "it cannot be combined with -e or -w.\n";
+        return EXIT_FAILURE;
+    }
 
     if (cfg.verbose) {
         if (cfg.max_candidates > 0)

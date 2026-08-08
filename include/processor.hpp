@@ -55,6 +55,12 @@ struct ProcessorConfig {
     unsigned max_candidates = 8;
 
     /**
+     * @brief Adaptive per-subframe window selection (experimental,
+     * estimated-DP modes only). See flacoutcpp::Config::adaptive_windows.
+     */
+    bool adaptive_windows = false;
+
+    /**
      * @brief If false, suppresses progress/statistics stdout output.
      * Errors always go to stderr regardless of this setting.
      */

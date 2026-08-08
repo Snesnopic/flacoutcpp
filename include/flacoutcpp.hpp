@@ -101,6 +101,17 @@ struct Config {
     unsigned max_candidates = 8;
 
     /**
+     * @brief Adaptive per-subframe window selection (experimental).
+     *
+     * Estimated-DP modes only: instead of the fixed 4-window shortlist, each
+     * encoded block picks a 4-window set from its cached granule statistics
+     * (stationarity, transient position, spectral tilt) at identical analysis
+     * cost. Incompatible with @ref exhaustive and an explicit @ref windows
+     * list, both of which define their own window sets.
+     */
+    bool adaptive_windows = false;
+
+    /**
      * @brief Print progress and statistics to stdout during the run.
      *
      * Set to @c false to suppress progress/statistics output — useful when

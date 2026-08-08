@@ -1,32 +1,38 @@
 # Learned window shape — found by bench/window_search.py, not hand-designed.
 #
-# Search: CMA-ES, 9 knots, 210 evaluations, objective = total encoded bytes
+# Supersedes a pre-retune shape of the same family. That one was searched
+# against a scorer whose blind-region penalty was 4x too strong (fixed in
+# 60506d5), and about a quarter of its apparent value was an exploit of it:
+# knots just above zero dodged an equality test. Re-searched afterwards, this
+# shape carries no such trick — snapping its sub-1e-2 knots to exact zero
+# changes the result by 35 bytes, where the old shape lost 1257.
+#
+# Search: CMA-ES, 9 knots, 250 evaluations, objective = total encoded bytes
 # with this shape offered as a 5th window alongside the default set
 # (tukey050,hann,welch,rect) under the plain default search (-n -R -c 8).
 # Trained on 8 six-second excerpts from C418 / Jake Kaufman / MDK; validated
-# on 7 excerpts from a disjoint set of artists (Hiatus, Baron von Arrow,
-# Horcrux, Big Giant Circles).
+# on 7 from a disjoint set of artists (Hiatus, Baron von Arrow, Horcrux, Big
+# Giant Circles).
 #
-# Measured as a 5th window, bytes saved vs the 4-window default:
-#   held-out excerpts (unseen artists)   -0.105%
-#   master_1s_mix (188 tracks)           -0.066%
-#   best compiled-in 5th window          -0.029% (tukey005)
+# As a 5th window, bytes saved vs the 4-window default:
+#   held-out excerpts (unseen artists)   -0.165%
+#   master_1s_mix (188 tracks)           -0.081%
+#   punchouttukey2_033 in the same slot  -0.077%
 #
-# Two lobes with a near-silent middle: it looks at the first eighth and a
-# narrow band near the end, which is the sparse/punchout family the compiled-in
-# windows only cover at fixed offsets. Note the 1.7e-4 / 3.5e-4 knots are load
-# bearing under the *ranked* search — being near zero rather than exactly zero
-# keeps window_zero_frac's blind-region penalty from firing, which is worth
-# ~24% of this window's gain. See the commit message; that is a finding about
-# the scorer, not a property to imitate.
+# Read that last line before reaching for this file. Once the scorer was
+# fixed, a compiled-in window gets within 6% of a shape searched specifically
+# to beat it, which says the gap was mostly a scorer defect rather than a
+# missing shape. -a adaptive mode reaches -0.083% on the same corpus by
+# routing to punchout windows per block, without any custom window at all.
 #
-# Not promoted into any default set: one search, one corpus split.
-0.077478085993338719
-0.78428566045328896
-0.7185301721084435
-0.00017449787357266716
-0.00035440336937370154
-0.10284796608632378
-0.015361323225811555
+# Two lobes with a near-silent middle: it reads the first eighth and a narrow
+# band near the end. Not promoted into any default set.
+5.434008196990581e-06
+0.99551918517633309
+0.89518760756923699
+0.027884335882718266
+0.0021734000338403544
+0.060755831351654695
+0.023289170410998219
 1
-0.011633581100949784
+0.021406450461664884

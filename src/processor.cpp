@@ -190,9 +190,15 @@ bool Processor::process() {
     }
 
     // --- Step 3: run optimiser ----
+    // Resolve the patience default here rather than only in the CLI, so a
+    // library caller that never touches Config::patience gets the same search
+    // as `flacoutcpp` with no flags.
+    const unsigned resolved_patience =
+        m_config.patience < 0 ? m_config.max_candidates * 2
+                              : (unsigned)m_config.patience;
     Optimizer opt(m_channels, m_bps, m_sample_rate, m_config.windows, m_config.max_threads,
                   m_config.exhaustive, m_config.verbose, m_config.max_candidates,
-                  m_config.adaptive_windows);
+                  m_config.adaptive_windows, resolved_patience);
     if (!reuse_edges.empty())
         opt.set_reuse_edges(std::move(reuse_edges));
     std::vector<BlockParams> blocks = opt.find_optimal_block_partitioning(m_pcm_data);

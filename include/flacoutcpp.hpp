@@ -101,6 +101,31 @@ struct Config {
     unsigned max_candidates = 8;
 
     /**
+     * @brief Consecutive non-improving candidates before the ranked scan stops.
+     *
+     * @ref max_candidates alone cuts the ranked list at a fixed depth, which
+     * assumes the ranking is right about what lies below the cut. It often is
+     * not: measured over every candidate, the winner's rank is heavy-tailed —
+     * rank 0 takes 56% of subframes on a 24-bit pure sine but the tail reaches
+     * rank 59, and on real music only ~51% of winners fall inside rank 7. The
+     * misses are not near-ties with rank 0, so no widening around the top can
+     * reach them.
+     *
+     * Patience uses the exact costs the scan is already computing as its own
+     * stopping signal: descend the ranked list and keep going while it is
+     * still producing improvements, stopping only after this many consecutive
+     * candidates fail to beat the best so far. @ref max_candidates becomes a
+     * floor rather than a ceiling. Subframes the ranking ordered well stop
+     * near the floor; the ones it ordered badly pay for the tail they need.
+     *
+     * @c -1 (default) means 2 x @ref max_candidates, which costs ~1.34x time
+     * for ~59% of the unlimited sweep's remaining compression on real music.
+     * @c 0 disables patience and restores the plain top-N cut. Irrelevant when
+     * @ref max_candidates is 0, since every candidate is evaluated anyway.
+     */
+    int patience = -1;
+
+    /**
      * @brief Adaptive per-subframe window selection (experimental).
      *
      * Estimated-DP modes only: instead of the fixed 4-window shortlist, each

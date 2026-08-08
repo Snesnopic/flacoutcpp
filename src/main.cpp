@@ -17,6 +17,10 @@ static void print_usage(const char* prog) {
         << "                       Default: 8, or 0 when -e is given without -c.\n"
         << "                       Composes with -e (e.g. -e -c 8). Larger N is\n"
         << "                       slower and compresses better.\n"
+        << "  -p, --patience N     Keep scanning past -c N while candidates are\n"
+        << "                       still improving; stop after N consecutive that\n"
+        << "                       are not. Makes -c a floor, not a ceiling.\n"
+        << "                       Default: 2x -c. 0 disables it (plain top-N cut).\n"
         << "  -n, --no-metadata    Do not copy metadata from input to output\n"
         << "  -a, --adaptive-windows  Experimental: pick each block's 4-window set\n"
         << "                       from its signal statistics instead of the fixed\n"
@@ -96,6 +100,20 @@ int main(int argc, char* argv[]) {
                 return EXIT_FAILURE;
             }
             candidates_given = true;
+
+        } else if (arg == "-p" || arg == "--patience") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: -p requires a number.\n";
+                return EXIT_FAILURE;
+            }
+            ++i;
+            try {
+                if (argv[i][0] == '-') throw std::invalid_argument("negative");
+                cfg.patience = static_cast<int>(std::stoul(argv[i]));
+            } catch (const std::exception&) {
+                std::cerr << "Error: -p requires a non-negative integer, got '" << argv[i] << "'.\n";
+                return EXIT_FAILURE;
+            }
 
         } else if (arg == "-a" || arg == "--adaptive-windows") {
             cfg.adaptive_windows = true;
@@ -181,10 +199,17 @@ int main(int argc, char* argv[]) {
         return EXIT_FAILURE;
     }
 
+    // Patience defaults to twice the candidate budget; resolve it here so the
+    // rest of the program sees a concrete number.
+    if (cfg.patience < 0)
+        cfg.patience = static_cast<int>(cfg.max_candidates) * 2;
+
     if (cfg.verbose) {
         if (cfg.max_candidates > 0)
             std::cout << "Ranked search: " << cfg.max_candidates
-                      << " candidates/subframe\n";
+                      << " candidates/subframe, patience "
+                      << (cfg.patience > 0 ? std::to_string(cfg.patience) : std::string("off"))
+                      << "\n";
         else
             std::cout << "Ranked search: unlimited (full sweep)\n";
         if (cfg.windows.empty()) {

@@ -55,6 +55,14 @@ struct ProcessorConfig {
     unsigned max_candidates = 8;
 
     /**
+     * @brief Consecutive non-improving candidates before the ranked scan
+     * stops, making `max_candidates` a floor rather than a ceiling.
+     * -1 = 2 x `max_candidates`; 0 = plain top-N cut.
+     * See flacoutcpp::Config::patience.
+     */
+    int patience = -1;
+
+    /**
      * @brief Adaptive per-subframe window selection (experimental,
      * estimated-DP modes only). See flacoutcpp::Config::adaptive_windows.
      */

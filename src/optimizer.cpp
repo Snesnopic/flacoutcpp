@@ -7,6 +7,7 @@
 #include <atomic>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <future>
 #include <iostream>
@@ -234,11 +235,12 @@ Optimizer::Optimizer(uint32_t channels, uint32_t bps, uint32_t sample_rate,
                      bool exhaustive,
                      bool verbose,
                      unsigned max_candidates,
-                     bool adaptive_windows)
+                     bool adaptive_windows,
+                     unsigned patience)
     : m_channels(channels), m_bps(bps), m_sample_rate(sample_rate),
       m_max_threads(max_threads),
       m_exhaustive(exhaustive), m_verbose(verbose), m_max_candidates(max_candidates),
-      m_adaptive(adaptive_windows)
+      m_adaptive(adaptive_windows), m_patience(patience)
 {
     if (windows.empty()) {
         // Exact-DP mode (-e) affords the widest window set; the ranking pays
@@ -1573,7 +1575,7 @@ uint32_t Optimizer::estimate_subframe_cost(
 SubframeParams Optimizer::optimize_subframe(
     const int32_t* samples, uint32_t bsize, uint32_t bps,
     const std::vector<WindowType>& windows,
-    unsigned max_candidates)
+    unsigned max_candidates, unsigned patience)
 {
     SubframeParams best{};
     best.bits_cost = std::numeric_limits<uint32_t>::max();
@@ -1872,9 +1874,40 @@ SubframeParams Optimizer::optimize_subframe(
                 }
             }
 
-            const size_t keep = std::min((size_t)max_candidates, cands.size());
-            std::partial_sort(cands.begin(), cands.begin() + keep, cands.end(),
-                              [](const Cand& a, const Cand& b) { return a.score < b.score; });
+            auto by_score = [](const Cand& a, const Cand& b) { return a.score < b.score; };
+            size_t keep = std::min((size_t)max_candidates, cands.size());
+            std::partial_sort(cands.begin(), cands.begin() + keep, cands.end(), by_score);
+
+            // ---- Patience ----
+            // The winner's rank is heavy-tailed, not tied: measured over all
+            // candidates, rank 0 wins 56% of sine24 subframes but the tail
+            // reaches rank 59, and on music only ~51% of winners fall inside
+            // rank 7. A fixed cut at N therefore misses a long tail that a
+            // wider tolerance band around rank 0 cannot reach.
+            //
+            // Use the exact costs already being computed as the stopping
+            // signal instead: descend the ranked list and keep going while it
+            // is still yielding improvements, stopping only after `patience`
+            // consecutive candidates fail to beat the best. Where the model
+            // ordered well, the first few confirm it and the scan stops near
+            // N; where it ordered badly, the scan follows the improvements
+            // down. Cost is paid only on the subframes that need it.
+            if (patience > 0) {
+                std::sort(cands.begin(), cands.end(), by_score);
+                uint32_t prev  = best_lpc_cost;
+                size_t   since = 0;
+                for (size_t c = 0; c < cands.size(); ++c) {
+                    if (c >= keep && since >= patience) break;
+                    const Cand& cd = cands[c];
+                    uint32_t hdr_min = hdr_fixed + (uint32_t)cd.ord * (eff_bps + min_prec);
+                    if (hdr_min >= best_lpc_cost) { ++since; continue; }
+                    eval_candidate(&lpc_store[cd.wi * LPC_STRIDE + (size_t)(cd.ord - 1) * 32],
+                                   cd.ord, windows[cd.wi]);
+                    if (best_lpc_cost < prev) { prev = best_lpc_cost; since = 0; }
+                    else ++since;
+                }
+                keep = 0;  // scan already done
+            }
 
             // Best-first, so the exact cost of a strong candidate tightens the
             // pruning bound before the weaker ones are tried.
@@ -1992,7 +2025,7 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
         if (m_channels == 1) {
             bp.stereo_mode  = 0;
             bp.subframes[0] = optimize_subframe(pcm_data[0].data(),
-                                                (uint32_t)total_samples, m_bps, m_windows, m_max_candidates);
+                                                (uint32_t)total_samples, m_bps, m_windows, m_max_candidates, m_patience);
         } else {
             uint32_t best_bits = std::numeric_limits<uint32_t>::max();
             for (int mode : {0, 8, 9, 10}) {
@@ -2007,8 +2040,8 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
                 // mode 9 = right+side: ch0 is side (needs +1 bit), ch1 is right
                 uint32_t bps0 = (mode == 9) ? m_bps + 1 : m_bps;
                 uint32_t bps1 = (mode == 9) ? m_bps     : (mode == 0 ? m_bps : m_bps + 1);
-                SubframeParams s0 = optimize_subframe(ch0.data(), (uint32_t)total_samples, bps0, m_windows, m_max_candidates);
-                SubframeParams s1 = optimize_subframe(ch1.data(), (uint32_t)total_samples, bps1, m_windows, m_max_candidates);
+                SubframeParams s0 = optimize_subframe(ch0.data(), (uint32_t)total_samples, bps0, m_windows, m_max_candidates, m_patience);
+                SubframeParams s1 = optimize_subframe(ch1.data(), (uint32_t)total_samples, bps1, m_windows, m_max_candidates, m_patience);
                 if (s0.bits_cost + s1.bits_cost < best_bits) {
                     best_bits = s0.bits_cost + s1.bits_cost;
                     bp.stereo_mode  = mode;
@@ -2528,7 +2561,7 @@ BlockParams Optimizer::compute_block(
     if (m_channels == 1) {
         bp.stereo_mode  = 0;
         bp.subframes[0] = optimize_subframe(
-            &pcm_data[0][sample_start], block_size, m_bps, wins, m_max_candidates);
+            &pcm_data[0][sample_start], block_size, m_bps, wins, m_max_candidates, m_patience);
     } else {
         uint32_t best_bits = std::numeric_limits<uint32_t>::max();
 
@@ -2578,9 +2611,9 @@ BlockParams Optimizer::compute_block(
         auto get_sig = [&](int sig) -> const SubframeParams& {
             if (have[sig]) return cache[sig];
             if (sig == SIG_L) {
-                cache[sig] = optimize_subframe(&pcm_data[0][sample_start], block_size, m_bps, wins, m_max_candidates);
+                cache[sig] = optimize_subframe(&pcm_data[0][sample_start], block_size, m_bps, wins, m_max_candidates, m_patience);
             } else if (sig == SIG_R) {
-                cache[sig] = optimize_subframe(&pcm_data[1][sample_start], block_size, m_bps, wins, m_max_candidates);
+                cache[sig] = optimize_subframe(&pcm_data[1][sample_start], block_size, m_bps, wins, m_max_candidates, m_patience);
             } else {
                 std::vector<int32_t> ch(block_size);
                 uint32_t bps_s;
@@ -2593,7 +2626,7 @@ BlockParams Optimizer::compute_block(
                         ch[k] = (pcm_data[0][sample_start + k] + pcm_data[1][sample_start + k]) >> 1;
                     bps_s = m_bps;
                 }
-                cache[sig] = optimize_subframe(ch.data(), block_size, bps_s, wins, m_max_candidates);
+                cache[sig] = optimize_subframe(ch.data(), block_size, bps_s, wins, m_max_candidates, m_patience);
             }
             have[sig] = true;
             return cache[sig];

@@ -230,6 +230,9 @@ public:
      * @param max_candidates  Ranked-search budget: the number of
      *        (window, order) pairs fully evaluated per subframe.  0 (default)
      *        evaluates every pair, which is the exhaustive behaviour.
+     * @param patience  Consecutive non-improving candidates tolerated before
+     *        the ranked scan stops; @c max_candidates becomes a floor rather
+     *        than a ceiling.  0 (default) keeps the plain top-N cut.
      */
     Optimizer(uint32_t channels, uint32_t bps, uint32_t sample_rate,
               std::vector<WindowType> windows = {},
@@ -237,7 +240,8 @@ public:
               bool exhaustive = false,
               bool verbose = true,
               unsigned max_candidates = 0,
-              bool adaptive_windows = false);
+              bool adaptive_windows = false,
+              unsigned patience = 0);
 
     /**
      * @brief Find the optimal variable block-size partition for the stream.
@@ -282,7 +286,8 @@ public:
         uint32_t                    bsize,
         uint32_t                    bps,
         const std::vector<WindowType>& windows,
-        unsigned                    max_candidates = 0);
+        unsigned                    max_candidates = 0,
+        unsigned                    patience = 0);
 
 private:
     /// @cond INTERNAL
@@ -353,6 +358,7 @@ private:
     bool                  m_verbose;
     unsigned              m_max_candidates;
     bool                  m_adaptive;
+    unsigned              m_patience;
     std::vector<ReuseEdge> m_reuse_edges;
 
     /// True when block costs come from real encodes rather than the granule

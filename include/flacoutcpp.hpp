@@ -96,13 +96,15 @@ struct Config {
      * fully evaluated (each across the whole precision ladder). @c 0 means no
      * limit — every pair is fully evaluated, the classic exhaustive sweep.
      *
-     * The default of 8 costs ~0.03% size on real music for ~1.75x speed over
-     * the unlimited sweep. Known weak spot: near-white high-bps content, where
+     * The default of 24 is effort level 3 (see @ref apply_effort): the old
+     * default of 8 with a full precision ladder measured *off* the frontier in
+     * both directions — level 3 is faster and smaller. Costs ~0.03% size on
+     * real music for ~1.75x speed over the unlimited sweep. Known weak spot: near-white high-bps content, where
      * the Levinson errors are almost flat across orders and the ranking is
      * noise — 24-bit whitenoise fixtures grew 2-2.8% at 8 and needed 32 for
      * parity. Real music does not behave that way.
      */
-    unsigned max_candidates = 8;
+    unsigned max_candidates = 24;
 
     /**
      * @brief Consecutive non-improving candidates before the ranked scan stops.
@@ -159,10 +161,11 @@ struct Config {
      * still wins on size alone at unlimited time, which is why this is off by
      * default. See PRECISION_LADDER_PLAN.md.
      *
-     * @c 0 (default) encodes every rung, which is the pre-existing behaviour
-     * and bit-exact with it. A trade of compression for speed is opt-in here.
+     * Defaults to 1 as part of effort level 3; @c 0 encodes every rung, which
+     * is what @ref exhaustive resets it to and what the CLI restores whenever
+     * @c -e is given without an explicit @c -L.
      */
-    unsigned precision_rungs = 0;
+    unsigned precision_rungs = 1;
 
     /**
      * @brief Effort level 0-9: one dial across the measured size/time frontier.
@@ -193,9 +196,15 @@ struct Config {
      * encoded block picks a 4-window set from its cached granule statistics
      * (stationarity, transient position, spectral tilt) at identical analysis
      * cost. Incompatible with @ref exhaustive and an explicit @ref windows
-     * list, both of which define their own window sets.
+     * list, both of which define their own window sets — the CLI clears this
+     * default rather than erroring when either is present, and only a
+     * *explicit* @c -a is treated as a contradiction there.
+     *
+     * On by default as part of effort level 3: swept as a third frontier
+     * dimension it appears in 16 of 21 efficient points, and the album that
+     * historically regressed under it is -0.219% with no track worse.
      */
-    bool adaptive_windows = false;
+    bool adaptive_windows = true;
 
     /**
      * @brief Reuse input frames that beat the new encoding (default: on).
@@ -279,20 +288,21 @@ bool optimise(const std::string& input_path,
  * The levels are points measured on the size/time frontier of the 188-track
  * master mix (`bench/fixtures/master_1s_mix.flac`), lowest effort first:
  *
- * Sizes are against the `-c 8` default; times are for the master mix.
+ * Sizes are relative to **level 3, which is the default**; times are for the
+ * master mix.
  *
  * | level | candidates | rungs | time | mix | excerpts |
  * |---|---|---|---|---|---|
- * | 0 | 2 | 1 | 0.65 s | +0.090% | +0.053% |
- * | 1 | 8 | 1 | 0.71 s | +0.003% | +0.012% |
- * | 2 | 16 | 1 | 0.78 s | −0.045% | −0.015% |
- * | 3 | 24 | 1 | 0.85 s | −0.056% | −0.023% |
- * | 4 | 32 | 1 | 0.95 s | −0.065% | −0.034% |
- * | 5 | 48 | 1 | 1.12 s | −0.080% | −0.051% |
- * | 6 | 64 | 1 | 1.26 s | −0.086% | −0.055% |
- * | 7 | 64 | 2 | 1.60 s | −0.096% | −0.062% |
- * | 8 | 64 | 3 | 1.94 s | −0.101% | −0.066% |
- * | 9 | 0 (no limit) | 0 (full ladder) | 4.82 s | −0.113% | −0.073% |
+ * | 0 | 2 | 1 | 0.65 s | +0.146% | +0.076% |
+ * | 1 | 8 | 1 | 0.71 s | +0.058% | +0.034% |
+ * | 2 | 16 | 1 | 0.78 s | +0.011% | +0.008% |
+ * | **3** | **24** | **1** | **0.85 s** | **—** | **—** |
+ * | 4 | 32 | 1 | 0.95 s | −0.010% | −0.012% |
+ * | 5 | 48 | 1 | 1.12 s | −0.024% | −0.028% |
+ * | 6 | 64 | 1 | 1.26 s | −0.030% | −0.032% |
+ * | 7 | 64 | 2 | 1.60 s | −0.041% | −0.040% |
+ * | 8 | 64 | 3 | 1.94 s | −0.046% | −0.043% |
+ * | 9 | 0 (no limit) | 0 (full ladder) | 4.82 s | −0.055% | −0.051% |
  *
  * Every level also enables @ref Config::adaptive_windows: on the 3-D frontier
  * (56 configs over candidates x rungs x adaptive), 16 of the 21 efficient
@@ -303,11 +313,11 @@ bool optimise(const std::string& input_path,
  * under `-a` (17 tracks, the case that motivated its patience scaling) is
  * −0.219% at level 4 with **no track worse** than the default.
  *
- * Note what the table says about the current defaults: `-c 8` with the full
- * ladder and no adaptive windows is dominated outright — level 3 is both
- * faster and 0.056% smaller. Levels rise monotonically in both time and
- * compression on *both* corpora, which is what makes the dial a dial; whether
- * the default should move is a separate question.
+ * Levels rise monotonically in both time and compression on *both* corpora,
+ * which is the property that makes the dial worth having. Note how little the
+ * top half buys: level 9 costs 5.7x level 3's time for 0.055%, because the
+ * candidate pool saturates — the dial's range is bounded by the estimated DP
+ * it lives in, not by the levels.
  *
  * Levels 0-2 are bunched in time because fixed work (decode, MD5, the
  * granule DP) floors the runtime — the dial cannot go below that.

@@ -19,9 +19,10 @@ static void print_usage(const char* prog) {
         << "  -c, --candidates N   Fully evaluate only the N most promising\n"
         << "                       (window, order) pairs per subframe, ranked by\n"
         << "                       Levinson-Durbin prediction error. 0 = no limit.\n"
-        << "                       Default: 8, or 0 when -e is given without\n"
-        << "                       -c/-L/-E. Composes with -e (e.g. -e -c 8).\n"
-        << "                       Larger N is slower and compresses better.\n"
+        << "                       Default: 24 (effort level 3), or 0 when -e is\n"
+        << "                       given without -c/-L/-E. Composes with -e\n"
+        << "                       (e.g. -e -c 8). Larger N is slower and\n"
+        << "                       compresses better.\n"
         << "  -p, --patience N     Keep scanning past -c N while candidates are\n"
         << "                       still improving; stop after N consecutive that\n"
         << "                       are not. Makes -c a floor, not a ceiling.\n"
@@ -31,10 +32,10 @@ static void print_usage(const char* prog) {
         << "                       together (they are not independent —\n"
         << "                       which mix is efficient shifts with the\n"
         << "                       budget). 0 fastest, 9 = every candidate and\n"
-        << "                       every rung. Against the -c 8 default on a\n"
-        << "                       188-track mix, level 3 is 0.056% smaller and\n"
-        << "                       faster; level 9 is 0.113% smaller.\n"
-        << "                       An explicit -c/-p/-L/-a wins; the\n"
+        << "                       every rung. Level 3 is the default. Against\n"
+        << "                       it, on a 188-track mix: 0 is +0.15% at 0.8x\n"
+        << "                       the time, 6 is -0.03% at 1.5x, 9 is -0.05% at\n"
+        << "                       5.7x. An explicit -c/-p/-L/-a wins; the\n"
         << "                       level's -a yields to -e/-w rather than\n"
         << "                       erroring. The dial tunes the search *within*\n"
         << "                       a mode; it is not a substitute for -e.\n"
@@ -42,16 +43,19 @@ static void print_usage(const char* prog) {
         << "                       coefficient precisions per candidate, chosen by\n"
         << "                       an analytic model of the quantization error\n"
         << "                       instead of by encoding all of them.\n"
-        << "                       0 = all (default). Against all 8 rungs: 1\n"
-        << "                       costs 0.019% for 1.31x, 2 costs 0.009% for\n"
-        << "                       1.25x, 3 costs 0.005%.\n"
+        << "                       Default: 1 (effort level 3); 0 under a bare\n"
+        << "                       -e, which prices the whole ladder. Against\n"
+        << "                       all 8 rungs: 1 costs 0.019% for 1.31x, 2\n"
+        << "                       costs 0.009% for 1.25x, 3 costs 0.005%.\n"
         << "                       -c and -L are not independent —\n"
         << "                       prefer -E, which pairs them along the measured\n"
         << "                       frontier, unless you know which pair you want.\n"
         << "  -n, --no-metadata    Do not copy metadata from input to output\n"
-        << "  -a, --adaptive-windows  Experimental: add windows chosen from each\n"
-        << "                       block's signal statistics to the shortlist\n"
-        << "                       (estimated-DP only; excludes -e/-w)\n"
+        << "  -a, --adaptive-windows  Add windows chosen from each block's signal\n"
+        << "                       statistics to the shortlist. On by default;\n"
+        << "                       estimated-DP only, so it yields silently to\n"
+        << "                       -e/-w and is an error only when named there.\n"
+        << "  -A, --no-adaptive-windows  Turn that off.\n"
         << "  -R, --no-reuse       Disable input-frame reuse. By default, input\n"
         << "                       frames that beat the re-encoded ones are spliced\n"
         << "                       into the output (and the input is copied through\n"
@@ -106,7 +110,7 @@ int main(int argc, char* argv[]) {
     // the order the two appear in. Record what was named and re-apply it after
     // the level, rather than depending on argv order.
     bool patience_given = false, rungs_given = false;
-    bool adaptive_given = false;
+    bool adaptive_given = false, adaptive_off = false;
     int  effort = -1;
     unsigned given_candidates = 0, given_rungs = 0;
     int      given_patience = -1;
@@ -188,6 +192,10 @@ int main(int argc, char* argv[]) {
         } else if (arg == "-a" || arg == "--adaptive-windows") {
             cfg.adaptive_windows = true;
             adaptive_given = true;
+
+        } else if (arg == "-A" || arg == "--no-adaptive-windows") {
+            cfg.adaptive_windows = false;
+            adaptive_off = true;
 
         } else if (arg == "-R" || arg == "--no-reuse") {
             cfg.reuse_frames = false;
@@ -275,12 +283,22 @@ int main(int argc, char* argv[]) {
     // combined with -e or -w. A level's adaptive setting is a preference, not
     // a request, so apply_effort already dropped it in those cases.
     if (adaptive_given)    cfg.adaptive_windows = true;
+    if (adaptive_off)      cfg.adaptive_windows = false;
 
-    // -e alone means the classic unlimited sweep; any of -c/-L/-E alongside it
-    // is a deliberate statement about the search and is left alone, so
-    // `-e -E 5` means level 5's depth under exact DP.
-    if (cfg.exhaustive && effort < 0 && !candidates_given)
-        cfg.max_candidates = 0;
+    // -e alone means the classic unlimited sweep, and the same for the other
+    // two estimated-DP defaults: bare -e must still mean "exhaustive", not
+    // "exhaustive with the default search bolted on". Any of -c/-L/-E is a
+    // deliberate statement about the search and is left alone — `-e -E 5` means
+    // level 5's depth under exact DP, which used to be silently widened back to
+    // a full sweep.
+    if (cfg.exhaustive && effort < 0) {
+        if (!candidates_given) cfg.max_candidates  = 0;
+        if (!rungs_given)      cfg.precision_rungs = 0;
+    }
+    // -e and -w each define their own window set. The adaptive *default* yields
+    // to them silently; only an explicit -a is a contradiction worth rejecting.
+    if (!adaptive_given && (cfg.exhaustive || !cfg.windows.empty()))
+        cfg.adaptive_windows = false;
 
     // -W reads the reuse comparison's results, so it needs reuse enabled.
     if (cfg.warn_superior && !cfg.reuse_frames) {

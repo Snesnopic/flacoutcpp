@@ -791,7 +791,8 @@ struct CandidateDump {
         fh = path ? std::fopen(path, "w") : stderr;
         if (!fh) fh = stderr;
         std::fprintf(fh, "sf\twin\tord\tbsize\tbps\tlderr0\tlderr_ord\twsq\tzf\t"
-                         "model_bps\traw_bps\tvar_raw\tscore\tcost\n");
+                         "model_bps\traw_bps\tvar_raw\tscore\tcost\t"
+                         "lderr_prev\tlderr_next\tlderr_1\tlderr_max\tmax_ord\n");
     }
     ~CandidateDump() { if (fh && fh != stderr) std::fclose(fh); }
 };
@@ -2111,8 +2112,14 @@ SubframeParams Optimizer::optimize_subframe(
 #ifdef FLACOUT_DUMP_CANDIDATES
                 // Everything the scorer saw, carried so the dump can ask
                 // offline whether a better function of these would have
-                // ranked the eventual winner higher.
+                // ranked the eventual winner higher. The neighbouring
+                // Levinson errors are what the scorer throws away: E_m/E_{m-1}
+                // is the reflection coefficient at this order (|k|^2 = 1 -
+                // E_m/E_{m-1}), E_{m+1} says whether the next order is still
+                // paying, and E_max says how much is left to win at all.
                 double lderr0, lderr_ord, wsq, zf, model_bps;
+                double lderr_prev, lderr_next, lderr_1, lderr_max;
+                int    max_ord;
 #endif
             };
             std::vector<Cand> cands;
@@ -2174,9 +2181,17 @@ SubframeParams Optimizer::optimize_subframe(
                          + blind_bits_per_sample * zf) * (double)(bsize - ord);
                     const double coef_bits  = (double)ord * (double)(eff_bps + min_prec);
 #ifdef FLACOUT_DUMP_CANDIDATES
+                    // -1 marks orders the recursion stopped short of; fall
+                    // back to this order's own error so ratios stay finite.
+                    auto lde = [&](int k) {
+                        if (k < 0 || k > max_order) return lderr[ord];
+                        return lderr[k] > 0.0 ? lderr[k] : lderr[ord];
+                    };
                     cands.push_back({ resid_bits + coef_bits, (int)wi, ord,
                                       lderr[0], lderr[ord], wsq, zf,
-                                      model_bits_per_sample });
+                                      model_bits_per_sample,
+                                      lde(ord - 1), lde(ord + 1), lde(1),
+                                      lde(max_order), max_order });
 #else
                     cands.push_back({ resid_bits + coef_bits, (int)wi, ord });
 #endif
@@ -2222,10 +2237,13 @@ SubframeParams Optimizer::optimize_subframe(
                         std::lock_guard<std::mutex> lk(g_dump.mu);
                         std::fprintf(g_dump.fh,
                             "%llu\t%d\t%d\t%u\t%u\t%.10g\t%.10g\t%.10g\t%.6g\t"
-                            "%.10g\t%.10g\t%.10g\t%.10g\t%u\n",
+                            "%.10g\t%.10g\t%.10g\t%.10g\t%u\t"
+                            "%.10g\t%.10g\t%.10g\t%.10g\t%d\n",
                             (unsigned long long)dump_sf, (int)windows[cd.wi], cd.ord,
                             bsize, eff_bps, cd.lderr0, cd.lderr_ord, cd.wsq, cd.zf,
-                            cd.model_bps, raw_bits_per_sample, var_raw, cd.score, cc);
+                            cd.model_bps, raw_bits_per_sample, var_raw, cd.score, cc,
+                            cd.lderr_prev, cd.lderr_next, cd.lderr_1, cd.lderr_max,
+                            cd.max_ord);
                     }
 #else
                     (void)cc;
@@ -2250,10 +2268,13 @@ SubframeParams Optimizer::optimize_subframe(
                     std::lock_guard<std::mutex> lk(g_dump.mu);
                     std::fprintf(g_dump.fh,
                         "%llu\t%d\t%d\t%u\t%u\t%.10g\t%.10g\t%.10g\t%.6g\t"
-                        "%.10g\t%.10g\t%.10g\t%.10g\t%u\n",
+                        "%.10g\t%.10g\t%.10g\t%.10g\t%u\t"
+                        "%.10g\t%.10g\t%.10g\t%.10g\t%d\n",
                         (unsigned long long)dump_sf, (int)windows[cd.wi], cd.ord,
                         bsize, eff_bps, cd.lderr0, cd.lderr_ord, cd.wsq, cd.zf,
-                        cd.model_bps, raw_bits_per_sample, var_raw, cd.score, cc);
+                        cd.model_bps, raw_bits_per_sample, var_raw, cd.score, cc,
+                        cd.lderr_prev, cd.lderr_next, cd.lderr_1, cd.lderr_max,
+                        cd.max_ord);
                 }
 #else
                 (void)cc;

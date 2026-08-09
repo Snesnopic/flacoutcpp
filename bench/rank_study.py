@@ -28,7 +28,8 @@ import sys
 import numpy as np
 
 FIELDS = ["sf", "win", "ord", "bsize", "bps", "lderr0", "lderr_ord", "wsq",
-          "zf", "model_bps", "raw_bps", "var_raw", "score", "cost"]
+          "zf", "model_bps", "raw_bps", "var_raw", "score", "cost",
+          "lderr_prev", "lderr_next", "lderr_1", "lderr_max", "max_ord"]
 
 
 def load(path):
@@ -55,8 +56,35 @@ def features(r):
     wsq = np.maximum(r["wsq"], eps)
     n = r["bsize"]
 
+    prev = np.maximum(r["lderr_prev"], eps)
+    nxt = np.maximum(r["lderr_next"], eps)
+    e1 = np.maximum(r["lderr_1"], eps)
+    emax = np.maximum(r["lderr_max"], eps)
+
+    # The Levinson recursion produces an error at *every* order and the scorer
+    # keeps one number from it. These are the discarded shape:
+    #   k2   reflection coefficient at this order, |k|^2 = 1 - E_m/E_{m-1};
+    #        how much this order just bought.
+    #   gain_next  whether the next order is still buying anything, i.e.
+    #        whether we are at the knee of the curve or past it.
+    #   head_room  distance to the best any order reaches, so a candidate can
+    #        be judged against its own window's ceiling rather than absolutely.
+    #   pred1  first-order predictability, a cheap proxy for how tonal the
+    #        block is.
+    k2 = np.clip(1.0 - lderr_o / prev, 0.0, 1.0)
+    gain_next = np.log2(nxt / lderr_o)
+    head_room = np.log2(lderr_o / emax)
+    pred1 = np.log2(e1 / lderr0)
+
     var_e = lderr_o / wsq
     return np.column_stack([
+        k2,
+        gain_next,
+        head_room,
+        pred1,
+        np.log2(prev / lderr_o),                   # gain this order bought
+        r["max_ord"],
+        r["ord"] / np.maximum(r["max_ord"], 1.0),  # position along the curve
         r["ord"],
         n,
         r["bps"],

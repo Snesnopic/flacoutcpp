@@ -63,6 +63,12 @@ struct ProcessorConfig {
     int patience = -1;
 
     /**
+     * @brief LPC precision rungs encoded per candidate; 0 = all 8.
+     * See flacoutcpp::Config::precision_rungs.
+     */
+    unsigned precision_rungs = 0;
+
+    /**
      * @brief Adaptive per-subframe window selection (experimental,
      * estimated-DP modes only). See flacoutcpp::Config::adaptive_windows.
      */

@@ -32,6 +32,10 @@
 /// Top-level namespace for the flacoutcpp library.
 namespace flacoutcpp {
 
+/// @cond
+struct Config;
+/// @endcond
+
 /**
  * @brief Configuration for a single optimise-and-encode run.
  *
@@ -126,6 +130,63 @@ struct Config {
     int patience = -1;
 
     /**
+     * @brief Precision rungs actually encoded per candidate (0 = all 8).
+     *
+     * Each surviving (window, order) candidate is priced at LPC coefficient
+     * precisions 8..15, and every rung costs a full residual + Rice pass —
+     * the largest single multiplier on the cost of a candidate, and never
+     * pruned in practice.
+     *
+     * The ladder can be predicted instead of run. For a predictor @c c the
+     * windowed residual energy is `E_a + (c-a)'R(c-a)`, with @c a the
+     * Levinson solution and @c R the windowed autocorrelation — both already
+     * computed. That makes a rung an O(order²) quadratic form rather than an
+     * O(block × order) pass, so all 8 can be scored for a few percent of one
+     * rung and only the best few encoded for real.
+     *
+     * Measured in the encoder, as a fraction of file size given up against
+     * the full ladder at the same @ref max_candidates: 1 rung +0.019%,
+     * **2 rungs +0.009%**, 3 rungs +0.005%, alike on 16- and 24-bit material.
+     * The speedup is ~1.3x, not the ~4x the rung count suggests: the
+     * precision-delta path already makes 7 of the 8 rungs cheap, and skipping
+     * rungs breaks that chain, so what is actually saved is the Rice pass.
+     *
+     * The point is the *frontier*, not the speed. Spending 1.3x on a deeper
+     * @ref max_candidates beats plain @ref max_candidates at equal time
+     * everywhere the two overlap: on the 188-track master mix, `-c 24 -L 2`
+     * is 0.058% smaller than the `-c 8` default at 1.03x its speed, where
+     * plain `-c 12` buys only 0.031% and costs 1.16x. Full-ladder search
+     * still wins on size alone at unlimited time, which is why this is off by
+     * default. See PRECISION_LADDER_PLAN.md.
+     *
+     * @c 0 (default) encodes every rung, which is the pre-existing behaviour
+     * and bit-exact with it. A trade of compression for speed is opt-in here.
+     */
+    unsigned precision_rungs = 0;
+
+    /**
+     * @brief Effort level 0-9: one dial across the measured size/time frontier.
+     *
+     * @ref max_candidates and @ref precision_rungs are not independent — they
+     * buy the same thing (a better-chosen predictor) at different exchange
+     * rates, and which mix is efficient shifts with the budget. Measured on
+     * the 188-track master mix, the frontier is "spend everything on depth,
+     * one rung" until depth saturates around @c max_candidates 128 (past that,
+     * patience has exhausted the 256-candidate pool and extra depth is
+     * byte-identical), and only then does buying rungs pay.
+     *
+     * This dial walks that frontier so callers do not have to. It is not a new
+     * search mode: each level is exactly a (@ref max_candidates,
+     * @ref precision_rungs) pair, with @ref patience left at its 2x default.
+     *
+     * @c -1 (default) means no effort level: the individual knobs stand as
+     * they are, and behaviour is unchanged.
+     *
+     * @see apply_effort
+     */
+    int effort = -1;
+
+    /**
      * @brief Adaptive per-subframe window selection (experimental).
      *
      * Estimated-DP modes only: instead of the fixed 4-window shortlist, each
@@ -210,6 +271,73 @@ struct Config {
 bool optimise(const std::string& input_path,
               const std::string& output_path,
               const Config&      config = {});
+
+/**
+ * @brief Set @ref Config::max_candidates, @ref Config::precision_rungs and
+ *        @ref Config::adaptive_windows from an effort level 0-9.
+ *
+ * The levels are points measured on the size/time frontier of the 188-track
+ * master mix (`bench/fixtures/master_1s_mix.flac`), lowest effort first:
+ *
+ * Sizes are against the `-c 8` default; times are for the master mix.
+ *
+ * | level | candidates | rungs | time | mix | excerpts |
+ * |---|---|---|---|---|---|
+ * | 0 | 2 | 1 | 0.65 s | +0.090% | +0.053% |
+ * | 1 | 8 | 1 | 0.71 s | +0.003% | +0.012% |
+ * | 2 | 16 | 1 | 0.78 s | −0.045% | −0.015% |
+ * | 3 | 24 | 1 | 0.85 s | −0.056% | −0.023% |
+ * | 4 | 32 | 1 | 0.95 s | −0.065% | −0.034% |
+ * | 5 | 48 | 1 | 1.12 s | −0.080% | −0.051% |
+ * | 6 | 64 | 1 | 1.26 s | −0.086% | −0.055% |
+ * | 7 | 64 | 2 | 1.60 s | −0.096% | −0.062% |
+ * | 8 | 64 | 3 | 1.94 s | −0.101% | −0.066% |
+ * | 9 | 0 (no limit) | 0 (full ladder) | 4.82 s | −0.113% | −0.073% |
+ *
+ * Every level also enables @ref Config::adaptive_windows: on the 3-D frontier
+ * (56 configs over candidates x rungs x adaptive), 16 of the 21 efficient
+ * points use it, and every point past the fastest corner does. Its value does
+ * shrink as the search deepens — −0.019% at the default, −0.008 to −0.011% at
+ * each level — but it never stops paying, and its ~1.03-1.06x cost is the
+ * cheapest compression on the table. The album that historically regressed
+ * under `-a` (17 tracks, the case that motivated its patience scaling) is
+ * −0.219% at level 4 with **no track worse** than the default.
+ *
+ * Note what the table says about the current defaults: `-c 8` with the full
+ * ladder and no adaptive windows is dominated outright — level 3 is both
+ * faster and 0.056% smaller. Levels rise monotonically in both time and
+ * compression on *both* corpora, which is what makes the dial a dial; whether
+ * the default should move is a separate question.
+ *
+ * Levels 0-2 are bunched in time because fixed work (decode, MD5, the
+ * granule DP) floors the runtime — the dial cannot go below that.
+ *
+ * @param cfg    Configuration to modify in place.
+ * @param level  Effort level; out-of-range values are rejected.
+ * @return       @c true if @p level was valid and applied.
+ *
+ * @note @ref Config::patience is left alone, so it resolves to its
+ *       2 x @ref Config::max_candidates default — what every level was
+ *       measured with. Patience 0 measured off the frontier at equal time, so
+ *       the dial does not go there.
+ * @note These levels tune the search *within* a mode. They are measured under
+ *       the estimated DP and are not a substitute for @ref Config::exhaustive,
+ *       which is worth an order of magnitude more (0.59% on 24-bit music,
+ *       2.32% on 16-bit, against ~0.1% for this whole dial). Under
+ *       @ref Config::exhaustive the levels still apply, and level 0 (a
+ *       2-candidate search under exact pricing) reaches ~76% of a full
+ *       exhaustive run's gain at ~80x less time. To keep nearly all of it
+ *       instead, leave @ref Config::max_candidates at 0 and set
+ *       @ref Config::precision_rungs to 1: ~99.5% of the gain at ~5x less
+ *       time.
+ * @note Adaptive windows contradict @ref Config::exhaustive and an explicit
+ *       @ref Config::windows list, each of which defines its own window set.
+ *       This function reads both and declines to set @ref
+ *       Config::adaptive_windows when either is in play, so **set those
+ *       first** — a level is a preference, not a request, and `-E 5 -e` should
+ *       mean "level 5's depth under exact DP" rather than an error.
+ */
+bool apply_effort(Config& cfg, int level);
 
 } // namespace flacoutcpp
 

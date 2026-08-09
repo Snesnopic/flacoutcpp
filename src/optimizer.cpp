@@ -280,11 +280,13 @@ Optimizer::Optimizer(uint32_t channels, uint32_t bps, uint32_t sample_rate,
                      bool verbose,
                      unsigned max_candidates,
                      bool adaptive_windows,
-                     unsigned patience)
+                     unsigned patience,
+                     unsigned precision_rungs)
     : m_channels(channels), m_bps(bps), m_sample_rate(sample_rate),
       m_max_threads(max_threads),
       m_exhaustive(exhaustive), m_verbose(verbose), m_max_candidates(max_candidates),
-      m_adaptive(adaptive_windows), m_patience(patience)
+      m_adaptive(adaptive_windows), m_patience(patience),
+      m_precision_rungs(precision_rungs)
 {
     if (windows.empty()) {
         // Exact-DP mode (-e) affords the widest window set; the ranking pays
@@ -797,6 +799,38 @@ struct CandidateDump {
     ~CandidateDump() { if (fh && fh != stderr) std::fclose(fh); }
 };
 CandidateDump g_dump;
+} // namespace
+#endif
+
+#ifdef FLACOUT_DUMP_PRECISION
+// Second offline sink, one row per *precision rung* of every candidate the
+// scan evaluated. The candidate dump above asks whether the (window, order)
+// ordering is right; this one asks whether the precision ladder — 8 full
+// residual+Rice passes per candidate, never pruned in practice — can be
+// priced analytically instead of run.
+//
+// The analytic claim: for predictor c, the windowed residual energy is
+// E(c) = E_a + (c-a)'R(c-a), where a is the Levinson solution and R the
+// windowed autocorrelation. Both are already in hand, so a rung's cost is
+// an O(order^2) quadratic form rather than an O(bsize*order) pass. Each row
+// carries `ea` and `drd` so the offline model can be scored against `cost`,
+// which is what the rung actually cost.
+#include <cstdio>
+namespace {
+struct PrecisionDump {
+    std::FILE* fh = nullptr;
+    std::mutex mu;
+    PrecisionDump() {
+        const char* path = std::getenv("FLACOUT_PREC_DUMP_PATH");
+        fh = path ? std::fopen(path, "w") : stderr;
+        if (!fh) fh = stderr;
+        std::fprintf(fh, "sf\twin\tord\tbsize\tbps\tprec\tshift\tclamped\t"
+                         "cost\tea\tdrd\twsq\tr0\tsd2\tdrd1\tdrd4\n");
+    }
+    ~PrecisionDump() { if (fh && fh != stderr) std::fclose(fh); }
+};
+PrecisionDump g_pdump;
+std::atomic<uint64_t> g_pdump_sf{0};
 } // namespace
 #endif
 
@@ -1825,7 +1859,7 @@ uint32_t Optimizer::estimate_subframe_cost(
 SubframeParams Optimizer::optimize_subframe(
     const int32_t* samples, uint32_t bsize, uint32_t bps,
     const std::vector<WindowType>& windows,
-    unsigned max_candidates, unsigned patience)
+    unsigned max_candidates, unsigned patience, unsigned precision_rungs)
 {
     SubframeParams best{};
     best.bits_cost = std::numeric_limits<uint32_t>::max();
@@ -1905,6 +1939,18 @@ SubframeParams Optimizer::optimize_subframe(
 
         INSTR(g_instr.subframes.fetch_add(1, std::memory_order_relaxed));
 
+        // The windowed autocorrelation of whichever window eval_candidate is
+        // currently pricing — the R of the analytic ladder model below.
+        // analyse_window keeps `autoc` local, and in the ranked path the
+        // candidates are evaluated long after their window was analysed, so
+        // the ranked driver stashes a copy per window and points cand_autoc at
+        // the right one before each call.
+        double        cur_autoc[33] = {};
+        const double* cand_autoc = cur_autoc;
+#ifdef FLACOUT_DUMP_PRECISION
+        const uint64_t pdump_sf = g_pdump_sf.fetch_add(1, std::memory_order_relaxed);
+#endif
+
         const int max_order = (int)std::min((uint32_t)32, bsize - 1);
 
         // Evaluate one candidate — a coefficient set at one order — across
@@ -1931,10 +1977,97 @@ SubframeParams Optimizer::optimize_subframe(
             int        prev_shift = 0;
             int32_t    prev_qc[32];
 
+            // ---- Analytic precision ladder (-L) ----
+            // Every rung below costs a full residual + Rice pass, and the
+            // header bound almost never cuts one: measured 8 rungs entered per
+            // candidate with zero pruned. But a rung's cost is predictable
+            // without encoding it. For a predictor c the windowed residual
+            // energy is E(c) = E_a + (c-a)'R(c-a), with a the Levinson
+            // solution and R the windowed autocorrelation — both already
+            // computed for this candidate — so quantizing (O(order)) and
+            // evaluating the quadratic form (O(order^2)) prices the whole
+            // ladder for a few percent of one rung. Only the best `m_ladder`
+            // rungs are then encoded for real.
+            //
+            // Measured against encoding all 8, as a fraction of subframe bits:
+            // 1 rung 0.016%, 2 rungs 0.007-0.008%, 3 rungs 0.004%, alike on 16-
+            // and 24-bit material. See PRECISION_LADDER_PLAN.md.
+            //
+            // Cheaper models of the same quantity were tried and are much
+            // worse: banding the quadratic form to |i-j| <= 4 gives up 2.5-12x
+            // more, the diagonal alone more still, and treating the
+            // quantization error as uniform white noise — which would need no
+            // quantize call at all — is worst. quantize_lpc_coeffs uses error
+            // feedback, which shapes the error and shrinks (c-a)'R(c-a) by a
+            // median factor of 2^-4.15; the white-noise model does not know
+            // that, so the quantizer has to actually run. Only the residual
+            // pass can be predicted away.
+            bool rung_sel[16];
+            const bool use_ladder =
+                precision_rungs > 0 && precision_rungs < precisions.size();
+            if (use_ladder) {
+                const double* ac = cand_autoc;
+                double ea = ac[0];
+                for (int j = 0; j < ord; ++j) ea -= (double)lpc[j] * ac[j + 1];
+                if (!(ea > 0.0)) ea = 0.0;
+
+                double score[16];
+                for (size_t i = 0; i < precisions.size(); ++i)
+                    score[i] = std::numeric_limits<double>::max();
+
+                for (size_t i = 0; i < precisions.size(); ++i) {
+                    const int prec = precisions[i];
+                    // Same bound the encoding loop uses, so the ladder never
+                    // scores a rung that loop would have refused to enter.
+                    if (hdr_fixed + (uint32_t)ord * (eff_bps + (uint32_t)prec)
+                            >= best_lpc_cost)
+                        break;
+                    int32_t qc[32];
+                    int     shift   = 0;
+                    bool    clamped = false;
+                    if (!quantize_lpc_coeffs(lpc, ord, prec, log2cmax, qc, &shift,
+                                             &clamped))
+                        continue;
+                    const double scale = 1.0 / (double)((int64_t)1 << shift);
+                    double d[32];
+                    for (int j = 0; j < ord; ++j)
+                        d[j] = (double)qc[j] * scale - (double)lpc[j];
+                    double drd = 0.0;
+                    for (int a = 0; a < ord; ++a) {
+                        double row = 0.0;
+                        for (int b = 0; b < ord; ++b)
+                            row += d[b] * ac[std::abs(a - b)];
+                        drd += d[a] * row;
+                    }
+                    const double e = ea + drd;
+                    // order*prec is the exact coefficient cost; the rest is the
+                    // Gaussian entropy of the predicted residual. Terms that do
+                    // not vary across the ladder (the header, the window-energy
+                    // normalisation) are dropped — only the ordering matters.
+                    score[i] = (double)ord * (double)prec
+                             + 0.5 * (double)(bsize - (uint32_t)ord)
+                               * std::log2(e > 0.0 ? e : 1e-300);
+                }
+
+                for (size_t i = 0; i < precisions.size(); ++i) rung_sel[i] = false;
+                for (unsigned k = 0; k < precision_rungs; ++k) {
+                    size_t best_i = precisions.size();
+                    double best_s = std::numeric_limits<double>::max();
+                    for (size_t i = 0; i < precisions.size(); ++i)
+                        if (!rung_sel[i] && score[i] < best_s) {
+                            best_s = score[i];
+                            best_i = i;
+                        }
+                    if (best_i == precisions.size()) break;
+                    rung_sel[best_i] = true;
+                }
+            }
+
 #ifdef FLACOUT_INSTRUMENT
             int prec_idx = 0;
 #endif
-            for (int prec : precisions) {
+            for (size_t pi = 0; pi < precisions.size(); ++pi) {
+                const int prec = precisions[pi];
                 INSTR(++prec_idx);
                 // fixed cost is a lower bound on this candidate (rice >= 0);
                 // grows with precision, so break once it can't beat best.
@@ -1943,6 +2076,10 @@ SubframeParams Optimizer::optimize_subframe(
                     INSTR(g_instr.prec_pruned_break.fetch_add(precisions.size() - prec_idx + 1, std::memory_order_relaxed));
                     break;
                 }
+                // Ascending order is kept even when most rungs are skipped: the
+                // delta update below needs shift == prev_shift + 1, so two
+                // adjacent selected rungs still avoid a full recompute.
+                if (use_ladder && !rung_sel[pi]) continue;
                 INSTR(g_instr.prec_iters.fetch_add(1, std::memory_order_relaxed));
 
                 // Quantize with error feedback (mirrors libFLAC; see
@@ -1999,6 +2136,45 @@ SubframeParams Optimizer::optimize_subframe(
                 // +6: residual block header (2-bit coding method + 4-bit
                 // partition order), see estimate_subframe_cost for detail.
                 const uint32_t cost = hdr + 6u + rice;
+#ifdef FLACOUT_DUMP_PRECISION
+                {
+                    // E_a = r0 - a'r, the Levinson residual energy at this
+                    // order; drd = (aq - a)'R(aq - a), the extra energy this
+                    // rung's quantization introduces. Predicted rung energy is
+                    // their sum — everything else in the cost is either exact
+                    // (ord*prec) or constant across the ladder.
+                    const double* ac = cand_autoc;
+                    double ea = ac[0];
+                    for (int j = 0; j < ord; ++j) ea -= (double)lpc[j] * ac[j+1];
+                    const double scale = 1.0 / (double)((int64_t)1 << shift);
+                    double d[32];
+                    for (int j = 0; j < ord; ++j)
+                        d[j] = (double)qc[j] * scale - (double)lpc[j];
+                    // Full form and three cheaper approximations of it: the
+                    // diagonal alone (O(ord)) and bands of width 1 and 4
+                    // (O(ord*L)). The full form is O(ord^2), which at order 32
+                    // is a sixth of a residual pass -- worth knowing whether a
+                    // band buys the same ranking for less.
+                    double drd = 0.0, drd1 = 0.0, drd4 = 0.0, sd2 = 0.0;
+                    for (int i = 0; i < ord; ++i) {
+                        sd2 += d[i] * d[i];
+                        for (int j = 0; j < ord; ++j) {
+                            const int lag = std::abs(i - j);
+                            const double t = d[i] * d[j] * ac[lag];
+                            drd += t;
+                            if (lag <= 1) drd1 += t;
+                            if (lag <= 4) drd4 += t;
+                        }
+                    }
+                    std::lock_guard<std::mutex> lk(g_pdump.mu);
+                    std::fprintf(g_pdump.fh,
+                        "%llu\t%d\t%d\t%u\t%u\t%d\t%d\t%d\t%u\t%.10g\t%.10g\t%.10g\t%.10g"
+                        "\t%.10g\t%.10g\t%.10g\n",
+                        (unsigned long long)pdump_sf, (int)wt, ord, bsize, eff_bps,
+                        prec, shift, clamped ? 1 : 0, cost, ea, drd,
+                        window_energy(wt, bsize), ac[0], sd2, drd1, drd4);
+                }
+#endif
                 if (cost < cand_best) cand_best = cost;
                 if (cost < best_lpc_cost) {
                     best_lpc_cost = cost;
@@ -2025,6 +2201,7 @@ SubframeParams Optimizer::optimize_subframe(
                 g_instr.autoc_macs.fetch_add(bsize - (uint32_t)lag, std::memory_order_relaxed);
 #endif
             autocorrelation(windowed.data(), bsize, max_lag, autoc);
+            std::memcpy(cur_autoc, autoc, sizeof(autoc));
             if (autoc[0] <= 0.0) return false;
 
             std::memset(all_lpc, 0, sizeof(all_lpc));
@@ -2151,11 +2328,16 @@ SubframeParams Optimizer::optimize_subframe(
             // back. 4 KB per window.
             constexpr size_t LPC_STRIDE = 32 * 32;
             std::vector<float> lpc_store(windows.size() * LPC_STRIDE, 0.0f);
+            // One autocorrelation per window, kept for the ladder model: the
+            // scan evaluates candidates in ranked order, long after the loop
+            // below has moved on from their window.
+            std::vector<double> autoc_store(windows.size() * 33, 0.0);
 
             for (size_t wi = 0; wi < windows.size(); ++wi) {
                 double lderr[33];
                 if (!analyse_window(windows[wi], lderr)) continue;
                 std::memcpy(&lpc_store[wi * LPC_STRIDE], all_lpc, sizeof(all_lpc));
+                std::memcpy(&autoc_store[wi * 33], cur_autoc, sizeof(cur_autoc));
                 if (lderr[0] <= 0.0) continue;
                 const double wsq = window_energy(windows[wi], bsize);
                 if (!(wsq > 0.0)) continue;
@@ -2229,6 +2411,7 @@ SubframeParams Optimizer::optimize_subframe(
                     const Cand& cd = cands[c];
                     uint32_t hdr_min = hdr_fixed + (uint32_t)cd.ord * (eff_bps + min_prec);
                     if (hdr_min >= best_lpc_cost) { ++since; continue; }
+                    cand_autoc = &autoc_store[(size_t)cd.wi * 33];
                     uint32_t cc = eval_candidate(
                         &lpc_store[cd.wi * LPC_STRIDE + (size_t)(cd.ord - 1) * 32],
                         cd.ord, windows[cd.wi]);
@@ -2260,6 +2443,7 @@ SubframeParams Optimizer::optimize_subframe(
                 const Cand& cd = cands[c];
                 uint32_t hdr_min = hdr_fixed + (uint32_t)cd.ord * (eff_bps + min_prec);
                 if (hdr_min >= best_lpc_cost) continue;
+                cand_autoc = &autoc_store[(size_t)cd.wi * 33];
                 uint32_t cc = eval_candidate(
                     &lpc_store[cd.wi * LPC_STRIDE + (size_t)(cd.ord - 1) * 32],
                     cd.ord, windows[cd.wi]);
@@ -2387,7 +2571,7 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
         if (m_channels == 1) {
             bp.stereo_mode  = 0;
             bp.subframes[0] = optimize_subframe(pcm_data[0].data(),
-                                                (uint32_t)total_samples, m_bps, m_windows, m_max_candidates, m_patience);
+                                                (uint32_t)total_samples, m_bps, m_windows, m_max_candidates, m_patience, m_precision_rungs);
         } else {
             uint32_t best_bits = std::numeric_limits<uint32_t>::max();
             for (int mode : {0, 8, 9, 10}) {
@@ -2402,8 +2586,8 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
                 // mode 9 = right+side: ch0 is side (needs +1 bit), ch1 is right
                 uint32_t bps0 = (mode == 9) ? m_bps + 1 : m_bps;
                 uint32_t bps1 = (mode == 9) ? m_bps     : (mode == 0 ? m_bps : m_bps + 1);
-                SubframeParams s0 = optimize_subframe(ch0.data(), (uint32_t)total_samples, bps0, m_windows, m_max_candidates, m_patience);
-                SubframeParams s1 = optimize_subframe(ch1.data(), (uint32_t)total_samples, bps1, m_windows, m_max_candidates, m_patience);
+                SubframeParams s0 = optimize_subframe(ch0.data(), (uint32_t)total_samples, bps0, m_windows, m_max_candidates, m_patience, m_precision_rungs);
+                SubframeParams s1 = optimize_subframe(ch1.data(), (uint32_t)total_samples, bps1, m_windows, m_max_candidates, m_patience, m_precision_rungs);
                 if (s0.bits_cost + s1.bits_cost < best_bits) {
                     best_bits = s0.bits_cost + s1.bits_cost;
                     bp.stereo_mode  = mode;
@@ -2973,7 +3157,7 @@ BlockParams Optimizer::compute_block(
     if (m_channels == 1) {
         bp.stereo_mode  = 0;
         bp.subframes[0] = optimize_subframe(
-            &pcm_data[0][sample_start], block_size, m_bps, wins, m_max_candidates, patience);
+            &pcm_data[0][sample_start], block_size, m_bps, wins, m_max_candidates, patience, m_precision_rungs);
     } else {
         uint32_t best_bits = std::numeric_limits<uint32_t>::max();
 
@@ -3023,9 +3207,9 @@ BlockParams Optimizer::compute_block(
         auto get_sig = [&](int sig) -> const SubframeParams& {
             if (have[sig]) return cache[sig];
             if (sig == SIG_L) {
-                cache[sig] = optimize_subframe(&pcm_data[0][sample_start], block_size, m_bps, wins, m_max_candidates, patience);
+                cache[sig] = optimize_subframe(&pcm_data[0][sample_start], block_size, m_bps, wins, m_max_candidates, patience, m_precision_rungs);
             } else if (sig == SIG_R) {
-                cache[sig] = optimize_subframe(&pcm_data[1][sample_start], block_size, m_bps, wins, m_max_candidates, patience);
+                cache[sig] = optimize_subframe(&pcm_data[1][sample_start], block_size, m_bps, wins, m_max_candidates, patience, m_precision_rungs);
             } else {
                 std::vector<int32_t> ch(block_size);
                 uint32_t bps_s;
@@ -3038,7 +3222,7 @@ BlockParams Optimizer::compute_block(
                         ch[k] = (pcm_data[0][sample_start + k] + pcm_data[1][sample_start + k]) >> 1;
                     bps_s = m_bps;
                 }
-                cache[sig] = optimize_subframe(ch.data(), block_size, bps_s, wins, m_max_candidates, patience);
+                cache[sig] = optimize_subframe(ch.data(), block_size, bps_s, wins, m_max_candidates, patience, m_precision_rungs);
             }
             have[sig] = true;
             return cache[sig];

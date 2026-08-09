@@ -55,6 +55,25 @@ run rk_mono   -R -e -c 4 "$FIX/mono_2s.flac"
 run rk_24     -R -e -c 8 "$FIX/s24_2s.flac"
 run rk_short  -R -e -c 8 "$FIX/short.flac"
 run rk_win    -R -e -c 2 -w hann,tukey020 "$FIX/stereo_1s.flac"
+# Analytic precision ladder (-L N). Off by default, so the cases above already
+# pin the full-ladder path; these pin the model that picks the rungs. Retuning
+# it is expected to move them — re-record after confirming the size delta went
+# the intended way, as with rk_*.
+#
+# -L 1, not the recommended -L 2, on purpose: at -L 2 the model agrees with the
+# full ladder on every synthetic fixture here (byte-identical output), so a -L 2
+# case would pass even against a broken model. -L 1 forces it to commit to one
+# rung and does diverge — 1 B, 6 B and 155 B respectively.
+run ld_stereo -R -L 1 "$FIX/stereo_1s.flac"
+run ld_24     -R -L 1 "$FIX/s24_2s.flac"
+run ld_short  -R -L 1 "$FIX/short.flac"
+# Effort dial: pins the level -> (candidates, rungs) table itself. -E 3 is
+# (-c 24 -L 1) and stereo_1s is one of the fixtures where -L 1 diverges from
+# the full ladder, so this case moves if either half of the mapping changes.
+run ef_stereo -R -E 3 "$FIX/stereo_1s.flac"
+# The documented exact-DP recipe: -E under -e, where the level's -a is dropped
+# and only its -c/-L survive. Pins that interaction, not just the mapping.
+run ef_ex     -R -e -E 0 "$FIX/stereo_1s.flac"
 # Runtime-loaded window (-w custom:<file>): pins the knot parser and the
 # interpolation onto both table and non-table block sizes. The knot file is
 # committed next to this script, so these are reproducible anywhere.

@@ -10,21 +10,48 @@ static void print_usage(const char* prog) {
         << "Options:\n"
         << "  -e, --exhaustive     Exact search: fully encode every block-size and\n"
         << "                       stereo-mode choice instead of estimating them,\n"
-        << "                       and offer all windows (extremely slow)\n"
+        << "                       and offer all windows (extremely slow).\n"
+        << "                       Worth far more than any -E level: 0.6% (24-bit)\n"
+        << "                       to 2.3% (16-bit) on real music, against ~0.2%\n"
+        << "                       across the whole dial. Rarely worth it bare:\n"
+        << "                       '-e -L 1' is ~5x faster for 99.5% of the gain,\n"
+        << "                       and '-e -E 0' ~80x faster for ~76% of it.\n"
         << "  -c, --candidates N   Fully evaluate only the N most promising\n"
         << "                       (window, order) pairs per subframe, ranked by\n"
         << "                       Levinson-Durbin prediction error. 0 = no limit.\n"
-        << "                       Default: 8, or 0 when -e is given without -c.\n"
-        << "                       Composes with -e (e.g. -e -c 8). Larger N is\n"
-        << "                       slower and compresses better.\n"
+        << "                       Default: 8, or 0 when -e is given without\n"
+        << "                       -c/-L/-E. Composes with -e (e.g. -e -c 8).\n"
+        << "                       Larger N is slower and compresses better.\n"
         << "  -p, --patience N     Keep scanning past -c N while candidates are\n"
         << "                       still improving; stop after N consecutive that\n"
         << "                       are not. Makes -c a floor, not a ceiling.\n"
         << "                       Default: 2x -c. 0 disables it (plain top-N cut).\n"
+        << "  -E, --effort N       Effort 0-9: one dial along the measured\n"
+        << "                       size/time frontier, setting -c, -L and -a\n"
+        << "                       together (they are not independent —\n"
+        << "                       which mix is efficient shifts with the\n"
+        << "                       budget). 0 fastest, 9 = every candidate and\n"
+        << "                       every rung. Against the -c 8 default on a\n"
+        << "                       188-track mix, level 3 is 0.056% smaller and\n"
+        << "                       faster; level 9 is 0.113% smaller.\n"
+        << "                       An explicit -c/-p/-L/-a wins; the\n"
+        << "                       level's -a yields to -e/-w rather than\n"
+        << "                       erroring. The dial tunes the search *within*\n"
+        << "                       a mode; it is not a substitute for -e.\n"
+        << "  -L, --rungs N        Encode only the N most promising of the 8 LPC\n"
+        << "                       coefficient precisions per candidate, chosen by\n"
+        << "                       an analytic model of the quantization error\n"
+        << "                       instead of by encoding all of them.\n"
+        << "                       0 = all (default). Against all 8 rungs: 1\n"
+        << "                       costs 0.019% for 1.31x, 2 costs 0.009% for\n"
+        << "                       1.25x, 3 costs 0.005%.\n"
+        << "                       -c and -L are not independent —\n"
+        << "                       prefer -E, which pairs them along the measured\n"
+        << "                       frontier, unless you know which pair you want.\n"
         << "  -n, --no-metadata    Do not copy metadata from input to output\n"
-        << "  -a, --adaptive-windows  Experimental: pick each block's window set\n"
-        << "                       from its signal statistics instead of the fixed\n"
-        << "                       shortlist (estimated-DP only; excludes -e/-w)\n"
+        << "  -a, --adaptive-windows  Experimental: add windows chosen from each\n"
+        << "                       block's signal statistics to the shortlist\n"
+        << "                       (estimated-DP only; excludes -e/-w)\n"
         << "  -R, --no-reuse       Disable input-frame reuse. By default, input\n"
         << "                       frames that beat the re-encoded ones are spliced\n"
         << "                       into the output (and the input is copied through\n"
@@ -75,6 +102,14 @@ int main(int argc, char* argv[]) {
     flacoutcpp::Config cfg;
     std::vector<std::string> positional;
     bool candidates_given = false;
+    // Effort is a preset for -c/-L, so an explicit knob must win regardless of
+    // the order the two appear in. Record what was named and re-apply it after
+    // the level, rather than depending on argv order.
+    bool patience_given = false, rungs_given = false;
+    bool adaptive_given = false;
+    int  effort = -1;
+    unsigned given_candidates = 0, given_rungs = 0;
+    int      given_patience = -1;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -99,7 +134,7 @@ int main(int argc, char* argv[]) {
             try {
                 // stoul accepts a leading '-' by wrapping; reject it explicitly.
                 if (argv[i][0] == '-') throw std::invalid_argument("negative");
-                cfg.max_candidates = static_cast<unsigned>(std::stoul(argv[i]));
+                given_candidates = static_cast<unsigned>(std::stoul(argv[i]));
             } catch (const std::exception&) {
                 std::cerr << "Error: -c requires a non-negative integer, got '" << argv[i] << "'.\n";
                 return EXIT_FAILURE;
@@ -114,14 +149,45 @@ int main(int argc, char* argv[]) {
             ++i;
             try {
                 if (argv[i][0] == '-') throw std::invalid_argument("negative");
-                cfg.patience = static_cast<int>(std::stoul(argv[i]));
+                given_patience = static_cast<int>(std::stoul(argv[i]));
+                patience_given = true;
             } catch (const std::exception&) {
                 std::cerr << "Error: -p requires a non-negative integer, got '" << argv[i] << "'.\n";
                 return EXIT_FAILURE;
             }
 
+        } else if (arg == "-E" || arg == "--effort") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: -E requires a number.\n";
+                return EXIT_FAILURE;
+            }
+            ++i;
+            try {
+                if (argv[i][0] == '-') throw std::invalid_argument("negative");
+                effort = static_cast<int>(std::stoul(argv[i]));
+            } catch (const std::exception&) {
+                std::cerr << "Error: -E requires an effort level 0-9, got '" << argv[i] << "'.\n";
+                return EXIT_FAILURE;
+            }
+
+        } else if (arg == "-L" || arg == "--rungs") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: -L requires a number.\n";
+                return EXIT_FAILURE;
+            }
+            ++i;
+            try {
+                if (argv[i][0] == '-') throw std::invalid_argument("negative");
+                given_rungs = static_cast<unsigned>(std::stoul(argv[i]));
+                rungs_given = true;
+            } catch (const std::exception&) {
+                std::cerr << "Error: -L requires a non-negative integer, got '" << argv[i] << "'.\n";
+                return EXIT_FAILURE;
+            }
+
         } else if (arg == "-a" || arg == "--adaptive-windows") {
             cfg.adaptive_windows = true;
+            adaptive_given = true;
 
         } else if (arg == "-R" || arg == "--no-reuse") {
             cfg.reuse_frames = false;
@@ -196,9 +262,24 @@ int main(int argc, char* argv[]) {
                                  ? positional[1]
                                  : input + ".optimized.flac";
 
-    // -e alone means the classic unlimited sweep; -c composes with it to bound
-    // the per-subframe search while keeping the exact block-partitioning DP.
-    if (!candidates_given && cfg.exhaustive)
+    // Effort first, then whatever was named explicitly — so `-E 7 -L 0` means
+    // "level 7's depth, but price the whole ladder".
+    if (effort >= 0 && !flacoutcpp::apply_effort(cfg, effort)) {
+        std::cerr << "Error: -E takes an effort level 0-9, got " << effort << ".\n";
+        return EXIT_FAILURE;
+    }
+    if (candidates_given)  cfg.max_candidates  = given_candidates;
+    if (patience_given)    cfg.patience        = given_patience;
+    if (rungs_given)       cfg.precision_rungs = given_rungs;
+    // An explicit -a still means -a, including the hard error below when it is
+    // combined with -e or -w. A level's adaptive setting is a preference, not
+    // a request, so apply_effort already dropped it in those cases.
+    if (adaptive_given)    cfg.adaptive_windows = true;
+
+    // -e alone means the classic unlimited sweep; any of -c/-L/-E alongside it
+    // is a deliberate statement about the search and is left alone, so
+    // `-e -E 5` means level 5's depth under exact DP.
+    if (cfg.exhaustive && effort < 0 && !candidates_given)
         cfg.max_candidates = 0;
 
     // -W reads the reuse comparison's results, so it needs reuse enabled.

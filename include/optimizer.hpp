@@ -271,6 +271,9 @@ public:
      * @param patience  Consecutive non-improving candidates tolerated before
      *        the ranked scan stops; @c max_candidates becomes a floor rather
      *        than a ceiling.  0 (default) keeps the plain top-N cut.
+     * @param precision_rungs  How many of the 8 LPC precisions to encode per
+     *        candidate, chosen by the analytic ladder model.  0 (default)
+     *        encodes all of them, which is the pre-existing behaviour.
      */
     Optimizer(uint32_t channels, uint32_t bps, uint32_t sample_rate,
               std::vector<WindowType> windows = {},
@@ -279,7 +282,8 @@ public:
               bool verbose = true,
               unsigned max_candidates = 0,
               bool adaptive_windows = false,
-              unsigned patience = 0);
+              unsigned patience = 0,
+              unsigned precision_rungs = 0);
 
     /**
      * @brief Find the optimal variable block-size partition for the stream.
@@ -317,6 +321,8 @@ public:
      * @param windows        Windows to test.
      * @param max_candidates Ranked (window, order) pairs to fully evaluate;
      *                       0 means no limit (exhaustive sweep).
+     * @param precision_rungs LPC precisions encoded per candidate, picked by
+     *                       the analytic ladder model; 0 encodes all 8.
      * @return               Best SubframeParams found.
      */
     [[nodiscard]] static SubframeParams optimize_subframe(
@@ -325,7 +331,8 @@ public:
         uint32_t                    bps,
         const std::vector<WindowType>& windows,
         unsigned                    max_candidates = 0,
-        unsigned                    patience = 0);
+        unsigned                    patience = 0,
+        unsigned                    precision_rungs = 0);
 
 private:
     /// @cond INTERNAL
@@ -397,6 +404,7 @@ private:
     unsigned              m_max_candidates;
     bool                  m_adaptive;
     unsigned              m_patience;
+    unsigned              m_precision_rungs;
     std::vector<ReuseEdge> m_reuse_edges;
 
     /// True when block costs come from real encodes rather than the granule

@@ -28,6 +28,7 @@ import argparse
 import sys
 
 import numpy as np
+from scipy import signal
 
 FIELDS = ["sf", "win", "ord", "bsize", "bps", "lderr0", "lderr_ord", "wsq",
           "zf", "model_bps", "raw_bps", "var_raw", "score", "cost",
@@ -154,6 +155,78 @@ def oracle_allocate(groups, mean_budget, lo=1):
     return np.array(b)
 
 
+def gains_of(groups):
+    """Per subframe: the improvement each candidate made, and the block size.
+
+    `gain[j]` is what candidate j knocked off the best cost so far (0 when it
+    did not improve). This is the only thing a stop rule gets to see, and it is
+    what the count rule reduces to a boolean.
+    """
+    out = []
+    for f, _, co in groups:
+        run = np.minimum.accumulate(co)
+        g = np.empty(len(co))
+        g[0] = 0.0
+        g[1:] = run[:-1] - run[1:]
+        out.append((g, float(f[0])))
+    return out
+
+
+def _stop(mask, floor, n):
+    """First depth at or past `floor` whose stop condition holds; else n."""
+    if n <= floor:
+        return n
+    j = np.flatnonzero(mask[floor - 1:])
+    return int(j[0]) + floor if len(j) else n
+
+
+def rule_depths(gs, kind, lam, floor, W=8, cap=None):
+    """Depths chosen by a marginal-rate stop rule (R1/R2/R3, all with R4's floor).
+
+    `lam` is in bits per sample per candidate, so the threshold scales with
+    block size: a 16384-sample block must gain 16x what a 1024 does to justify
+    the same extra candidate.
+    """
+    depths = []
+    for g, bs in gs:
+        n = len(g)
+        thr = lam * bs
+        if kind == "R1":
+            c = np.r_[0.0, np.cumsum(g)]
+            w = np.minimum(np.arange(1, n + 1), W)
+            trail = c[1:] - c[np.maximum(np.arange(1, n + 1) - W, 0)]
+            d = _stop(trail < thr * w, floor, n)
+        elif kind == "R2":
+            a = 2.0 / (W + 1.0)
+            ewma = signal.lfilter([a], [1.0, -(1.0 - a)], g)
+            d = _stop(ewma < thr, floor, n)
+        else:  # R3: has the last improvement paid for the scan it triggered?
+            idx = np.arange(n)
+            hit = np.where(g > 0, idx, -1)
+            last = np.maximum.accumulate(hit)
+            since = idx - last
+            lastg = np.where(last >= 0, g[np.maximum(last, 0)], 0.0)
+            d = _stop(lastg < thr * np.maximum(since, 1), floor, n)
+        depths.append(min(d, cap) if cap else d)
+    return np.array(depths)
+
+
+def count_depths(gs, floor, p):
+    """What ships: stop after `p` consecutive candidates that did not improve."""
+    depths = []
+    for g, _ in gs:
+        n = len(g)
+        nz = g > 0
+        # consecutive non-improving run length ending at each position
+        since = np.zeros(n, dtype=int)
+        run = 0
+        for j in range(n):
+            run = 0 if nz[j] else run + 1
+            since[j] = run
+        depths.append(_stop(since >= p, floor, n))
+    return np.array(depths)
+
+
 def report(name, groups, budgets, base, mean_b):
     l = loss(groups, budgets)
     print("  %-30s %12d %9.1f%%  (mean depth %.1f)"
@@ -162,13 +235,82 @@ def report(name, groups, budgets, base, mean_b):
     return l
 
 
+def rules_main(args):
+    """Step 2 of PATIENCE_PLAN.md: does reacting to gain *size* beat counting?
+
+    Everything is scored at **equal mean depth**, because the two families are
+    not comparable at equal nominal budget: reactive patience overspends its
+    nominal `-p` by ~1.6x, and comparing nominal-to-nominal simply pays the
+    rate rule's bill for it. The count family is swept densely enough to
+    interpolate its loss at whatever depth a rate rule lands on.
+    """
+    te = group(load(args.test))
+    gs = gains_of(te)
+    print("test subframes: %d  candidates/subframe: median %d max %d"
+          % (len(te), np.median([len(g) for g, _ in gs]),
+             max(len(g) for g, _ in gs)))
+
+    floors = [int(b) for b in args.budgets.split(",")]
+
+    for floor in floors:
+        base = loss(te, np.full(len(te), floor))
+        print("\n=== floor -c %d   (flat loses %d bits) ===" % (floor, base))
+
+        # Reference curve: what the shipped count rule costs at each depth.
+        ref = []
+        for p in [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128]:
+            d = count_depths(gs, floor, p)
+            ref.append((float(d.mean()), loss(te, d)))
+        ref.sort()
+        rd = np.array([x for x, _ in ref])
+        rl = np.array([y for _, y in ref])
+        print("  count rule (-p): " + "  ".join(
+            "%.0f:%d" % (d, l) for d, l in ref[:6]) + " ...")
+
+        def matched(l, d):
+            """Count-rule loss at the same mean depth, log-interpolated."""
+            if d <= rd[0] or d >= rd[-1]:
+                return None
+            return float(np.interp(np.log(d), np.log(rd), rl))
+
+        print("  %-22s %7s %11s %11s %8s" %
+              ("rule", "depth", "bits lost", "count@depth", "vs count"))
+        rows = []
+        for kind in ("R1", "R2", "R3"):
+            for W in ([8] if kind == "R3" else [4, 8, 16, 32]):
+                for lam in (0.3, 0.1, 0.03, 0.01, 0.003, 0.001, 3e-4, 1e-4,
+                            3e-5, 1e-5):
+                    d = rule_depths(gs, kind, lam, floor, W)
+                    md, l = float(d.mean()), loss(te, d)
+                    c = matched(l, md)
+                    if c is None:
+                        continue
+                    rows.append((100.0 * (c - l) / c if c else 0.0, kind, W,
+                                 lam, md, l, c))
+        rows.sort(reverse=True)
+        for adv, kind, W, lam, md, l, c in rows[:12]:
+            print("  %-22s %7.1f %11d %11.0f %7.1f%%"
+                  % ("%s W=%d lam=%g" % (kind, W, lam), md, l, c, adv))
+        if rows:
+            worst = min(rows)
+            print("  worst of %d swept points: %s W=%d lam=%g  %+.1f%%"
+                  % (len(rows), worst[1], worst[2], worst[3], worst[0]))
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--train", required=True)
     ap.add_argument("--test", required=True)
     ap.add_argument("--budgets", default="8,16,32")
+    ap.add_argument("--rules", action="store_true",
+                    help="sweep the marginal-rate stop rules (R1-R4) against "
+                         "count-based patience at equal mean depth")
     args = ap.parse_args()
+
+    if args.rules:
+        return rules_main(args)
 
     tr = group(load(args.train))
     te = group(load(args.test))

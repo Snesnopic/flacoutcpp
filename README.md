@@ -98,7 +98,7 @@ So `-e` buys just under 1% over the default, and `-e -c 8` recovers roughly
 three quarters of that at a fortieth of `-e`'s cost. The curve flattens
 quickly at low `N`, which is dominated by fixed per-block costs rather than by
 `N` itself — `-e -c 1` is not much faster than `-e -c 8`. Note `-c 0` (the
-unlimited sweep on the heuristic's 4-window set) barely out-compresses the
+unlimited sweep on the heuristic's shortlist) barely out-compresses the
 default: the ranking finds nearly everything the sweep finds.
 
 These figures are one excerpt of one track; the trade depends on the material.
@@ -152,7 +152,7 @@ look.
 
 ### Adaptive window selection (`-a`, experimental)
 
-Estimated-DP modes normally analyse a fixed 4-window shortlist. With `-a`,
+Estimated-DP modes normally analyse a fixed shortlist. With `-a`,
 each block picks its window set from signal statistics the encoder has
 already computed (energy dispersion, transient position, spectral tilt):
 transient blocks bring in partial/punchout windows aimed at the energy peak,

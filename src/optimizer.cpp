@@ -287,13 +287,32 @@ Optimizer::Optimizer(uint32_t channels, uint32_t bps, uint32_t sample_rate,
     if (windows.empty()) {
         // Exact-DP mode (-e) affords the widest window set; the ranking pays
         // per candidate evaluated, not per window offered, so offering more
-        // windows there only adds options. The heuristic default keeps the
-        // short list because its analysis cost (windowing + autocorrelation
-        // per window) is paid on every block it touches.
+        // windows there only adds options.
+        //
+        // The heuristic shortlist carries four dense tapers plus the
+        // partial/punchout pair at each of the two offsets. The sparse half
+        // used to be left out because analysis (windowing + autocorrelation)
+        // is paid per window on every block; measured, that cost is invisible
+        // next to the budget-capped exact evaluation — 8 windows encode the
+        // 188-track master mix in 0.90 s against 0.92 s for 4 — while the
+        // compression is not: -0.113% on that corpus, -0.225% on held-out
+        // excerpts, -0.53% on the 3-minute synthetic percussion fixture, and
+        // not one fixture worse.
+        //
+        // It is specifically the *punchout* half that pays (-17989 B on the
+        // master mix alone, against -10129 B for the partials alone), and the
+        // set does not want to grow further: adding the 3-partition families
+        // on top gives back 2618 B, because at a fixed candidate budget more
+        // sparse windows crowd each other out of the ranked top-N. Widening
+        // this list is therefore not a free knob — it was worth exactly one
+        // family.
         if (full_search()) {
             m_windows = all_window_types();
         } else {
-            m_windows = {WindowType::TUKEY_050, WindowType::HANN, WindowType::WELCH, WindowType::RECTANGULAR};
+            m_windows = {WindowType::TUKEY_050, WindowType::HANN,
+                         WindowType::WELCH,    WindowType::RECTANGULAR,
+                         WindowType::PARTIAL_TUKEY_2_033,  WindowType::PARTIAL_TUKEY_2_067,
+                         WindowType::PUNCHOUT_TUKEY_2_033, WindowType::PUNCHOUT_TUKEY_2_067};
         }
     } else {
         m_windows = std::move(windows);
@@ -2721,8 +2740,9 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
 std::vector<WindowType> Optimizer::select_windows(
     uint64_t sample_start, uint32_t block_size) const
 {
-    const std::vector<WindowType> def = {WindowType::TUKEY_050, WindowType::HANN,
-                                         WindowType::WELCH, WindowType::RECTANGULAR};
+    // Falling back means "no better idea than the configured set", which is
+    // the shortlist itself — not a hardcoded copy of what it used to be.
+    const std::vector<WindowType>& def = m_windows;
     if (m_granules.empty() || m_granules[0].empty()) return def;
     const size_t g0 = (size_t)(sample_start / 16);
     const size_t g1 = std::min((size_t)((sample_start + block_size) / 16),
@@ -2810,8 +2830,11 @@ BlockParams Optimizer::compute_block(
     // (+52613 B) flipped to -4619 B once patience was raised by hand. Scaling
     // it with the pool restores that: same album -0.0712%, no track worse.
     // Ratio 1 when the set is not replaced, so this is inert without -a.
+    // Only ever widens: a specialised set can be *smaller* than the
+    // configured one, and shrinking the budget there would be a second way to
+    // lose good candidates rather than a saving.
     unsigned patience = m_patience;
-    if (!m_windows.empty() && wins.size() != m_windows.size())
+    if (!m_windows.empty() && wins.size() > m_windows.size())
         patience = (unsigned)((m_patience * wins.size() + m_windows.size() / 2)
                               / m_windows.size());
 

@@ -92,6 +92,9 @@ enum class WindowType : uint8_t {
     PARTIAL_TUKEY_3H_067,     ///< House partial Tukey, span 1/3 at 0.67. Experimental, -w only.
     PUNCHOUT_TUKEY_3H_025,    ///< House punchout Tukey, hole 0.25 at 0.25. Experimental, -w only.
     PUNCHOUT_TUKEY_3H_050,    ///< House punchout Tukey, hole 0.25 at 0.50. Experimental, -w only.
+    /// Punchout Tukey with the hole at the very start (0.00–0.33) — the
+    /// offset the standard _2 pair (0.33, 0.67) leaves uncovered.
+    PUNCHOUT_TUKEY_2_000,     ///< Punchout Tukey, hole 0.33 at 0.00. Experimental, -w only.
     // Tier 2: asymmetric windows (absent from libFLAC entirely).
     EXPDECAY_2,               ///< e^(-2·i/(N-1)) decaying exponential. Experimental, -w only.
     EXPDECAY_4,               ///< e^(-4·i/(N-1)) decaying exponential. Experimental, -w only.

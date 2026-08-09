@@ -185,6 +185,7 @@ std::string window_to_name(WindowType wt) {
         case WindowType::PARTIAL_TUKEY_3H_067:     return "partialtukey3h_067";
         case WindowType::PUNCHOUT_TUKEY_3H_025:    return "punchouttukey3h_025";
         case WindowType::PUNCHOUT_TUKEY_3H_050:    return "punchouttukey3h_050";
+        case WindowType::PUNCHOUT_TUKEY_2_000:     return "punchouttukey2_000";
         case WindowType::EXPDECAY_2:               return "expdecay2";
         case WindowType::EXPDECAY_4:               return "expdecay4";
         case WindowType::EXPATTACK_2:              return "expattack2";
@@ -236,6 +237,7 @@ WindowType window_from_name(const std::string& raw) {
     if (clean == "partialtukey2")                         return WindowType::PARTIAL_TUKEY_2_000;
     if (clean == "partialtukey2033")                      return WindowType::PARTIAL_TUKEY_2_033;
     if (clean == "partialtukey2067")                      return WindowType::PARTIAL_TUKEY_2_067;
+    if (clean == "punchouttukey2000")                     return WindowType::PUNCHOUT_TUKEY_2_000;
     if (clean == "punchouttukey2033")                     return WindowType::PUNCHOUT_TUKEY_2_033;
     if (clean == "punchouttukey2067")                     return WindowType::PUNCHOUT_TUKEY_2_067;
     if (clean == "lanczos")                               return WindowType::LANCZOS;
@@ -607,13 +609,15 @@ static void compute_window_coeffs(WindowType wt, uint32_t N, double* out)
             break;
         }
 
+        case WindowType::PUNCHOUT_TUKEY_2_000:
         case WindowType::PUNCHOUT_TUKEY_2_033:
         case WindowType::PUNCHOUT_TUKEY_2_067:
         case WindowType::PUNCHOUT_TUKEY_3H_025:
         case WindowType::PUNCHOUT_TUKEY_3H_050: {
             // Punchout Tukey: full window with a "hole" punched out. The _2
             // set punches 0.33; the experimental house _3H set 0.25 (-w only).
-            double start = (wt == WindowType::PUNCHOUT_TUKEY_2_033) ? 0.33
+            double start = (wt == WindowType::PUNCHOUT_TUKEY_2_000) ? 0.00
+                         : (wt == WindowType::PUNCHOUT_TUKEY_2_033) ? 0.33
                          : (wt == WindowType::PUNCHOUT_TUKEY_2_067) ? 0.67
                          : (wt == WindowType::PUNCHOUT_TUKEY_3H_025) ? 0.25 : 0.50;
             double hole  = (wt == WindowType::PUNCHOUT_TUKEY_3H_025 ||
@@ -2737,6 +2741,12 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
 // exactly 4 windows so the analysis cost per encoded block matches the fixed
 // shortlist; only membership adapts. Thresholds are first-cut hand picks —
 // calibrate against measurement before trusting them.
+// Energy-dispersion threshold above which a block is treated as transient and
+// offered peak-aligned sparse windows. See the sweep note at the gate below.
+#ifndef FLACOUT_TRANSIENT_CV2
+#define FLACOUT_TRANSIENT_CV2 0.5
+#endif
+
 std::vector<WindowType> Optimizer::select_windows(
     uint64_t sample_start, uint32_t block_size) const
 {
@@ -2794,7 +2804,7 @@ std::vector<WindowType> Optimizer::select_windows(
         if (std::find(out.begin(), out.end(), w) == out.end()) out.push_back(w);
     };
 
-    if (cv2 > 0.5) {
+    if (cv2 > (double)FLACOUT_TRANSIENT_CV2) {
         // Transient content: offer the partial/punchout pair that isolates
         // the energy peak, plus general-purpose tapers. rect stays in the set
         // because the gate has a false-positive mode — amplitude-modulated
@@ -2803,8 +2813,11 @@ std::vector<WindowType> Optimizer::select_windows(
         // routed block therefore analyses 5 windows instead of 4; routed
         // blocks are a minority, so the extra analysis is marginal.
         // The shortlist covers peaks at 1/3 and 2/3; a peak in the first third
-        // has no matching partial in it, so that is the one worth adding.
-        if (pos < 0.33) add(WindowType::PARTIAL_TUKEY_2_000);
+        // is the offset it has nothing for, in either polarity — the partial
+        // that isolates the peak, and the punchout that excises it so the
+        // predictor can fit the calmer remainder.
+        if (pos < 0.33) { add(WindowType::PARTIAL_TUKEY_2_000);
+                          add(WindowType::PUNCHOUT_TUKEY_2_000); }
         else if (pos < 0.67) { add(WindowType::PARTIAL_TUKEY_2_033);
                                add(WindowType::PUNCHOUT_TUKEY_2_033); }
         else               { add(WindowType::PARTIAL_TUKEY_2_067);

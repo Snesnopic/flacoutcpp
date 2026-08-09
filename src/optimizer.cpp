@@ -2800,10 +2800,25 @@ BlockParams Optimizer::compute_block(
     }
     const std::vector<WindowType>& wins = *win_set;
 
+    // Patience counts *consecutive* candidates that fail to improve, so it is
+    // a budget denominated in candidates, and the candidate pool is windows x
+    // orders. Handing a block a wider window set without widening that budget
+    // spends the same scan over a bigger pool and simply pushes good dense
+    // candidates past the cut. Measured: a transient block gets ~7 windows
+    // where the configured set has 4, and at unscaled patience one album
+    // regressed +0.0217% with 9 of 17 tracks worse — the worst track alone
+    // (+52613 B) flipped to -4619 B once patience was raised by hand. Scaling
+    // it with the pool restores that: same album -0.0712%, no track worse.
+    // Ratio 1 when the set is not replaced, so this is inert without -a.
+    unsigned patience = m_patience;
+    if (!m_windows.empty() && wins.size() != m_windows.size())
+        patience = (unsigned)((m_patience * wins.size() + m_windows.size() / 2)
+                              / m_windows.size());
+
     if (m_channels == 1) {
         bp.stereo_mode  = 0;
         bp.subframes[0] = optimize_subframe(
-            &pcm_data[0][sample_start], block_size, m_bps, wins, m_max_candidates, m_patience);
+            &pcm_data[0][sample_start], block_size, m_bps, wins, m_max_candidates, patience);
     } else {
         uint32_t best_bits = std::numeric_limits<uint32_t>::max();
 
@@ -2853,9 +2868,9 @@ BlockParams Optimizer::compute_block(
         auto get_sig = [&](int sig) -> const SubframeParams& {
             if (have[sig]) return cache[sig];
             if (sig == SIG_L) {
-                cache[sig] = optimize_subframe(&pcm_data[0][sample_start], block_size, m_bps, wins, m_max_candidates, m_patience);
+                cache[sig] = optimize_subframe(&pcm_data[0][sample_start], block_size, m_bps, wins, m_max_candidates, patience);
             } else if (sig == SIG_R) {
-                cache[sig] = optimize_subframe(&pcm_data[1][sample_start], block_size, m_bps, wins, m_max_candidates, m_patience);
+                cache[sig] = optimize_subframe(&pcm_data[1][sample_start], block_size, m_bps, wins, m_max_candidates, patience);
             } else {
                 std::vector<int32_t> ch(block_size);
                 uint32_t bps_s;
@@ -2868,7 +2883,7 @@ BlockParams Optimizer::compute_block(
                         ch[k] = (pcm_data[0][sample_start + k] + pcm_data[1][sample_start + k]) >> 1;
                     bps_s = m_bps;
                 }
-                cache[sig] = optimize_subframe(ch.data(), block_size, bps_s, wins, m_max_candidates, m_patience);
+                cache[sig] = optimize_subframe(ch.data(), block_size, bps_s, wins, m_max_candidates, patience);
             }
             have[sig] = true;
             return cache[sig];

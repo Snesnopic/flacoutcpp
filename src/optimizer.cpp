@@ -772,6 +772,33 @@ static int candidate_slot(uint32_t N)
     return -1;
 }
 
+#ifdef FLACOUT_DUMP_CANDIDATES
+// Offline training/analysis sink: one row per candidate the ranked scan
+// actually evaluated, carrying the features available at ranking time and the
+// exact bit cost that was only knowable afterwards. Enabled at build time and
+// pointed at a file by FLACOUT_DUMP_PATH; compiles to nothing otherwise.
+//
+// Run it through the ranked path with a candidate limit large enough that
+// nothing is cut (-c 100000 -p 0) so every subframe dumps its whole ladder.
+#include <cstdio>
+namespace {
+struct CandidateDump {
+    std::FILE* fh = nullptr;
+    std::mutex mu;
+    std::atomic<uint64_t> subframe{0};
+    CandidateDump() {
+        const char* path = std::getenv("FLACOUT_DUMP_PATH");
+        fh = path ? std::fopen(path, "w") : stderr;
+        if (!fh) fh = stderr;
+        std::fprintf(fh, "sf\twin\tord\tbsize\tbps\tlderr0\tlderr_ord\twsq\tzf\t"
+                         "model_bps\traw_bps\tvar_raw\tscore\tcost\n");
+    }
+    ~CandidateDump() { if (fh && fh != stderr) std::fclose(fh); }
+};
+CandidateDump g_dump;
+} // namespace
+#endif
+
 // How small a window coefficient must be, relative to the window's peak, to
 // count the sample as one the window cannot see. 0.0 means "exactly zero",
 // which is what the blind-region term originally tested; see the calibration
@@ -1883,7 +1910,8 @@ SubframeParams Optimizer::optimize_subframe(
         // every precision, updating the winner. Shared by both drivers below so
         // ranked and exhaustive search cost a candidate identically; they differ
         // only in which candidates they hand it.
-        auto eval_candidate = [&](const float* lpc, int ord, WindowType wt) {
+        auto eval_candidate = [&](const float* lpc, int ord, WindowType wt) -> uint32_t {
+            uint32_t cand_best = std::numeric_limits<uint32_t>::max();
             (void)wt;
             INSTR(g_instr.order_iters.fetch_add(1, std::memory_order_relaxed));
             INSTR(g_instr.win_order_hist[ord].fetch_add(1, std::memory_order_relaxed));
@@ -1970,6 +1998,7 @@ SubframeParams Optimizer::optimize_subframe(
                 // +6: residual block header (2-bit coding method + 4-bit
                 // partition order), see estimate_subframe_cost for detail.
                 const uint32_t cost = hdr + 6u + rice;
+                if (cost < cand_best) cand_best = cost;
                 if (cost < best_lpc_cost) {
                     best_lpc_cost = cost;
                     bl_ord = ord; bl_prec = prec; bl_shift = shift;
@@ -1977,6 +2006,7 @@ SubframeParams Optimizer::optimize_subframe(
                     INSTR(instr_best_win = (int)wt);
                 }
             }
+            return cand_best;
         };
 
         // Autocorrelation + Levinson-Durbin for one window. Returns false if the
@@ -2076,7 +2106,15 @@ SubframeParams Optimizer::optimize_subframe(
             // on the 3-minute tonal fixture at eps = 1e-2 for a further
             // -558 B on the corpus. Left at 0 (exact zero) on that evidence;
             // with beta at 0.25 the exploit is worth a quarter of what it was.
-            struct Cand { double score; int wi; int ord; };
+            struct Cand {
+                double score; int wi; int ord;
+#ifdef FLACOUT_DUMP_CANDIDATES
+                // Everything the scorer saw, carried so the dump can ask
+                // offline whether a better function of these would have
+                // ranked the eventual winner higher.
+                double lderr0, lderr_ord, wsq, zf, model_bps;
+#endif
+            };
             std::vector<Cand> cands;
             cands.reserve(windows.size() * (size_t)max_order);
 // How much of the gap between the model's claim and the raw signal's cost a
@@ -2135,10 +2173,20 @@ SubframeParams Optimizer::optimize_subframe(
                         (model_bits_per_sample * (1.0 - zf)
                          + blind_bits_per_sample * zf) * (double)(bsize - ord);
                     const double coef_bits  = (double)ord * (double)(eff_bps + min_prec);
+#ifdef FLACOUT_DUMP_CANDIDATES
+                    cands.push_back({ resid_bits + coef_bits, (int)wi, ord,
+                                      lderr[0], lderr[ord], wsq, zf,
+                                      model_bits_per_sample });
+#else
                     cands.push_back({ resid_bits + coef_bits, (int)wi, ord });
+#endif
                 }
             }
 
+#ifdef FLACOUT_DUMP_CANDIDATES
+            const uint64_t dump_sf =
+                g_dump.subframe.fetch_add(1, std::memory_order_relaxed);
+#endif
             auto by_score = [](const Cand& a, const Cand& b) { return a.score < b.score; };
             size_t keep = std::min((size_t)max_candidates, cands.size());
             std::partial_sort(cands.begin(), cands.begin() + keep, cands.end(), by_score);
@@ -2166,8 +2214,22 @@ SubframeParams Optimizer::optimize_subframe(
                     const Cand& cd = cands[c];
                     uint32_t hdr_min = hdr_fixed + (uint32_t)cd.ord * (eff_bps + min_prec);
                     if (hdr_min >= best_lpc_cost) { ++since; continue; }
-                    eval_candidate(&lpc_store[cd.wi * LPC_STRIDE + (size_t)(cd.ord - 1) * 32],
-                                   cd.ord, windows[cd.wi]);
+                    uint32_t cc = eval_candidate(
+                        &lpc_store[cd.wi * LPC_STRIDE + (size_t)(cd.ord - 1) * 32],
+                        cd.ord, windows[cd.wi]);
+#ifdef FLACOUT_DUMP_CANDIDATES
+                    if (cc != std::numeric_limits<uint32_t>::max()) {
+                        std::lock_guard<std::mutex> lk(g_dump.mu);
+                        std::fprintf(g_dump.fh,
+                            "%llu\t%d\t%d\t%u\t%u\t%.10g\t%.10g\t%.10g\t%.6g\t"
+                            "%.10g\t%.10g\t%.10g\t%.10g\t%u\n",
+                            (unsigned long long)dump_sf, (int)windows[cd.wi], cd.ord,
+                            bsize, eff_bps, cd.lderr0, cd.lderr_ord, cd.wsq, cd.zf,
+                            cd.model_bps, raw_bits_per_sample, var_raw, cd.score, cc);
+                    }
+#else
+                    (void)cc;
+#endif
                     if (best_lpc_cost < prev) { prev = best_lpc_cost; since = 0; }
                     else ++since;
                 }
@@ -2180,8 +2242,22 @@ SubframeParams Optimizer::optimize_subframe(
                 const Cand& cd = cands[c];
                 uint32_t hdr_min = hdr_fixed + (uint32_t)cd.ord * (eff_bps + min_prec);
                 if (hdr_min >= best_lpc_cost) continue;
-                eval_candidate(&lpc_store[cd.wi * LPC_STRIDE + (size_t)(cd.ord - 1) * 32],
-                               cd.ord, windows[cd.wi]);
+                uint32_t cc = eval_candidate(
+                    &lpc_store[cd.wi * LPC_STRIDE + (size_t)(cd.ord - 1) * 32],
+                    cd.ord, windows[cd.wi]);
+#ifdef FLACOUT_DUMP_CANDIDATES
+                if (cc != std::numeric_limits<uint32_t>::max()) {
+                    std::lock_guard<std::mutex> lk(g_dump.mu);
+                    std::fprintf(g_dump.fh,
+                        "%llu\t%d\t%d\t%u\t%u\t%.10g\t%.10g\t%.10g\t%.6g\t"
+                        "%.10g\t%.10g\t%.10g\t%.10g\t%u\n",
+                        (unsigned long long)dump_sf, (int)windows[cd.wi], cd.ord,
+                        bsize, eff_bps, cd.lderr0, cd.lderr_ord, cd.wsq, cd.zf,
+                        cd.model_bps, raw_bits_per_sample, var_raw, cd.score, cc);
+                }
+#else
+                (void)cc;
+#endif
             }
         }
 

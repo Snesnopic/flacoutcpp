@@ -2776,6 +2776,24 @@ std::vector<WindowType> Optimizer::select_windows(
     // prices their blind region honestly — before that term existed, routing
     // under -c 8 lost (+2489 B music / +4151 B percussion); with it, it wins
     // (−104 B / −17992 B).
+    // Additive, not replacing. The selector used to substitute its own set for
+    // the shortlist, which made sense while the shortlist was four dense
+    // tapers and the sparse windows lived nowhere else. Now that the
+    // partial/punchout pair is standard, substituting *removed* more windows
+    // than it added and cost bytes outright. Start from the configured set and
+    // add only what the statistics argue for; the patience scaling in
+    // compute_block widens the candidate budget to match.
+    //
+    // Adding globally is not an option — measured, each of these costs bytes
+    // when handed to every block (partialtukey2 at offset 0 alone is +253 B on
+    // the master mix), because at a fixed budget an extra window crowds the
+    // ranked top-N everywhere to pay off somewhere. Gating is the whole point:
+    // spend the slot only where the content predicts a winner.
+    std::vector<WindowType> out = def;
+    auto add = [&out](WindowType w) {
+        if (std::find(out.begin(), out.end(), w) == out.end()) out.push_back(w);
+    };
+
     if (cv2 > 0.5) {
         // Transient content: offer the partial/punchout pair that isolates
         // the energy peak, plus general-purpose tapers. rect stays in the set
@@ -2784,21 +2802,25 @@ std::vector<WindowType> Optimizer::select_windows(
         // rect there cost +4523 B on the 3-min synthetic tonal fixture. A
         // routed block therefore analyses 5 windows instead of 4; routed
         // blocks are a minority, so the extra analysis is marginal.
-        if (pos < 0.33)
-            return {WindowType::PARTIAL_TUKEY_2_000, WindowType::TUKEY_050,
-                    WindowType::HANN, WindowType::WELCH, WindowType::RECTANGULAR};
-        if (pos < 0.67)
-            return {WindowType::PARTIAL_TUKEY_2_033, WindowType::PUNCHOUT_TUKEY_2_033,
-                    WindowType::TUKEY_050, WindowType::HANN, WindowType::RECTANGULAR};
-        return {WindowType::PARTIAL_TUKEY_2_067, WindowType::PUNCHOUT_TUKEY_2_067,
-                WindowType::TUKEY_050, WindowType::HANN, WindowType::RECTANGULAR};
+        // The shortlist covers peaks at 1/3 and 2/3; a peak in the first third
+        // has no matching partial in it, so that is the one worth adding.
+        if (pos < 0.33) add(WindowType::PARTIAL_TUKEY_2_000);
+        else if (pos < 0.67) { add(WindowType::PARTIAL_TUKEY_2_033);
+                               add(WindowType::PUNCHOUT_TUKEY_2_033); }
+        else               { add(WindowType::PARTIAL_TUKEY_2_067);
+                             add(WindowType::PUNCHOUT_TUKEY_2_067); }
+        return out;
     }
-    if (tilt > 0.95) // stationary tonal: mild tapers, keep the workhorse
-        return {WindowType::TUKEY_005, WindowType::TUKEY_010,
-                WindowType::TUKEY_050, WindowType::HANN};
-    if (tilt < 0.60) // noisy: heavy tapers, keep the workhorse
-        return {WindowType::TUKEY_050, WindowType::HANN,
-                WindowType::TUKEY_075, WindowType::TUKEY_090};
+    if (tilt > 0.95) { // stationary tonal: barely-tapered windows do best
+        add(WindowType::TUKEY_005);
+        add(WindowType::TUKEY_010);
+        return out;
+    }
+    if (tilt < 0.60) { // noisy: heavy tapers
+        add(WindowType::TUKEY_075);
+        add(WindowType::TUKEY_090);
+        return out;
+    }
     return def;
 }
 

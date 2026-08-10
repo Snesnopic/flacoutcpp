@@ -26,9 +26,14 @@ endif()
 # binaries that may not run on other machines, so it is off by default.
 option(FLACOUT_NATIVE "Optimize for the build host's CPU (not portable)" OFF)
 
-set(WITH_OGG OFF CACHE BOOL "Disable Ogg support in vendored FLAC" FORCE)
-set(INSTALL_MANPAGES OFF CACHE BOOL "Don't build FLAC manpages" FORCE)
-add_subdirectory(third_party/libflac EXCLUDE_FROM_ALL)
+# Skip vendoring our own copy if a FLAC target already exists — e.g. when
+# flacoutcpp is add_subdirectory'd into a parent project that already
+# provides one (its own libflac submodule), so the two don't collide.
+if(NOT TARGET FLAC)
+    set(WITH_OGG OFF CACHE BOOL "Disable Ogg support in vendored FLAC" FORCE)
+    set(INSTALL_MANPAGES OFF CACHE BOOL "Don't build FLAC manpages" FORCE)
+    add_subdirectory(third_party/libflac EXCLUDE_FROM_ALL)
+endif()
 
 include_directories(
     include

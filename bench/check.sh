@@ -74,6 +74,11 @@ run ef_stereo -R -E 3 "$FIX/stereo_1s.flac"
 # The documented exact-DP recipe: -E under -e, where the level's -a is dropped
 # and only its -c/-L survive. Pins that interaction, not just the mapping.
 run ef_ex     -R -e -E 0 "$FIX/stereo_1s.flac"
+# Exact-DP effort levels (10-12). These pin two things at once: that the level
+# selects exact DP itself, and that at a finite -c it uses the shortlist rather
+# than all 26 windows (the gate in Optimizer::Optimizer).
+run ef_x10    -R -E 10 "$FIX/stereo_1s.flac"
+run ef_x12    -R -E 12 "$FIX/mono_2s.flac"
 # Runtime-loaded window (-w custom:<file>): pins the knot parser and the
 # interpolation onto both table and non-table block sizes. The knot file is
 # committed next to this script, so these are reproducible anywhere.

@@ -29,18 +29,22 @@ static void print_usage(const char* prog) {
         << "                       still improving; stop after N consecutive that\n"
         << "                       are not. Makes -c a floor, not a ceiling.\n"
         << "                       Default: 2x -c. 0 disables it (plain top-N cut).\n"
-        << "  -E, --effort N       Effort 0-9: one dial along the measured\n"
-        << "                       size/time frontier, setting -c, -L and -a\n"
-        << "                       together (they are not independent —\n"
-        << "                       which mix is efficient shifts with the\n"
-        << "                       budget). 0 fastest, 9 = every candidate and\n"
-        << "                       every rung. Level 3 is the default. Against\n"
-        << "                       it, on a 188-track mix: 0 is +0.15% at 0.8x\n"
-        << "                       the time, 6 is -0.03% at 1.5x, 9 is -0.05% at\n"
-        << "                       5.7x. An explicit -c/-p/-L/-a wins; the\n"
-        << "                       level's -a yields to -e/-w rather than\n"
-        << "                       erroring. The dial tunes the search *within*\n"
-        << "                       a mode; it is not a substitute for -e.\n"
+        << "  -E, --effort N       Effort 0-12: one dial along the measured\n"
+        << "                       size/time frontier, setting -c, -L, -a and\n"
+        << "                       — from level 10 — exact DP, together (they\n"
+        << "                       are not independent; which mix is efficient\n"
+        << "                       shifts with the budget). 0 fastest, 9 = every\n"
+        << "                       candidate and every rung under estimated DP,\n"
+        << "                       10-12 = exact DP at increasing depth. Level 3\n"
+        << "                       is the default. Against it, on a 188-track\n"
+        << "                       mix: 0 is +0.15% at 0.8x the time, 6 is\n"
+        << "                       -0.03% at 1.5x, 9 is -0.05% at 5.7x, 10 is\n"
+        << "                       -0.52% at 7.7x, 12 is -0.61% at 24x. Level 10\n"
+        << "                       is the value corner — ten times level 9's\n"
+        << "                       compression for 20% more time — because exact\n"
+        << "                       pricing is worth far more than search depth.\n"
+        << "                       An explicit -c/-p/-L/-a wins; the level's -a\n"
+        << "                       yields to -e/-w rather than erroring.\n"
         << "  -L, --rungs N        Encode only the N most promising of the 8 LPC\n"
         << "                       coefficient precisions per candidate, chosen by\n"
         << "                       an analytic model of the quantization error\n"
@@ -85,7 +89,8 @@ static void print_usage(const char* prog) {
         << "  -q, --quiet          Suppress all progress output\n"
         << "  -t, --threads N      Limit parallel worker threads (default: all CPUs)\n"
         << "  -w, --windows <list> Comma-separated list of apodization windows to use\n"
-        << "                       (default: all 26 with -e, else tukey005,tukey020,\n"
+        << "                       (default: all 26 with a bare -e, else\n"
+        << "                       tukey005,tukey020,\n"
         << "                       tukey050,hann,welch,rect and the partial/punchout\n"
         << "                       tukey pair at .33/.67)\n"
         << "                       An entry of the form custom:<file> loads a window\n"
@@ -187,7 +192,7 @@ int main(int argc, char* argv[]) {
                 if (argv[i][0] == '-') throw std::invalid_argument("negative");
                 effort = static_cast<int>(std::stoul(argv[i]));
             } catch (const std::exception&) {
-                std::cerr << "Error: -E requires an effort level 0-9, got '" << argv[i] << "'.\n";
+                std::cerr << "Error: -E requires an effort level 0-12, got '" << argv[i] << "'.\n";
                 return EXIT_FAILURE;
             }
 
@@ -353,7 +358,7 @@ int main(int argc, char* argv[]) {
     // Effort first, then whatever was named explicitly — so `-E 7 -L 0` means
     // "level 7's depth, but price the whole ladder".
     if (effort >= 0 && !flacoutcpp::apply_effort(cfg, effort)) {
-        std::cerr << "Error: -E takes an effort level 0-9, got " << effort << ".\n";
+        std::cerr << "Error: -E takes an effort level 0-12, got " << effort << ".\n";
         return EXIT_FAILURE;
     }
     if (candidates_given)  cfg.max_candidates  = given_candidates;

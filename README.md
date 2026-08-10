@@ -70,6 +70,11 @@ Options:
                        -c and -L are not independent —
                        prefer -E, which pairs them along the measured
                        frontier, unless you know which pair you want.
+  -Q, --lattice N      Refine the winning subframe's quantized LPC
+                       coefficients by coordinate descent: try each
+                       tap at +-1, keep what lowers the exact cost,
+                       up to N sweeps (0 = off, the default).
+                       Experimental. Never grows a subframe.
   -b, --blocks <list>  Comma-separated block sizes the DP may choose
                        from (default: 1024,2048,4096,8192,16384).
                        Each must be a multiple of 16 in [16, 65520],

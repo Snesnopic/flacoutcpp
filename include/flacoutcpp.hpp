@@ -180,6 +180,26 @@ struct Config {
     unsigned precision_rungs = 1;
 
     /**
+     * @brief Coefficient-lattice refinement sweeps (`-Q`, experimental).
+     *
+     * The search quantizes LPC coefficients by one fixed rule — round the
+     * Levinson solution with error feedback — and never revisits the integer
+     * vector it lands on. That rule minimizes the quantization error's
+     * quadratic form, not the Rice cost actually being paid, so a neighbouring
+     * lattice point can be cheaper.
+     *
+     * When non-zero, the winning candidate of each subframe is refined by
+     * coordinate descent: each tap is tried at +-1 and any perturbation that
+     * strictly lowers the exact cost is adopted, repeating until a full sweep
+     * finds nothing or this many sweeps have run. It can only shrink a
+     * subframe, never grow one.
+     *
+     * @c 0 (default) disables it, which is bit-exact with the pre-existing
+     * behaviour. Costs 2 x order residual+Rice passes per sweep per subframe.
+     */
+    unsigned lattice_sweeps = 0;
+
+    /**
      * @brief Effort level 0-9: one dial across the measured size/time frontier.
      *
      * @ref max_candidates and @ref precision_rungs are not independent — they

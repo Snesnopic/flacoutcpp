@@ -44,6 +44,8 @@ struct InstrCounters {
     std::atomic<uint64_t> rice_chunk_slow{0};  // OR proved it could wrap; redone in 64-bit
     std::atomic<uint64_t> autoc_macs{0};
     std::atomic<uint64_t> window_samples{0};
+    std::atomic<uint64_t> lattice_evals{0};     // -Q: +-1 perturbations costed
+    std::atomic<uint64_t> lattice_accepts{0};   // of which: adopted (cost dropped)
     std::atomic<uint64_t> win_order_hist[33]{};
     std::atomic<uint64_t> best_order_hist[33]{};
     std::atomic<uint64_t> best_prec_hist[16]{};
@@ -62,6 +64,11 @@ struct InstrCounters {
         std::fprintf(stderr, "residual loops run      : %llu   (delta updates: %llu)\n",
                      (unsigned long long)residual_calls, (unsigned long long)residual_delta);
         std::fprintf(stderr, "residual MACs           : %llu\n", (unsigned long long)residual_macs);
+        {
+            unsigned long long ev = lattice_evals, ac = lattice_accepts;
+            std::fprintf(stderr, "lattice evals/accepts   : %llu / %llu (%.4f%% adopted)\n",
+                         ev, ac, ev ? 100.0 * (double)ac / (double)ev : 0.0);
+        }
         std::fprintf(stderr, "rice calls              : %llu\n", (unsigned long long)rice_calls);
         std::fprintf(stderr, "rice residuals scanned  : %llu\n", (unsigned long long)rice_scan_samples);
         std::fprintf(stderr, "rice (u>>k) ops         : %llu\n", (unsigned long long)rice_k_ops);
@@ -301,12 +308,13 @@ Optimizer::Optimizer(uint32_t channels, uint32_t bps, uint32_t sample_rate,
                      bool adaptive_windows,
                      unsigned patience,
                      unsigned precision_rungs,
-                     std::vector<uint32_t> dp_candidates)
+                     std::vector<uint32_t> dp_candidates,
+                     unsigned lattice_sweeps)
     : m_channels(channels), m_bps(bps), m_sample_rate(sample_rate),
       m_max_threads(max_threads),
       m_exhaustive(exhaustive), m_verbose(verbose), m_max_candidates(max_candidates),
       m_adaptive(adaptive_windows), m_patience(patience),
-      m_precision_rungs(precision_rungs)
+      m_precision_rungs(precision_rungs), m_lattice_sweeps(lattice_sweeps)
 {
     // Block-size ladder. Empty means the built-in one, whose coefficient
     // tables are precomputed; any other size falls back to computing window
@@ -912,6 +920,27 @@ struct CandidateDump {
     ~CandidateDump() { if (fh && fh != stderr) std::fclose(fh); }
 };
 CandidateDump g_dump;
+} // namespace
+#endif
+
+#ifdef FLACOUT_DUMP_LATTICE
+// Sink for the coefficient-lattice refinement (-Q): one row per +-1
+// perturbation costed, carrying the signed cost delta against the rounded
+// point the quantizer chose. Answers whether that point is an axis-local
+// minimum of the *exact* cost, and if not, by how much it misses.
+namespace {
+struct LatticeDump {
+    std::FILE* fh = nullptr;
+    std::mutex mu;
+    LatticeDump() {
+        const char* path = std::getenv("FLACOUT_LATTICE_DUMP_PATH");
+        fh = path ? std::fopen(path, "w") : stderr;
+        if (!fh) fh = stderr;
+        std::fprintf(fh, "bsize\tord\tprec\ttap\tdelta\tdcost\n");
+    }
+    ~LatticeDump() { if (fh && fh != stderr) std::fclose(fh); }
+};
+LatticeDump g_ldump;
 } // namespace
 #endif
 
@@ -1972,7 +2001,8 @@ uint32_t Optimizer::estimate_subframe_cost(
 SubframeParams Optimizer::optimize_subframe(
     const int32_t* samples, uint32_t bsize, uint32_t bps,
     const std::vector<WindowType>& windows,
-    unsigned max_candidates, unsigned patience, unsigned precision_rungs)
+    unsigned max_candidates, unsigned patience, unsigned precision_rungs,
+    unsigned lattice_sweeps)
 {
     SubframeParams best{};
     best.bits_cost = std::numeric_limits<uint32_t>::max();
@@ -2579,6 +2609,79 @@ SubframeParams Optimizer::optimize_subframe(
             }
         }
 
+        // ---- Coefficient-lattice refinement (-Q) ----
+        // Every candidate above got its integer coefficients from one fixed
+        // rule: round the Levinson solution with error feedback. That rule
+        // minimizes the quantization error's quadratic form d'Rd, which is not
+        // the cost we are actually paying — Rice bits are a step function of
+        // the residual magnitudes, so the cheapest lattice point near the
+        // real-valued optimum need not be the rounded one. Nothing in the
+        // search ever revisits it.
+        //
+        // Coordinate descent fixes that for the winner: try each tap at +-1,
+        // keep any perturbation that lowers the *exact* cost, sweep until a
+        // full pass finds nothing. FFmpeg's multi_dim_quant (flacenc.c) does
+        // the same search by enumerating all 3^order corners with at most 8
+        // taps differing, which is exponential and therefore unusable above
+        // order ~12 — it is off by default there. A coordinate sweep is
+        // 2*order evaluations and finds the same axis-local minimum.
+        //
+        // This runs once per subframe on the winner alone, so it does not
+        // multiply the search: 2*order*sweeps residual+Rice passes against the
+        // thousands the ranked scan already ran. It cannot lose bits — a
+        // perturbation is adopted only when the exact cost strictly drops.
+        if (lattice_sweeps > 0 && bl_ord > 0) {
+            const uint32_t hdr =
+                hdr_fixed + (uint32_t)bl_ord * (eff_bps + (uint32_t)bl_prec);
+            const int32_t qmax = (1 << (bl_prec - 1)) - 1;
+            const int32_t qmin = -(1 << (bl_prec - 1));
+            int32_t try_qc[32];
+            std::memcpy(try_qc, bl_qc, (size_t)bl_ord * sizeof(int32_t));
+
+            for (unsigned sweep = 0; sweep < lattice_sweeps; ++sweep) {
+                bool improved = false;
+                for (int j = 0; j < bl_ord; ++j) {
+                    const int32_t base = try_qc[j];
+                    bool accepted = false;
+                    for (int delta = -1; delta <= 1; delta += 2) {
+                        const int64_t v = (int64_t)base + delta;
+                        if (v < qmin || v > qmax) continue;
+                        try_qc[j] = (int32_t)v;
+                        INSTR(g_instr.lattice_evals.fetch_add(1, std::memory_order_relaxed));
+                        compute_lpc_residuals(shifted.data(), bsize, try_qc,
+                                              bl_ord, bl_shift, residuals.data());
+                        const uint32_t cost =
+                            hdr + 6u + calculate_rice_cost(residuals.data(), bsize,
+                                                           (uint32_t)bl_ord, nullptr);
+#ifdef FLACOUT_DUMP_LATTICE
+                        // Signed cost delta per perturbation. Reading the
+                        // *distribution* is the point: all-positive says the
+                        // rounded point really is an axis-local minimum, while
+                        // a large constant offset would mean the cost
+                        // expression here disagrees with the search's.
+                        {
+                            std::lock_guard<std::mutex> lk(g_ldump.mu);
+                            std::fprintf(g_ldump.fh, "%u\t%d\t%d\t%d\t%d\t%lld\n",
+                                         bsize, bl_ord, bl_prec, j, delta,
+                                         (long long)cost - (long long)best_lpc_cost);
+                        }
+#endif
+                        if (cost < best_lpc_cost) {
+                            best_lpc_cost = cost;
+                            std::memcpy(bl_qc, try_qc,
+                                        (size_t)bl_ord * sizeof(int32_t));
+                            INSTR(g_instr.lattice_accepts.fetch_add(1, std::memory_order_relaxed));
+                            accepted = true;
+                            break; // this tap moved; go on to the next one
+                        }
+                    }
+                    if (!accepted) try_qc[j] = base;
+                    improved |= accepted;
+                }
+                if (!improved) break; // a clean sweep: this is an axis-local min
+            }
+        }
+
         // Materialize the winning LPC candidate, if it beat the non-LPC modes.
         // Re-deriving its residuals costs one more pass out of the millions the
         // search just ran, and in exchange every candidate above skipped the
@@ -2685,7 +2788,7 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
         if (m_channels == 1) {
             bp.stereo_mode  = 0;
             bp.subframes[0] = optimize_subframe(pcm_data[0].data(),
-                                                (uint32_t)total_samples, m_bps, m_windows, m_max_candidates, m_patience, m_precision_rungs);
+                                                (uint32_t)total_samples, m_bps, m_windows, m_max_candidates, m_patience, m_precision_rungs, m_lattice_sweeps);
         } else {
             uint32_t best_bits = std::numeric_limits<uint32_t>::max();
             for (int mode : {0, 8, 9, 10}) {
@@ -2700,8 +2803,8 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
                 // mode 9 = right+side: ch0 is side (needs +1 bit), ch1 is right
                 uint32_t bps0 = (mode == 9) ? m_bps + 1 : m_bps;
                 uint32_t bps1 = (mode == 9) ? m_bps     : (mode == 0 ? m_bps : m_bps + 1);
-                SubframeParams s0 = optimize_subframe(ch0.data(), (uint32_t)total_samples, bps0, m_windows, m_max_candidates, m_patience, m_precision_rungs);
-                SubframeParams s1 = optimize_subframe(ch1.data(), (uint32_t)total_samples, bps1, m_windows, m_max_candidates, m_patience, m_precision_rungs);
+                SubframeParams s0 = optimize_subframe(ch0.data(), (uint32_t)total_samples, bps0, m_windows, m_max_candidates, m_patience, m_precision_rungs, m_lattice_sweeps);
+                SubframeParams s1 = optimize_subframe(ch1.data(), (uint32_t)total_samples, bps1, m_windows, m_max_candidates, m_patience, m_precision_rungs, m_lattice_sweeps);
                 if (s0.bits_cost + s1.bits_cost < best_bits) {
                     best_bits = s0.bits_cost + s1.bits_cost;
                     bp.stereo_mode  = mode;
@@ -3351,7 +3454,7 @@ BlockParams Optimizer::compute_block(
     if (m_channels == 1) {
         bp.stereo_mode  = 0;
         bp.subframes[0] = optimize_subframe(
-            &pcm_data[0][sample_start], block_size, m_bps, wins, m_max_candidates, patience, m_precision_rungs);
+            &pcm_data[0][sample_start], block_size, m_bps, wins, m_max_candidates, patience, m_precision_rungs, m_lattice_sweeps);
     } else {
         uint32_t best_bits = std::numeric_limits<uint32_t>::max();
 
@@ -3401,9 +3504,9 @@ BlockParams Optimizer::compute_block(
         auto get_sig = [&](int sig) -> const SubframeParams& {
             if (have[sig]) return cache[sig];
             if (sig == SIG_L) {
-                cache[sig] = optimize_subframe(&pcm_data[0][sample_start], block_size, m_bps, wins, m_max_candidates, patience, m_precision_rungs);
+                cache[sig] = optimize_subframe(&pcm_data[0][sample_start], block_size, m_bps, wins, m_max_candidates, patience, m_precision_rungs, m_lattice_sweeps);
             } else if (sig == SIG_R) {
-                cache[sig] = optimize_subframe(&pcm_data[1][sample_start], block_size, m_bps, wins, m_max_candidates, patience, m_precision_rungs);
+                cache[sig] = optimize_subframe(&pcm_data[1][sample_start], block_size, m_bps, wins, m_max_candidates, patience, m_precision_rungs, m_lattice_sweeps);
             } else {
                 std::vector<int32_t> ch(block_size);
                 uint32_t bps_s;
@@ -3416,7 +3519,7 @@ BlockParams Optimizer::compute_block(
                         ch[k] = (pcm_data[0][sample_start + k] + pcm_data[1][sample_start + k]) >> 1;
                     bps_s = m_bps;
                 }
-                cache[sig] = optimize_subframe(ch.data(), block_size, bps_s, wins, m_max_candidates, patience, m_precision_rungs);
+                cache[sig] = optimize_subframe(ch.data(), block_size, bps_s, wins, m_max_candidates, patience, m_precision_rungs, m_lattice_sweeps);
             }
             have[sig] = true;
             return cache[sig];

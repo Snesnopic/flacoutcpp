@@ -75,6 +75,12 @@ struct ProcessorConfig {
     unsigned precision_rungs = 0;
 
     /**
+     * @brief Coefficient-lattice refinement sweeps; 0 = off.
+     * See flacoutcpp::Config::lattice_sweeps.
+     */
+    unsigned lattice_sweeps = 0;
+
+    /**
      * @brief Adaptive per-subframe window selection (experimental,
      * estimated-DP modes only). See flacoutcpp::Config::adaptive_windows.
      */

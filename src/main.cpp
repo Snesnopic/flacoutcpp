@@ -57,6 +57,11 @@ static void print_usage(const char* prog) {
         << "                       -c and -L are not independent —\n"
         << "                       prefer -E, which pairs them along the measured\n"
         << "                       frontier, unless you know which pair you want.\n"
+        << "  -Q, --lattice N      Refine the winning subframe's quantized LPC\n"
+        << "                       coefficients by coordinate descent: try each\n"
+        << "                       tap at +-1, keep what lowers the exact cost,\n"
+        << "                       up to N sweeps (0 = off, the default).\n"
+        << "                       Experimental. Never grows a subframe.\n"
         << "  -b, --blocks <list>  Comma-separated block sizes the DP may choose\n"
         << "                       from (default: 1024,2048,4096,8192,16384).\n"
         << "                       Each must be a multiple of 16 in [16, 65520],\n"
@@ -209,6 +214,20 @@ int main(int argc, char* argv[]) {
                 rungs_given = true;
             } catch (const std::exception&) {
                 std::cerr << "Error: -L requires a non-negative integer, got '" << argv[i] << "'.\n";
+                return EXIT_FAILURE;
+            }
+
+        } else if (arg == "-Q" || arg == "--lattice") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: -Q requires a number.\n";
+                return EXIT_FAILURE;
+            }
+            ++i;
+            try {
+                if (argv[i][0] == '-') throw std::invalid_argument("negative");
+                cfg.lattice_sweeps = static_cast<unsigned>(std::stoul(argv[i]));
+            } catch (const std::exception&) {
+                std::cerr << "Error: -Q requires a non-negative integer, got '" << argv[i] << "'.\n";
                 return EXIT_FAILURE;
             }
 

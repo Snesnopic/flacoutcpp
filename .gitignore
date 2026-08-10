@@ -11,3 +11,8 @@ bench/fixtures/
 bench/reference/
 bench/.current/
 albums/
+
+# Reference encoders cloned for comparison. These are separate git repos, so
+# an unguarded `git add -A` commits them as bare gitlinks with no submodule
+# config — which it did once.
+ref/

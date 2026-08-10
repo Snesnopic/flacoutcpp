@@ -110,6 +110,69 @@ uint8_t FrameWriter::encode_bps(uint32_t bps) {
     }
 }
 
+std::vector<uint8_t> FrameWriter::rewrite_frame(
+    const uint8_t* in, size_t len,
+    uint64_t sample_number, uint32_t block_size, uint32_t sample_rate)
+{
+    // Parse just enough of the input header to find the payload. Layout:
+    // sync(14) res(1) blocking(1) | bs code(4) sr code(4) | ch(4) bps(3)
+    // res(1) | UTF-8 number (1-7 B) | bs extra (0-2 B) | sr extra (0-2 B) |
+    // CRC-8. Subframes follow byte-aligned; the last 2 bytes are CRC-16.
+    // The sync code is 14 bits (0b11111111111110), so in[1]'s top *six* bits
+    // are part of it — mask 0xFC, not 0xF8, which would leave the sync's last
+    // bit unchecked and accept 0b111111xx. Unreachable today (callers pass
+    // ranges libFLAC's own decode-position tracking identified as frames), but
+    // this is the guard that decides whether the fallback-to-{} path fires.
+    if (len < 8 || in[0] != 0xFF || (in[1] & 0xFCu) != 0xF8u)
+        return {};
+    const uint8_t bs_code_in = (uint8_t)(in[2] >> 4);
+    const uint8_t sr_code_in = (uint8_t)(in[2] & 0x0F);
+
+    size_t utf8_bytes = 0;
+    const uint8_t lead = in[4];
+    if      ((lead & 0x80u) == 0x00u) utf8_bytes = 1;
+    else if ((lead & 0xE0u) == 0xC0u) utf8_bytes = 2;
+    else if ((lead & 0xF0u) == 0xE0u) utf8_bytes = 3;
+    else if ((lead & 0xF8u) == 0xF0u) utf8_bytes = 4;
+    else if ((lead & 0xFCu) == 0xF8u) utf8_bytes = 5;
+    else if ((lead & 0xFEu) == 0xFCu) utf8_bytes = 6;
+    else if (lead == 0xFEu)           utf8_bytes = 7;
+    else return {};
+
+    size_t bs_extra_in = (bs_code_in == 0x6) ? 1 : (bs_code_in == 0x7) ? 2 : 0;
+    size_t sr_extra_in = (sr_code_in == 0xC) ? 1
+                       : (sr_code_in == 0xD || sr_code_in == 0xE) ? 2 : 0;
+    const size_t hdr_len = 4 + utf8_bytes + bs_extra_in + sr_extra_in + 1;
+    if (len < hdr_len + 2) return {};
+    const uint8_t* payload     = in + hdr_len;
+    const size_t   payload_len = len - hdr_len - 2; // strip input CRC-16
+
+    BitWriter bw;
+    bw.write_bits(0x3FFE, 14);
+    bw.write_bits(0, 1);
+    bw.write_bits(1, 1);  // variable blocking strategy, like write_frame
+
+    uint32_t bs_extra_val = 0; int bs_extra_bits = 0;
+    bw.write_bits(blocksize_code(block_size, bs_extra_val, bs_extra_bits), 4);
+    uint32_t sr_extra_val = 0; int sr_extra_bits = 0;
+    bw.write_bits(samplerate_code(sample_rate, sr_extra_val, sr_extra_bits), 4);
+
+    bw.write_bits(in[3], 8);  // channel assignment + bps + reserved, verbatim
+
+    bw.write_utf8(sample_number);
+    if (bs_extra_bits > 0) bw.write_bits(bs_extra_val, bs_extra_bits);
+    if (sr_extra_bits > 0) bw.write_bits(sr_extra_val, sr_extra_bits);
+    bw.write_bits(bw.crc8(0, bw.byte_size()), 8);
+
+    for (size_t i = 0; i < payload_len; ++i)
+        bw.write_bits(payload[i], 8);
+
+    uint16_t crc16 = bw.crc16(0, bw.byte_size());
+    bw.write_bits(crc16 >> 8,   8);
+    bw.write_bits(crc16 & 0xFF, 8);
+    return bw.buffer();
+}
+
 // ============================================================
 // Main frame serialization
 // ============================================================
@@ -330,7 +393,13 @@ void FrameWriter::write_residual(
     uint32_t              bsize,
     int                   order)
 {
-    bw.write_bits(0, 2); // coding method = PARTITIONED_RICE (method 0)
+    // Coding method 0 = PARTITIONED_RICE (4-bit parameters, k ≤ 14),
+    // 1 = PARTITIONED_RICE2 (5-bit parameters, k ≤ 30) — the optimizer picks
+    // per subframe; RICE2 pays one extra bit per partition and only wins when
+    // residuals want k > 14 (high-bps content).
+    const int  plen = sp.rice_method ? 5 : 4;
+    const int  esc  = sp.rice_method ? 31 : 15;
+    bw.write_bits((uint64_t)sp.rice_method, 2);
     bw.write_bits((uint64_t)sp.rice_partition_order, 4);
 
     uint32_t num_parts = 1u << sp.rice_partition_order;
@@ -338,23 +407,24 @@ void FrameWriter::write_residual(
 
     for (uint32_t p = 0; p < num_parts; ++p) {
         int      raw_k = sp.rice_k[p];
+        int      k     = raw_k & 0xFF;
         uint32_t start = p * p_size;
         uint32_t end   = start + p_size;
         uint32_t first = std::max(start, (uint32_t)order); // skip warm-up in partition 0
 
-        if (raw_k < 15) {
+        if (k < esc) {
             // Normal Rice coding
-            bw.write_bits((uint64_t)raw_k, 4);
+            bw.write_bits((uint64_t)k, plen);
             for (uint32_t i = first; i < end; ++i)
-                bw.write_rice_sample(residuals[i], raw_k);
+                bw.write_rice_sample(residuals[i], k);
         } else {
-            // Escape code (k = 15): verbatim residuals.
+            // Escape code: verbatim residuals.
             // The escape_bps is stored in the upper bits of raw_k (see optimizer.cpp).
             int escape_bps = raw_k >> 8;
             if (escape_bps < 1)  escape_bps = 1;
             if (escape_bps > 31) escape_bps = 31; // 5-bit bps field holds 0..31
-            bw.write_bits(15u, 4);          // 4-bit escape marker
-            bw.write_bits((uint64_t)escape_bps, 5); // 5-bit bits-per-sample
+            bw.write_bits((uint64_t)esc, plen);      // escape marker
+            bw.write_bits((uint64_t)escape_bps, 5);  // 5-bit bits-per-sample
             for (uint32_t i = first; i < end; ++i)
                 bw.write_signed_bits(residuals[i], escape_bps);
         }

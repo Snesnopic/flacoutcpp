@@ -1,0 +1,47 @@
+# Learned window shape — found by bench/window_search.py, not hand-designed.
+#
+# Supersedes a pre-retune shape of the same family. That one was searched
+# against a scorer whose blind-region penalty was 4x too strong (fixed in
+# 60506d5), and about a quarter of its apparent value was an exploit of it:
+# knots just above zero dodged an equality test. Re-searched afterwards, this
+# shape carries no such trick — snapping its sub-1e-2 knots to exact zero
+# changes the result by 35 bytes, where the old shape lost 1257.
+#
+# Search: CMA-ES, 9 knots, 250 evaluations, objective = total encoded bytes
+# with this shape offered as a 5th window alongside the default set
+# (tukey050,hann,welch,rect) under the plain default search (-n -R -c 8).
+# Trained on 8 six-second excerpts from C418 / Jake Kaufman / MDK; validated
+# on 7 from a disjoint set of artists (Hiatus, Baron von Arrow, Horcrux, Big
+# Giant Circles).
+#
+# As a 5th window, bytes saved vs the 4-window default:
+#   held-out excerpts (unseen artists)   -0.165%
+#   master_1s_mix (188 tracks)           -0.081%
+#   punchouttukey2_033 in the same slot  -0.077%
+#
+# Read that last line before reaching for this file. Once the scorer was
+# fixed, a compiled-in window gets within 6% of a shape searched specifically
+# to beat it, which says the gap was mostly a scorer defect rather than a
+# missing shape. -a adaptive mode reaches -0.083% on the same corpus by
+# routing to punchout windows per block, without any custom window at all.
+#
+# Two lobes with a near-silent middle: it reads the first eighth and a narrow
+# band near the end. Not promoted into any default set.
+#
+# 2026-08-09: read every number above as relative to the FOUR-window baseline
+# it was searched against. That is no longer the default set, and the gap has
+# almost entirely closed: measured as an extra window on top of the shipping
+# shortlist this shape is worth -0.0008% at -c 8 and -0.0130% at the default,
+# not -0.081%. The reason is the one the note above already suspected — its
+# value is multi-lobe support, which the partial/punchout pair now supplies.
+# Kept as the provenance record for bench/window_search.py, not as a window
+# worth loading.
+5.434008196990581e-06
+0.99551918517633309
+0.89518760756923699
+0.027884335882718266
+0.0021734000338403544
+0.060755831351654695
+0.023289170410998219
+1
+0.021406450461664884

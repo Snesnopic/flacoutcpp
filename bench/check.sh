@@ -33,24 +33,58 @@ rm -rf "$OUT"; mkdir -p "$OUT"
 run() { local name=$1; shift
   "$BIN" -q "$@" "$OUT/$name.flac" || { echo "FAIL: encoder returned nonzero for $name" >&2; exit 1; }
 }
-run ex_stereo -e "$FIX/stereo_1s.flac"
-run ex_mono   -e "$FIX/mono_2s.flac"
-run ex_24     -e "$FIX/s24_2s.flac"
-run ex_short  -e "$FIX/short.flac"
-run ex_win    -e -w hann,tukey020,punchouttukey2_067 "$FIX/stereo_1s.flac"
-run he_stereo    "$FIX/stereo_4s.flac"
-run he_mono      "$FIX/mono_2s.flac"
-run he_24        "$FIX/s24_2s.flac"
-run he_short     "$FIX/short.flac"
-# Ranked search (-c). Its output is a deliberate compression/speed trade, so it
-# is not comparable to -e — but it must still be stable and decode losslessly.
-# A reference for these can only be recorded from the commit that introduced
-# ranked search or later; older builds reject the flag and `record` will fail.
-run rk_stereo -c 8 "$FIX/stereo_1s.flac"
-run rk_mono   -c 4 "$FIX/mono_2s.flac"
-run rk_24     -c 8 "$FIX/s24_2s.flac"
-run rk_short  -c 8 "$FIX/short.flac"
-run rk_win    -c 2 -w hann,tukey020 "$FIX/stereo_1s.flac"
+# All search-path cases pass -R: they pin the *search*, and letting the
+# input's own frames compete would splice ffmpeg-encoded frames into the
+# reference. The ru_* cases below cover the reuse path itself.
+run ex_stereo -R -e "$FIX/stereo_1s.flac"
+run ex_mono   -R -e "$FIX/mono_2s.flac"
+run ex_24     -R -e "$FIX/s24_2s.flac"
+run ex_short  -R -e "$FIX/short.flac"
+run ex_win    -R -e -w hann,tukey020,punchouttukey2_067 "$FIX/stereo_1s.flac"
+run he_stereo -R    "$FIX/stereo_4s.flac"
+run he_mono   -R    "$FIX/mono_2s.flac"
+run he_24     -R    "$FIX/s24_2s.flac"
+run he_short  -R    "$FIX/short.flac"
+# Ranked exact search (-e -c N; plain -c N before the flags composed). Its
+# output is a deliberate compression/speed trade, so it is not comparable to
+# bare -e — but it must still be stable and decode losslessly. A reference for
+# these can only be recorded from the commit that introduced ranked search or
+# later; older builds reject the flag and `record` will fail.
+run rk_stereo -R -e -c 8 "$FIX/stereo_1s.flac"
+run rk_mono   -R -e -c 4 "$FIX/mono_2s.flac"
+run rk_24     -R -e -c 8 "$FIX/s24_2s.flac"
+run rk_short  -R -e -c 8 "$FIX/short.flac"
+run rk_win    -R -e -c 2 -w hann,tukey020 "$FIX/stereo_1s.flac"
+# Analytic precision ladder (-L N). Off by default, so the cases above already
+# pin the full-ladder path; these pin the model that picks the rungs. Retuning
+# it is expected to move them — re-record after confirming the size delta went
+# the intended way, as with rk_*.
+#
+# -L 1, not the recommended -L 2, on purpose: at -L 2 the model agrees with the
+# full ladder on every synthetic fixture here (byte-identical output), so a -L 2
+# case would pass even against a broken model. -L 1 forces it to commit to one
+# rung and does diverge — 1 B, 6 B and 155 B respectively.
+run ld_stereo -R -L 1 "$FIX/stereo_1s.flac"
+run ld_24     -R -L 1 "$FIX/s24_2s.flac"
+run ld_short  -R -L 1 "$FIX/short.flac"
+# Effort dial: pins the level -> (candidates, rungs) table itself. -E 3 is
+# (-c 24 -L 1) and stereo_1s is one of the fixtures where -L 1 diverges from
+# the full ladder, so this case moves if either half of the mapping changes.
+run ef_stereo -R -E 3 "$FIX/stereo_1s.flac"
+# The documented exact-DP recipe: -E under -e, where the level's -a is dropped
+# and only its -c/-L survive. Pins that interaction, not just the mapping.
+run ef_ex     -R -e -E 0 "$FIX/stereo_1s.flac"
+# Runtime-loaded window (-w custom:<file>): pins the knot parser and the
+# interpolation onto both table and non-table block sizes. The knot file is
+# committed next to this script, so these are reproducible anywhere.
+run cw_stereo -R    -w "custom:$HERE/windows/example_taper.txt",hann "$FIX/stereo_4s.flac"
+run cw_short  -R -e -w "custom:$HERE/windows/example_taper.txt"      "$FIX/short.flac"
+# Frame reuse (the default) — heuristic splice path and exact-DP reuse-edge
+# path, both over the ffmpeg-encoded fixtures so input frames actually
+# compete.
+run ru_he           "$FIX/stereo_4s.flac"
+run ru_ex -e -c 8   "$FIX/stereo_1s.flac"
+run ru_24 -e -c 8   "$FIX/s24_2s.flac"
 
 fail=0
 for f in "$OUT"/*.flac; do

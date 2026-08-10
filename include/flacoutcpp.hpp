@@ -65,6 +65,18 @@ struct Config {
     std::vector<WindowType> windows;
 
     /**
+     * @brief DP block-size ladder (`-b`).
+     *
+     * Empty (the default) uses the built-in `{1024, 2048, 4096, 8192, 16384}`.
+     * Every entry must be a multiple of 16 and within [16, 65520]: the DP
+     * places nodes every GCD-of-the-ladder samples and each frame spans
+     * exactly one candidate, so a size that is not a multiple of that step
+     * could never land on a node. 65535 is therefore unreachable — it is odd;
+     * 65520 is the largest usable size.
+     */
+    std::vector<uint32_t> dp_candidates;
+
+    /**
      * @brief Maximum number of worker threads.
      *
      * Set to @c 0 (default) to use all logical CPUs reported by the OS.

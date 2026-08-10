@@ -50,6 +50,7 @@ bool optimise(const std::string& input_path, const std::string& output_path, con
     pc.adaptive_windows = config.adaptive_windows;
     pc.patience = config.patience;
     pc.precision_rungs = config.precision_rungs;
+    pc.dp_candidates = config.dp_candidates;
     pc.reuse_frames  = config.reuse_frames;
     pc.warn_superior = config.warn_superior;
     pc.verbose       = config.verbose;

@@ -52,6 +52,20 @@ static void print_usage(const char* prog) {
         << "                       -c and -L are not independent —\n"
         << "                       prefer -E, which pairs them along the measured\n"
         << "                       frontier, unless you know which pair you want.\n"
+        << "  -b, --blocks <list>  Comma-separated block sizes the DP may choose\n"
+        << "                       from (default: 1024,2048,4096,8192,16384).\n"
+        << "                       Each must be a multiple of 16 in [16, 65520],\n"
+        << "                       and every size must be a multiple of the\n"
+        << "                       smallest, or the DP cannot reach the stream's\n"
+        << "                       end. FLAC's own limits are 16 and 65535, but\n"
+        << "                       65535 is odd, so no usable grid reaches it;\n"
+        << "                       65520 is the largest attainable size, and\n"
+        << "                       needs a smallest size that divides it (e.g.\n"
+        << "                       16 or 5040, not 1024). Cost scales with\n"
+        << "                       sum(sizes)/gcd(sizes): the default is 31 block\n"
+        << "                       -samples of work per input sample, and\n"
+        << "                       16,...,32768 is 4095 — about 130x. Best paired\n"
+        << "                       with -e, which prices every choice exactly.\n"
         << "  -n, --no-metadata    Do not copy metadata from input to output\n"
         << "  -a, --adaptive-windows  Add windows chosen from each block's signal\n"
         << "                       statistics to the shortlist. On by default;\n"
@@ -252,6 +266,69 @@ int main(int argc, char* argv[]) {
                 std::cerr << "Error: -t requires a positive integer, got '" << argv[i] << "'.\n";
                 return EXIT_FAILURE;
             }
+
+        } else if (arg == "-b" || arg == "--blocks") {
+            // Block-size ladder for the DP. Rejecting bad ladders here keeps
+            // the optimizer free of the checks: it may assume the list is
+            // non-empty and that its GCD is a usable node spacing.
+            if (i + 1 >= argc) {
+                std::cerr << "Error: -b requires a comma-separated block-size list.\n";
+                return EXIT_FAILURE;
+            }
+            ++i;
+            std::vector<uint32_t> sizes;
+            for (const auto& tok : split_csv(argv[i])) {
+                unsigned long v = 0;
+                try {
+                    size_t used = 0;
+                    v = std::stoul(tok, &used);
+                    if (used != tok.size()) throw std::invalid_argument("junk");
+                } catch (const std::exception&) {
+                    std::cerr << "Error: -b: not a block size: '" << tok << "'.\n";
+                    return EXIT_FAILURE;
+                }
+                // 16 is FLAC's minimum; 65535 is the maximum a 16-bit
+                // STREAMINFO field can hold, but the DP needs multiples of 16
+                // (its nodes sit on a grid whose spacing divides every
+                // candidate, and the estimated path indexes 16-sample
+                // granules), so 65520 is the largest reachable size.
+                if (v < 16 || v > 65520) {
+                    std::cerr << "Error: -b: block size " << v
+                              << " out of range [16, 65520].\n";
+                    return EXIT_FAILURE;
+                }
+                if (v % 16 != 0) {
+                    std::cerr << "Error: -b: block size " << v
+                              << " is not a multiple of 16.\n";
+                    return EXIT_FAILURE;
+                }
+                sizes.push_back((uint32_t)v);
+            }
+            if (sizes.empty()) {
+                std::cerr << "Error: -b: empty block-size list.\n";
+                return EXIT_FAILURE;
+            }
+            // Every size must be a multiple of the smallest. The DP's nodes
+            // sit every gcd(sizes) samples, but the positions actually
+            // *reachable* from the start are the sums of candidates. If the
+            // smallest candidate is larger than the gcd, most nodes — quite
+            // possibly the final one — cannot be reached at all, and the DP
+            // finds no path and emits an empty stream. (Caught the hard way:
+            // 1024,...,65520 gives gcd 16 with a smallest step of 1024, and
+            // produced a 99-byte file that failed `flac -t`.)
+            std::sort(sizes.begin(), sizes.end());
+            sizes.erase(std::unique(sizes.begin(), sizes.end()), sizes.end());
+            for (uint32_t v : sizes) {
+                if (v % sizes.front() != 0) {
+                    std::cerr << "Error: -b: " << v << " is not a multiple of the "
+                              << "smallest size " << sizes.front()
+                              << ". Every block size must be a multiple of the "
+                              << "smallest, or the DP cannot reach the end of "
+                              << "the stream.\n";
+                    return EXIT_FAILURE;
+                }
+            }
+            cfg.dp_candidates = std::move(sizes);
 
         } else if (arg.substr(0, 2) == "--" || arg.substr(0, 1) == "-") {
             std::cerr << "Unknown option: " << arg << "\n";

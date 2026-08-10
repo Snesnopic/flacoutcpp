@@ -15,6 +15,7 @@
 #include <limits>
 #include <sstream>
 #include <mutex>
+#include <numeric>
 #include <map>
 #include <string>
 #include <thread>
@@ -275,6 +276,12 @@ WindowType window_from_name(const std::string& raw) {
 // Optimizer constructor
 // ============================================================
 
+// The DP's candidate block sizes (shared with find_optimal_block_partitioning).
+// Window coefficient tables for these sizes are precomputed once; any other
+// size (the remainder block, the short-stream path) computes on the fly.
+static const uint32_t DP_CANDIDATES[] = { 1024, 2048, 4096, 8192, 16384 };
+static constexpr size_t NUM_DP_CANDIDATES = 5;
+
 Optimizer::Optimizer(uint32_t channels, uint32_t bps, uint32_t sample_rate,
                      std::vector<WindowType> windows,
                      unsigned max_threads,
@@ -283,13 +290,39 @@ Optimizer::Optimizer(uint32_t channels, uint32_t bps, uint32_t sample_rate,
                      unsigned max_candidates,
                      bool adaptive_windows,
                      unsigned patience,
-                     unsigned precision_rungs)
+                     unsigned precision_rungs,
+                     std::vector<uint32_t> dp_candidates)
     : m_channels(channels), m_bps(bps), m_sample_rate(sample_rate),
       m_max_threads(max_threads),
       m_exhaustive(exhaustive), m_verbose(verbose), m_max_candidates(max_candidates),
       m_adaptive(adaptive_windows), m_patience(patience),
       m_precision_rungs(precision_rungs)
 {
+    // Block-size ladder. Empty means the built-in one, whose coefficient
+    // tables are precomputed; any other size falls back to computing window
+    // coefficients per block (correct, just slower), so a custom ladder costs
+    // no memory.
+    if (dp_candidates.empty())
+        m_dp_candidates.assign(std::begin(DP_CANDIDATES), std::end(DP_CANDIDATES));
+    else
+        m_dp_candidates = std::move(dp_candidates);
+    std::sort(m_dp_candidates.begin(), m_dp_candidates.end());
+    m_dp_candidates.erase(std::unique(m_dp_candidates.begin(), m_dp_candidates.end()),
+                          m_dp_candidates.end());
+
+    // The node spacing is the GCD: every candidate must be walkable from one
+    // node to another. Validation in main.cpp keeps every entry a multiple of
+    // 16, so the GCD is too — which the estimated path needs, since it indexes
+    // 16-sample granules by node.
+    uint32_t g = m_dp_candidates.front();
+    for (uint32_t c : m_dp_candidates) g = std::gcd(g, c);
+    m_dp_step = g;
+    // The smallest candidate must equal the step, or nodes between reachable
+    // positions are dead and the DP can fail to reach the end of the stream
+    // at all. main.cpp rejects such ladders; this catches library callers.
+    assert(m_dp_candidates.front() == m_dp_step &&
+           "every -b block size must be a multiple of the smallest");
+
     if (windows.empty()) {
         // Exact-DP mode (-e) affords the widest window set; the ranking pays
         // per candidate evaluated, not per window offered, so offering more
@@ -785,11 +818,6 @@ static void compute_window_coeffs(WindowType wt, uint32_t N, double* out)
     }
 }
 
-// The DP's candidate block sizes (shared with find_optimal_block_partitioning).
-// Window coefficient tables for these sizes are precomputed once; any other
-// size (the remainder block, the short-stream path) computes on the fly.
-static const uint32_t DP_CANDIDATES[] = { 1024, 2048, 4096, 8192, 16384 };
-static constexpr size_t NUM_DP_CANDIDATES = 5;
 
 static int candidate_slot(uint32_t N)
 {
@@ -797,6 +825,7 @@ static int candidate_slot(uint32_t N)
         if (DP_CANDIDATES[c] == N) return (int)c;
     return -1;
 }
+
 
 #ifdef FLACOUT_DUMP_CANDIDATES
 // Offline training/analysis sink: one row per candidate the ranked scan
@@ -2534,6 +2563,7 @@ void Optimizer::precompute_granules(
                 m_granules[c][g].autoc[i] = s;
             }
         }
+
 }
 
 uint32_t Optimizer::estimate_lpc_bits_fast(
@@ -2630,7 +2660,7 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
     // Variable-block-size DP
     // -----------------------------------------------------------------
     //
-    // Candidates: {4096, 8192, 16384} with STEP = GCD = 4096.
+    // Candidates: the -b ladder, default {1024..16384}, with STEP = its GCD.
     // Node i = position i*STEP in the audio.
     // Edge (i→j) = one FLAC frame covering [i*STEP, j*STEP).
     // Cost = FrameWriter::frame_bits: the exact encoded frame size, header
@@ -2646,9 +2676,12 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
 
     // Shared with the window-table cache, which precomputes coefficients for
     // exactly these sizes (see DP_CANDIDATES at file scope).
-    static const auto&    CANDIDATES     = DP_CANDIDATES;
-    static const size_t   NUM_CANDS      = std::size(DP_CANDIDATES);
-    static constexpr uint32_t STEP = 1024u; // GCD of all candidates
+    // Configurable via -b; defaults to DP_CANDIDATES, for which the window
+    // coefficient tables are precomputed. STEP is the ladder's GCD, so every
+    // candidate walks from one node to another.
+    const std::vector<uint32_t>& CANDIDATES = m_dp_candidates;
+    const size_t   NUM_CANDS = CANDIDATES.size();
+    const uint32_t STEP      = m_dp_step;
 
     const size_t   num_nodes = total_samples / STEP;
     const uint32_t remainder = (uint32_t)(total_samples % STEP);
@@ -2670,7 +2703,7 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
     // leaves only cheap blocks to fill the tail. Purely a scheduling change:
     // cost_table is indexed by (node, candidate), not by completion order.
     std::stable_sort(work.begin(), work.end(),
-                     [](const WorkItem& a, const WorkItem& b) {
+                     [&CANDIDATES](const WorkItem& a, const WorkItem& b) {
                          return CANDIDATES[a.ci] > CANDIDATES[b.ci];
                      });
 
@@ -2699,7 +2732,8 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
                             compute_block(pcm_data, (uint64_t)node * STEP, CANDIDATES[ci]);
                     } else {
                         uint32_t bits = 0;
-                        // granules are 16 samples each; nodes are STEP=1024 samples each
+                        // granules are 16 samples each; nodes are STEP samples
+                        // each, and -b validation keeps STEP a multiple of 16
                         static constexpr uint32_t GRANULE_SIZE = 16u;
                         uint32_t g_start = (uint32_t)(node * (STEP / GRANULE_SIZE));
                         uint32_t g_end   = g_start + CANDIDATES[ci] / GRANULE_SIZE;

@@ -79,6 +79,16 @@ run ef_ex     -R -e -E 0 "$FIX/stereo_1s.flac"
 # committed next to this script, so these are reproducible anywhere.
 run cw_stereo -R    -w "custom:$HERE/windows/example_taper.txt",hann "$FIX/stereo_4s.flac"
 run cw_short  -R -e -w "custom:$HERE/windows/example_taper.txt"      "$FIX/short.flac"
+# Block-size ladder (-b). bs_ceil raises the ceiling past the built-in 16384,
+# so it pins the on-the-fly window path for a size with no precomputed table.
+# bs_floor lowers the floor and therefore changes the DP's node spacing, which
+# is what the reachability rule constrains. bs_max reaches 65520, the largest
+# attainable size — 65535 is odd, so no valid grid lands on it, and a ladder
+# whose smallest entry does not divide the rest strands the final node (that
+# bug shipped a 99-byte file once; the parser rejects it now).
+run bs_ceil  -R -e -b 1024,2048,4096,8192,16384,32768 "$FIX/stereo_1s.flac"
+run bs_floor -R -e -b 256,512,1024,2048,4096          "$FIX/mono_2s.flac"
+run bs_max   -R    -b 5040,10080,20160,65520          "$FIX/stereo_4s.flac"
 # Frame reuse (the default) — heuristic splice path and exact-DP reuse-edge
 # path, both over the ffmpeg-encoded fixtures so input frames actually
 # compete.

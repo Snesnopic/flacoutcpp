@@ -29,7 +29,8 @@ Options:
                        and offer all windows (extremely slow)
   -c, --candidates N   Fully evaluate only the N most promising
                        (window, order) pairs per subframe (0 = no limit;
-                       default 8, or 0 when -e is given without -c)
+                       default 24 (effort level 3), or 0 when -e is given
+                       without -c/-L/-E)
   -p, --patience N     Keep scanning past -c N while candidates are still
                        improving; stop after N consecutive that are not
                        (default: 2x -c; 0 = plain top-N cut)

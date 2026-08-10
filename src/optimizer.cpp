@@ -293,7 +293,7 @@ Optimizer::Optimizer(uint32_t channels, uint32_t bps, uint32_t sample_rate,
         // per candidate evaluated, not per window offered, so offering more
         // windows there only adds options.
         //
-        // The heuristic shortlist carries four dense tapers plus the
+        // The heuristic shortlist carries six dense tapers plus the
         // partial/punchout pair at each of the two offsets. The sparse half
         // used to be left out because analysis (windowing + autocorrelation)
         // is paid per window on every block; measured, that cost is invisible
@@ -305,16 +305,38 @@ Optimizer::Optimizer(uint32_t channels, uint32_t bps, uint32_t sample_rate,
         //
         // It is specifically the *punchout* half that pays (-17989 B on the
         // master mix alone, against -10129 B for the partials alone), and the
-        // set does not want to grow further: adding the 3-partition families
-        // on top gives back 2618 B, because at a fixed candidate budget more
-        // sparse windows crowd each other out of the ranked top-N. Widening
-        // this list is therefore not a free knob — it was worth exactly one
-        // family.
+        // *sparse* side does not want to grow further: adding the 3-partition
+        // families on top gives back 2618 B, because at a fixed candidate
+        // budget more sparse windows crowd each other out of the ranked top-N.
+        //
+        // The narrow Tukeys are the exception, and they are dense, which is
+        // why they do not crowd. The list used to jump straight from
+        // RECTANGULAR to TUKEY_050 with nothing in between, and that gap in
+        // *taper width* — not any missing shape family — was the last thing
+        // left on the table: 005 and 020 sit at different points in it rather
+        // than substituting for each other, so the pair beats either alone
+        // (master mix -0.0177%, against -0.0144% for 005 and -0.0117% for
+        // 020; 12-fixture total -0.0212% against -0.0126% / -0.0147%). Album
+        // corpus, 3 tracks from each of 9 albums: -0.0159% with **no track
+        // worse**, and syn3m_noise — where every ranking-based knob here gives
+        // something back — is -0.0053%. Cost is 1.02-1.04x, the same exchange
+        // rate as -a. Adaptive windows are near-orthogonal to it: the deltas
+        // move under 0.0005% with -A.
+        //
+        // 38 novel shapes were screened against this list first (asymmetric
+        // Tukeys, sign-changing windows, multi-lobe combs, tapered sub-rects,
+        // Hann-Poisson/Cauchy/Riesz), fed in through the -w custom: loader.
+        // None reached even +tukey005: measured as a 9th window the best of
+        // them was worth -0.0041%. Every shape that scored well against the
+        // *old* four-window list was multi-lobe, i.e. redundant with the
+        // partial/punchout pair already here — which is exactly why the
+        // 4-window baseline must not be used to judge a new window.
         if (full_search()) {
             m_windows = all_window_types();
         } else {
             m_windows = {WindowType::TUKEY_050, WindowType::HANN,
                          WindowType::WELCH,    WindowType::RECTANGULAR,
+                         WindowType::TUKEY_005, WindowType::TUKEY_020,
                          WindowType::PARTIAL_TUKEY_2_033,  WindowType::PARTIAL_TUKEY_2_067,
                          WindowType::PUNCHOUT_TUKEY_2_033, WindowType::PUNCHOUT_TUKEY_2_067};
         }

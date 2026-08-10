@@ -27,6 +27,15 @@
 #
 # Two lobes with a near-silent middle: it reads the first eighth and a narrow
 # band near the end. Not promoted into any default set.
+#
+# 2026-08-09: read every number above as relative to the FOUR-window baseline
+# it was searched against. That is no longer the default set, and the gap has
+# almost entirely closed: measured as an extra window on top of the shipping
+# shortlist this shape is worth -0.0008% at -c 8 and -0.0130% at the default,
+# not -0.081%. The reason is the one the note above already suspected — its
+# value is multi-lobe support, which the partial/punchout pair now supplies.
+# Kept as the provenance record for bench/window_search.py, not as a window
+# worth loading.
 5.434008196990581e-06
 0.99551918517633309
 0.89518760756923699

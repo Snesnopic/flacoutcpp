@@ -936,7 +936,8 @@ struct LatticeDump {
         const char* path = std::getenv("FLACOUT_LATTICE_DUMP_PATH");
         fh = path ? std::fopen(path, "w") : stderr;
         if (!fh) fh = stderr;
-        std::fprintf(fh, "bsize\tord\tprec\ttap\tdelta\tdcost\n");
+        std::fprintf(fh, "bsize\tord\tprec\ttap\tdelta\tdcost"
+                         "\tbps\twasted\tshift\tbase\tcoef\n");
     }
     ~LatticeDump() { if (fh && fh != stderr) std::fclose(fh); }
 };
@@ -980,6 +981,13 @@ std::atomic<uint64_t> g_pdump_sf{0};
 // count the sample as one the window cannot see. 0.0 means "exactly zero",
 // which is what the blind-region term originally tested; see the calibration
 // note at the ranked scorer for why that is worth a threshold.
+// Highest LPC coefficient precision whose winner -Q still tries to refine.
+// 15 disables the gate (every winner refined). See the gate in
+// optimize_subframe for the measured frontier behind the default.
+#ifndef FLACOUT_LATTICE_MAX_PREC
+#define FLACOUT_LATTICE_MAX_PREC 10
+#endif
+
 #ifndef FLACOUT_BLIND_EPS
 #define FLACOUT_BLIND_EPS 0.0
 #endif
@@ -2679,7 +2687,45 @@ SubframeParams Optimizer::optimize_subframe(
         // multiply the search: 2*order*sweeps residual+Rice passes against the
         // thousands the ranked scan already ran. It cannot lose bits — a
         // perturbation is adopted only when the exact cost strictly drops.
-        if (lattice_sweeps > 0 && bl_ord > 0) {
+        // Precision gate. The lattice step is 2^-shift, so a low-precision
+        // winner was rounded far from the cost-optimal lattice point and has
+        // room to search, while a prec-15 one is already essentially on it —
+        // measured over every perturbation, 97.1% of the improvements on a
+        // gaining fixture sit at prec <= 9, and a fixture whose winners are
+        // mostly prec 11-15 yields nothing at all.
+        //
+        // Gating strictly improves the frontier (master mix, -Q 2, against
+        // -Q 0 at 0.80 s / 16827941 B, interleaved best-of-4 on an idle
+        // machine -- see trap 9, an earlier version of this table was measured
+        // against a second encoder and read ~0.015x high throughout):
+        //
+        //   gate  time   x       bytes
+        //   <=8   -      -       -3020   (50.5% of ungated -- too aggressive)
+        //   <=9   0.84   1.050   -5626   (94.1%)
+        //   <=10  0.85   1.062   -5851   (97.8%)  <- default
+        //   <=11  0.86   1.075   -5901   (98.7%)
+        //   <=12  0.86   1.075   -5934   (99.2%)
+        //   none  0.89   1.113   -5981   (100%)
+        //
+        // Read that table honestly: 10, 11 and 12 are inside timing noise of
+        // each other (0.85/0.86/0.86), so the real finding is "gate somewhere
+        // in 10-12", and 10 is picked for holding the most gain per unit time
+        // over the <=9 step (+225 B for +0.012x, against +83 B for the same
+        // 0.013x from 10 to 12). Only the ends are firm: <=8 throws away half
+        // the gain, and ungated pays 0.051x more than <=10 for 2.2% more.
+        // The gated point dominates ungated -Q 1 outright on both axes
+        // (0.85 s / -5851 B against 0.86 s / -5596 B), so this is not a
+        // speed-for-size trade.
+        //
+        // Under exact DP the gate still captures the gains (94.4% of the
+        // improvements and 92.9% of the headroom bits are at prec <= 10,
+        // measured over 660492 perturbations at -e -c 8 -L 1), but -Q is far
+        // more expensive there -- 1.24-1.80x rather than 1.06x -- because the
+        // exact DP prices every (position, block size, stereo mode) with a
+        // full optimize_subframe call, so the refinement runs on ~31x more
+        // subframes than end up in the file.
+        if (lattice_sweeps > 0 && bl_ord > 0 &&
+            bl_prec <= FLACOUT_LATTICE_MAX_PREC) {
             const uint32_t hdr =
                 hdr_fixed + (uint32_t)bl_ord * (eff_bps + (uint32_t)bl_prec);
             const int32_t qmax = (1 << (bl_prec - 1)) - 1;
@@ -2711,9 +2757,19 @@ SubframeParams Optimizer::optimize_subframe(
                         // expression here disagrees with the search's.
                         {
                             std::lock_guard<std::mutex> lk(g_ldump.mu);
-                            std::fprintf(g_ldump.fh, "%u\t%d\t%d\t%d\t%d\t%lld\n",
+                            // base = the winner's exact cost, so dcost/base is
+                            // the *relative* steepness of the cost surface and
+                            // base/bsize its bits/sample. shift is the one that
+                            // matters: the lattice step is 2^-shift, and that
+                            // is what the precision gate above is really a
+                            // proxy for. coef is the tap's own magnitude.
+                            std::fprintf(g_ldump.fh,
+                                         "%u\t%d\t%d\t%d\t%d\t%lld"
+                                         "\t%u\t%d\t%d\t%u\t%d\n",
                                          bsize, bl_ord, bl_prec, j, delta,
-                                         (long long)cost - (long long)best_lpc_cost);
+                                         (long long)cost - (long long)best_lpc_cost,
+                                         eff_bps, wasted, bl_shift, best_lpc_cost,
+                                         base);
                         }
 #endif
                         if (cost < best_lpc_cost) {

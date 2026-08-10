@@ -12,6 +12,8 @@
 #include <vector>
 #include <cstring>
 
+namespace flacoutcpp {
+
 // ============================================================
 // Constructor / destructor
 // ============================================================
@@ -136,7 +138,7 @@ bool Processor::process() {
     // The FLAC spec mandates MD5 over the raw audio (channel-interleaved,
     // little-endian, ceil(bps/8) bytes per sample).
     const int bytes_per_sample = (m_bps + 7) / 8;
-    MD5 md5;
+    detail::MD5 md5;
     std::vector<uint8_t> pcm_bytes(m_channels * bytes_per_sample);
     for (uint64_t s = 0; s < m_total_samples; ++s) {
         for (uint32_t c = 0; c < m_channels; ++c) {
@@ -543,3 +545,5 @@ void Processor::metadata_callback(
         self->m_total_samples = metadata->data.stream_info.total_samples;
     }
 }
+
+} // namespace flacoutcpp

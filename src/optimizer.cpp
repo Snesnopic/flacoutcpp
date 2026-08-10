@@ -20,6 +20,8 @@
 #include <thread>
 #include <vector>
 
+namespace flacoutcpp {
+
 #ifdef FLACOUT_INSTRUMENT
 #include <cstdio>
 struct InstrCounters {
@@ -3278,3 +3280,5 @@ BlockParams Optimizer::compute_block(
                   + (m_channels > 1 ? bp.subframes[1].bits_cost : 0);
     return bp;
 }
+
+} // namespace flacoutcpp

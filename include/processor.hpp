@@ -12,6 +12,8 @@
 #include "FLAC/stream_decoder.h"
 #include "optimizer.hpp"
 
+namespace flacoutcpp {
+
 /**
  * @brief Configuration parameters for the Processor pipeline.
  */
@@ -171,5 +173,7 @@ private:
 
     /// @endcond
 };
+
+} // namespace flacoutcpp
 
 #endif // PROCESSOR_HPP

@@ -11,9 +11,11 @@
 #include <cstddef>
 #include <array>
 
+namespace flacoutcpp {
+
 /**
  * @brief Writes bits MSB-first into a dynamically growing byte buffer.
- * 
+ *
  * Used internally by FrameWriter to construct FLAC frame headers and
  * payload sections bit-by-bit. Also provides fast CRC-8 and CRC-16
  * checksum generation required by the FLAC specification.
@@ -133,5 +135,7 @@ private:
 
     /// @endcond
 };
+
+} // namespace flacoutcpp
 
 #endif // BITWRITER_HPP

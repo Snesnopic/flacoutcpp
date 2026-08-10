@@ -3,6 +3,8 @@
 #include <cassert>
 #include <cstring>
 
+namespace flacoutcpp {
+
 // ---------------------------------------------------------------------------
 // Compile-time CRC table generation (C++17 constexpr)
 // ---------------------------------------------------------------------------
@@ -69,8 +71,9 @@ void BitWriter::write_unary(uint32_t value) {
 }
 
 void BitWriter::write_rice_sample(int32_t sample, int k) {
-    // Zigzag (fold) signed → unsigned
-    uint32_t u = (uint32_t)((sample << 1) ^ (sample >> 31));
+    // Zigzag (fold) signed → unsigned; cast to unsigned before the left shift,
+    // since shifting a negative signed value left is UB before C++20
+    uint32_t u = ((uint32_t)sample << 1) ^ (uint32_t)(sample >> 31);
     uint32_t q = u >> k;          // quotient
     uint32_t r = u & ((1u << k) - 1u); // remainder (only valid when k>0)
     write_unary(q);
@@ -155,3 +158,5 @@ uint16_t BitWriter::crc16(size_t from, size_t to) const {
         crc = (uint16_t)((crc << 8) ^ CRC16_TABLE[((crc >> 8) ^ m_buf[i]) & 0xFF]);
     return crc;
 }
+
+} // namespace flacoutcpp

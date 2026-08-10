@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <stdexcept>
 
+namespace flacoutcpp {
+
 // ============================================================
 // Helpers: encode frame-header variable-length fields
 // ============================================================
@@ -469,3 +471,5 @@ std::vector<uint8_t> FrameWriter::make_streaminfo_block(
 
     return bw.buffer(); // 38 bytes total
 }
+
+} // namespace flacoutcpp

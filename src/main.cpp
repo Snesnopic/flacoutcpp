@@ -4,6 +4,8 @@
 #include <sstream>
 #include "flacoutcpp.hpp"
 
+using namespace flacoutcpp;
+
 static void print_usage(const char* prog) {
     std::cerr
         << "Usage: " << prog << " [options] <input.flac> [output.flac]\n"

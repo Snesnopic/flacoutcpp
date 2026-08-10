@@ -26,6 +26,8 @@
 #include <cstdint>
 #include <string>
 
+namespace flacoutcpp {
+
 // ---------------------------------------------------------------------------
 /// @defgroup windows Apodization Windows
 /// @{
@@ -420,5 +422,7 @@ private:
 };
 
 /// @}
+
+} // namespace flacoutcpp
 
 #endif // OPTIMIZER_HPP

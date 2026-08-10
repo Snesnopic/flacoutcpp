@@ -11,6 +11,8 @@
 
 // NOLINTBEGIN
 
+namespace flacoutcpp::detail {
+
 class MD5 {
 public:
     MD5() { reset(); }
@@ -150,6 +152,8 @@ private:
         m_state[0] += a; m_state[1] += b; m_state[2] += c; m_state[3] += d;
     }
 };
+
+} // namespace flacoutcpp::detail
 
 // NOLINTEND
 

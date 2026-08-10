@@ -11,9 +11,11 @@
 #include <vector>
 #include <cstdint>
 
+namespace flacoutcpp {
+
 /**
  * @brief Serializes FLAC audio frames from pre-computed optimal parameters.
- * 
+ *
  * This class replaces the libFLAC high-level encoder in the pipeline.
  * It provides full byte-accurate control over the bitstream, taking exact
  * `BlockParams` determined by the DP optimizer and generating valid FLAC frames.
@@ -143,5 +145,7 @@ private:
 
     /// @endcond
 };
+
+} // namespace flacoutcpp
 
 #endif // FRAME_WRITER_HPP

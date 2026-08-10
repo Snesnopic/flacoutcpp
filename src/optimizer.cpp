@@ -279,6 +279,16 @@ WindowType window_from_name(const std::string& raw) {
 // The DP's candidate block sizes (shared with find_optimal_block_partitioning).
 // Window coefficient tables for these sizes are precomputed once; any other
 // size (the remainder block, the short-stream path) computes on the fly.
+// The estimated-DP shortlist: six dense tapers plus the partial/punchout pair
+// at each offset. Also what exact DP falls back to at a small -c.
+static std::vector<WindowType> heuristic_shortlist() {
+    return {WindowType::TUKEY_050, WindowType::HANN,
+            WindowType::WELCH,    WindowType::RECTANGULAR,
+            WindowType::TUKEY_005, WindowType::TUKEY_020,
+            WindowType::PARTIAL_TUKEY_2_033,  WindowType::PARTIAL_TUKEY_2_067,
+            WindowType::PUNCHOUT_TUKEY_2_033, WindowType::PUNCHOUT_TUKEY_2_067};
+}
+
 static const uint32_t DP_CANDIDATES[] = { 1024, 2048, 4096, 8192, 16384 };
 static constexpr size_t NUM_DP_CANDIDATES = 5;
 
@@ -366,14 +376,29 @@ Optimizer::Optimizer(uint32_t channels, uint32_t bps, uint32_t sample_rate,
         // *old* four-window list was multi-lobe, i.e. redundant with the
         // partial/punchout pair already here — which is exactly why the
         // 4-window baseline must not be used to judge a new window.
-        if (full_search()) {
+        // Exact DP widens to all 26 only at an *unlimited* candidate budget.
+        // The ranking pays per candidate evaluated, not per window offered, so
+        // at -c 0 extra windows are free options — but at any finite -c they
+        // crowd better candidates out of the top N and cost both size and
+        // time. On the 188-track mix the shortlist wins on both axes at every
+        // budget measured: -e -E 0 is -0.520% at 7.7x the default against
+        // -0.413% at 15.4x for the wide set, and -e -c 24 -L 1 is -0.610% at
+        // 24x against -0.598% at 41x. Real music (music_10s) prefers the
+        // shortlist at -c 2 through 48 and only loses by 0.0065% at -c 0.
+        //
+        // The synthetic 24-bit fixture disagrees — s24_2s wants the wide set
+        // from -c 16 on, by up to 0.49% — which is exactly the trap in
+        // CLAUDE.md: synthetic noise floors mispredict window choice. Tuned to
+        // the real-music result deliberately.
+        //
+        // Bare -e implies -c 0, so it is unaffected; an explicit -w overrides
+        // all of this.
+        if (full_search() && m_max_candidates == 0) {
             m_windows = all_window_types();
+        } else if (full_search()) {
+            m_windows = heuristic_shortlist();
         } else {
-            m_windows = {WindowType::TUKEY_050, WindowType::HANN,
-                         WindowType::WELCH,    WindowType::RECTANGULAR,
-                         WindowType::TUKEY_005, WindowType::TUKEY_020,
-                         WindowType::PARTIAL_TUKEY_2_033,  WindowType::PARTIAL_TUKEY_2_067,
-                         WindowType::PUNCHOUT_TUKEY_2_033, WindowType::PUNCHOUT_TUKEY_2_067};
+            m_windows = heuristic_shortlist();
         }
     } else {
         m_windows = std::move(windows);

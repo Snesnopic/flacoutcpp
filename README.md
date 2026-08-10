@@ -43,18 +43,22 @@ Options:
                        still improving; stop after N consecutive that
                        are not. Makes -c a floor, not a ceiling.
                        Default: 2x -c. 0 disables it (plain top-N cut).
-  -E, --effort N       Effort 0-9: one dial along the measured
-                       size/time frontier, setting -c, -L and -a
-                       together (they are not independent —
-                       which mix is efficient shifts with the
-                       budget). 0 fastest, 9 = every candidate and
-                       every rung. Level 3 is the default. Against
-                       it, on a 188-track mix: 0 is +0.15% at 0.8x
-                       the time, 6 is -0.03% at 1.5x, 9 is -0.05% at
-                       5.7x. An explicit -c/-p/-L/-a wins; the
-                       level's -a yields to -e/-w rather than
-                       erroring. The dial tunes the search *within*
-                       a mode; it is not a substitute for -e.
+  -E, --effort N       Effort 0-12: one dial along the measured
+                       size/time frontier, setting -c, -L, -a and
+                       — from level 10 — exact DP, together (they
+                       are not independent; which mix is efficient
+                       shifts with the budget). 0 fastest, 9 = every
+                       candidate and every rung under estimated DP,
+                       10-12 = exact DP at increasing depth. Level 3
+                       is the default. Against it, on a 188-track
+                       mix: 0 is +0.15% at 0.8x the time, 6 is
+                       -0.03% at 1.5x, 9 is -0.05% at 5.7x, 10 is
+                       -0.52% at 7.7x, 12 is -0.61% at 24x. Level 10
+                       is the value corner — ten times level 9's
+                       compression for 20% more time — because exact
+                       pricing is worth far more than search depth.
+                       An explicit -c/-p/-L/-a wins; the level's -a
+                       yields to -e/-w rather than erroring.
   -L, --rungs N        Encode only the N most promising of the 8 LPC
                        coefficient precisions per candidate, chosen by
                        an analytic model of the quantization error
@@ -66,6 +70,20 @@ Options:
                        -c and -L are not independent —
                        prefer -E, which pairs them along the measured
                        frontier, unless you know which pair you want.
+  -b, --blocks <list>  Comma-separated block sizes the DP may choose
+                       from (default: 1024,2048,4096,8192,16384).
+                       Each must be a multiple of 16 in [16, 65520],
+                       and every size must be a multiple of the
+                       smallest, or the DP cannot reach the stream's
+                       end. FLAC's own limits are 16 and 65535, but
+                       65535 is odd, so no usable grid reaches it;
+                       65520 is the largest attainable size, and
+                       needs a smallest size that divides it (e.g.
+                       16 or 5040, not 1024). Cost scales with
+                       sum(sizes)/gcd(sizes): the default is 31 block
+                       -samples of work per input sample, and
+                       16,...,32768 is 4095 — about 130x. Best paired
+                       with -e, which prices every choice exactly.
   -n, --no-metadata    Do not copy metadata from input to output
   -a, --adaptive-windows  Add windows chosen from each block's signal
                        statistics to the shortlist. On by default;
@@ -85,7 +103,8 @@ Options:
   -q, --quiet          Suppress all progress output
   -t, --threads N      Limit parallel worker threads (default: all CPUs)
   -w, --windows <list> Comma-separated list of apodization windows to use
-                       (default: all 26 with -e, else tukey005,tukey020,
+                       (default: all 26 with a bare -e, else
+                       tukey005,tukey020,
                        tukey050,hann,welch,rect and the partial/punchout
                        tukey pair at .33/.67)
                        An entry of the form custom:<file> loads a window
@@ -106,6 +125,7 @@ Experimental windows (never in a default set; explicit -w only):
   dpss{2,3,4}
 ```
 
+
 If `[output.flac]` is omitted, it will default to `<input.flac>.optimized.flac`.
 
 ### Choosing a search level
@@ -117,9 +137,11 @@ Three knobs control the search:
 
 - **`-e`** switches the block-partitioning DP from granule-based *estimates* to
   *exact* costs — every (position, block size) pair and every stereo mode is
-  fully encoded before the DP chooses — and widens the window set from the
-  10-window shortlist to all 26 standard windows (experimental windows such as
-  `lanczos` stay opt-in via `-w`). Orders of magnitude more CPU.
+  fully encoded before the DP chooses — and, at an unlimited candidate budget,
+  widens the window set from the 10-window shortlist to all 26 standard windows
+  (experimental windows such as `lanczos` stay opt-in via `-w`). Reachable from
+  the effort dial as `-E 10` and up, which is where most of the available
+  compression is.
 - **`-c N`** bounds the per-subframe LPC search. Levinson-Durbin already
   computes the prediction error at each order as a by-product of deriving the
   coefficients; the ranking uses it to estimate every (window, order) pair's

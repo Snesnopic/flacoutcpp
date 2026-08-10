@@ -286,7 +286,8 @@ public:
               bool adaptive_windows = false,
               unsigned patience = 0,
               unsigned precision_rungs = 0,
-              std::vector<uint32_t> dp_candidates = {});
+              std::vector<uint32_t> dp_candidates = {},
+              unsigned lattice_sweeps = 0);
 
     /**
      * @brief Find the optimal variable block-size partition for the stream.
@@ -335,7 +336,8 @@ public:
         const std::vector<WindowType>& windows,
         unsigned                    max_candidates = 0,
         unsigned                    patience = 0,
-        unsigned                    precision_rungs = 0);
+        unsigned                    precision_rungs = 0,
+        unsigned                    lattice_sweeps = 0);
 
 private:
     /// @cond INTERNAL
@@ -408,6 +410,7 @@ private:
     bool                  m_adaptive;
     unsigned              m_patience;
     unsigned              m_precision_rungs;
+    unsigned              m_lattice_sweeps;
 
     /// DP block-size ladder, ascending. Every entry is a multiple of
     /// m_dp_step (itself a multiple of the 16-sample granule), because the DP

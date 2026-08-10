@@ -34,6 +34,10 @@ struct ProcessorConfig {
      */
     std::vector<WindowType> windows;
 
+    /// DP block-size ladder (`-b`); empty uses the built-in default.
+    /// See Config::dp_candidates for the multiple-of-16 constraint.
+    std::vector<uint32_t> dp_candidates;
+
     /**
      * @brief Maximum number of threads to spawn for dynamic programming evaluation.
      * 

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.5...4.10)
-project(flacoutcpp VERSION 1.2.0)
+project(flacoutcpp VERSION 1.3.0)
 
 if(MSVC)
     # force static msvc runtime linkage (/mt for release, /mtd for debug)

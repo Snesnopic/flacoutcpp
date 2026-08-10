@@ -827,6 +827,41 @@ static int candidate_slot(uint32_t N)
 }
 
 
+#ifdef FLACOUT_DUMP_BLOCKCOST
+// Offline sink for the block-cost estimator's error: one row per (node, block
+// size) the DP considered, carrying the granule features available at
+// estimation time, the estimate, and the exact encoded cost. The point is to
+// find out whether the estimator's error is *systematic* — a per-block-size
+// bias a five-parameter recalibration could absorb — or content-dependent, in
+// which case it needs a model. Compiles to nothing unless defined; path from
+// FLACOUT_DUMP_PATH, else stderr.
+#include <cstdio>
+namespace {
+struct BlockCostDump {
+    std::FILE* fh = nullptr;
+    std::mutex mu;
+    BlockCostDump() {
+        const char* path = std::getenv("FLACOUT_DUMP_PATH");
+        fh = path ? std::fopen(path, "w") : stderr;
+        if (!fh) fh = stderr;
+        std::fprintf(fh, "node\tstart\tbsize\tch\tbps\test\texact\t"
+                         "energy\ttilt1\ttilt2\tcv2\tmode\testL\testR\testM\testS\n");
+    }
+    ~BlockCostDump() { if (fh && fh != stderr) std::fclose(fh); }
+    void row(size_t node, uint64_t start, uint32_t bsize, uint32_t ch, uint32_t bps,
+             uint32_t est, uint32_t exact, double energy, double t1, double t2,
+             double cv2, int mode, double eL, double eR, double eM, double eS) {
+        std::lock_guard<std::mutex> lk(mu);
+        std::fprintf(fh, "%zu\t%llu\t%u\t%u\t%u\t%u\t%u\t%.6g\t%.6g\t%.6g\t%.6g"
+                         "\t%d\t%.6g\t%.6g\t%.6g\t%.6g\n",
+                     node, (unsigned long long)start, bsize, ch, bps, est, exact,
+                     energy, t1, t2, cv2, mode, eL, eR, eM, eS);
+    }
+};
+BlockCostDump g_block_dump;
+} // namespace
+#endif
+
 #ifdef FLACOUT_DUMP_CANDIDATES
 // Offline training/analysis sink: one row per candidate the ranked scan
 // actually evaluated, carrying the features available at ranking time and the
@@ -2748,6 +2783,82 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
                         bp.total_bits = bits;
                         cost_table[node * NUM_CANDS + ci] = bp;
                     }
+#ifdef FLACOUT_DUMP_BLOCKCOST
+                    // Phase-0 dataset: what the DP's estimator claimed for this
+                    // (node, block size) against what encoding it actually
+                    // costs. Both numbers are subframe payload bits on the same
+                    // footing — frame_bits() adds the header afterwards to
+                    // whichever the DP used — so they are directly comparable.
+                    //
+                    // Cost is why this is a separate build: it evaluates every
+                    // candidate exactly *and* estimates it, so a dump run does
+                    // the work of -e plus the estimator.
+                    {
+                        static constexpr uint32_t GS = 16u;
+                        const uint32_t bsize = CANDIDATES[ci];
+                        const uint32_t g0 = (uint32_t)(node * (STEP / GS));
+                        const uint32_t g1 = g0 + bsize / GS;
+                        uint32_t est = 0;
+                        for (uint32_t ch = 0; ch < std::min(m_channels, 2u); ++ch)
+                            est += estimate_lpc_bits_fast((int)ch, g0, g1, m_bps);
+                        const BlockParams exact = full_search()
+                            ? cost_table[node * NUM_CANDS + ci]
+                            : compute_block(pcm_data, (uint64_t)node * STEP, bsize);
+
+                        // Span features, all from the granule cache — no PCM
+                        // pass. cv2 of granule energy is the transient measure
+                        // -a already uses; the lag ratios are spectral tilt.
+                        double e_sum = 0.0, e_sq = 0.0, a1 = 0.0, a2 = 0.0, a0 = 0.0;
+                        for (uint32_t g = g0; g < g1; ++g) {
+                            const double e = m_granules[0][g].autoc[0];
+                            e_sum += e; e_sq += e * e;
+                            a0 += e; a1 += m_granules[0][g].autoc[1];
+                            a2 += m_granules[0][g].autoc[2];
+                        }
+                        const double n  = (double)(g1 - g0);
+                        const double mu = e_sum / n;
+                        const double cv2 = (mu > 0.0) ? (e_sq / n - mu * mu) / (mu * mu) : 0.0;
+                        // Per-mode estimates, computed straight from PCM so
+                        // the shipping estimator is untouched. This is what
+                        // says *which* term is wrong, rather than only that
+                        // the total is: two attempts at a stereo term were
+                        // reverted for want of exactly this breakdown.
+                        double eL = 0, eR = 0, eM = 0, eS = 0;
+                        if (m_channels >= 2) {
+                            const uint64_t s0 = (uint64_t)node * STEP;
+                            auto est_of = [&](int which) {
+                                double ac[9] = {};
+                                for (uint32_t i = 0; i + 8 < bsize; ++i) {
+                                    const int32_t L = pcm_data[0][s0 + i];
+                                    const int32_t R = pcm_data[1][s0 + i];
+                                    const double v = which == 0 ? L : which == 1 ? R
+                                                   : which == 2 ? ((L + R) >> 1) : (L - R);
+                                    for (int k = 0; k <= 8; ++k) {
+                                        const int32_t L2 = pcm_data[0][s0 + i + k];
+                                        const int32_t R2 = pcm_data[1][s0 + i + k];
+                                        const double w = which == 0 ? L2 : which == 1 ? R2
+                                                       : which == 2 ? ((L2 + R2) >> 1) : (L2 - R2);
+                                        ac[k] += v * w;
+                                    }
+                                }
+                                float c[32];
+                                compute_lpc_coefficients(ac, c, 8);
+                                double e = ac[0];
+                                for (int k = 0; k < 8; ++k) e -= (double)c[k] * ac[k+1];
+                                if (e <= 0) return 8.0 + (double)m_bps;
+                                double bp = 0.5 * std::log2(2.0*M_PI*M_E*(e/bsize));
+                                if (bp < 1.0) bp = 1.0;
+                                return 8.0 + bsize * bp;
+                            };
+                            eL = est_of(0); eR = est_of(1); eM = est_of(2); eS = est_of(3);
+                        }
+                        g_block_dump.row(node, (uint64_t)node * STEP, bsize,
+                                         m_channels, m_bps, est, exact.total_bits,
+                                         a0, (a0 > 0 ? a1 / a0 : 0.0),
+                                         (a0 > 0 ? a2 / a0 : 0.0), cv2,
+                                         exact.stereo_mode, eL, eR, eM, eS);
+                    }
+#endif
                     size_t d = done.fetch_add(1, std::memory_order_relaxed) + 1;
                     if (m_verbose && (d % 10 == 0 || d == work.size())) {
                         std::lock_guard<std::mutex> lk(cout_mtx);

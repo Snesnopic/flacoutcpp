@@ -57,7 +57,13 @@ layout(std430, binding = 2) writeonly buffer OutCost { uint outCost[]; };
 layout(push_constant) uniform PC {
     int ncand;
     int bsize;
-    int flags;      // bit 0: use the fp32 ranking residual instead of exact
+    int flags;      // reserved; must be 0. Once held an fp32 ranking-residual
+                    // mode that no host path ever enabled -- it cost `fc[32]`
+                    // in registers unconditionally, because a push constant is
+                    // not a compile-time constant and the array had to be
+                    // allocated whether the branch ran or not. If an
+                    // approximate ranking mode is ever wanted, make it a SPIR-V
+                    // specialization constant so the dead side compiles out.
     int maxPOrder;  // cap on the partition-order search; 8 = the format's max
 } pc;
 
@@ -144,15 +150,16 @@ void main() {
     const int  base  = int(c) * 34;
     const int  ord   = cand[base + 0];
     const int  shift = cand[base + 1];
-    const bool fp32  = (pc.flags & 1) != 0;
 
-    int qc[32];
-    for (int j = 0; j < 32; ++j) qc[j] = cand[base + 2 + j];
-    float fc[32];
-    if (fp32) {
-        const float inv = 1.0 / float(1 << shift);
-        for (int j = 0; j < 32; ++j) fc[j] = float(qc[j]) * inv;
-    }
+    // Coefficients are NOT staged in a private array. At SIMD32 every slot of a
+    // private array costs a whole GRF, so `int qc[32]` alone was a quarter of
+    // the 128-register budget -- and it bought nothing: j is loop-uniform, so
+    // cand[base + 2 + j] is one address for the whole subgroup and the hardware
+    // broadcasts it, exactly as the sample reads below rely on.
+    //
+    // Measured on an Arc A380 (Mesa ANV, INTEL_DEBUG=cs). Staging this array and
+    // keeping the dead fp32 ladder cost 14847 instructions and 511:1444
+    // spills:fills; without them it is 7436 and 319:517.
 
     // Capping the partition-order search makes the kernel markedly cheaper --
     // the cost is dominated by partition closes, of which there are 2^(P+1)-1.
@@ -190,17 +197,10 @@ void main() {
 
         uint u = 0u;
         if (act) {
-            int r;
-            if (fp32) {
-                float fsum = 0.0;
-                for (int j = 0; j < ord; ++j) fsum += fc[j] * float(samples[i - 1 - j]);
-                r = samples[i] - int(floor(fsum));
-            } else {
-                int64_t sum = 0L;
-                for (int j = 0; j < ord; ++j)
-                    sum += int64_t(qc[j]) * int64_t(samples[i - 1 - j]);
-                r = samples[i] - int(sum >> shift);
-            }
+            int64_t sum = 0L;
+            for (int j = 0; j < ord; ++j)
+                sum += int64_t(cand[base + 2 + j]) * int64_t(samples[i - 1 - j]);
+            const int r = samples[i] - int(sum >> shift);
             u = (uint(r) << 1) ^ uint(r >> 31);       // zigzag
         }
 

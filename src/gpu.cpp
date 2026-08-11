@@ -651,10 +651,11 @@ bool GpuEvaluator::evaluate(const int32_t* shifted, uint32_t bsize,
     // the gl_SubgroupSize guard at the end of sweep.comp). That value must
     // never reach a caller: both call sites compute `hdr + 6 + cost`, which
     // wraps in uint32 to `hdr + 5` -- the *cheapest* cost representable, so a
-    // failed candidate would beat every real one and win the subframe. It is
-    // the exact defect that made -G pick order 1 where the CPU picks order 32
-    // (see GPU_PLAN.md); a sentinel that means "no answer" must not be
-    // arithmetic.
+    // failed candidate would beat every real one and win the subframe. Measured
+    // on an Arc A380: -G chose LPC order 1 where the CPU chose 32, output up to
+    // 4.5% larger, and --gpu-partition-cap 1/4/8 gave byte-identical output
+    // because a sentinel does not depend on the partition search. A sentinel
+    // that means "no answer" must not be arithmetic.
     //
     // Rejecting the whole batch rather than the individual entries keeps the
     // fallback honest: `false` here means the caller prices these candidates on

@@ -3053,6 +3053,22 @@ SubframeParams Optimizer::optimize_subframe(
                 // eval_candidate, which is the same answer either way.
                 const size_t reach = std::min(cands.size(),
                     (size_t)keep + 4u * (size_t)patience + 16u);
+                // Decline before building, not after. The build below runs
+                // quantize_lpc_coeffs over every (candidate, precision) pair in
+                // `reach`, and until this check moved up here a min_batch
+                // rejection threw all of it away and eval_candidate quantized
+                // the same pairs again -- so the knob meant to keep small work
+                // on the CPU was buying pure overhead instead.
+                // `reach * precisions.size()` is the exact upper bound on what
+                // the loop can append, so this never declines a batch the old
+                // order would have accepted.
+                //
+                // Justified structurally, not by a stopwatch: the only machine
+                // with a discrete GPU available had a 16-23% run-to-run noise
+                // floor (measured, 8 interleaved repeats), which swamps a
+                // change this size. Do not quote a speedup for it without a
+                // quiet machine.
+                if (reach * precisions.size() < gpu->min_batch()) return;
                 std::vector<GpuEvaluator::Candidate> batch;
                 std::vector<std::pair<uint32_t,int>> owner;   // (ranked index, prec)
                 batch.reserve(reach * precisions.size());

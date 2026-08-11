@@ -1531,27 +1531,64 @@ static inline uint32_t zigzag(int32_t r) {
 // keeping its own accumulator summed over ascending j, and each band's ragged
 // tail (where the highest lag in the band would run off the end) is finished per
 // lag afterwards, which is still ascending j for that lag.
+// Order and coefficient precision of the estimator's predictor. The order is
+// the estimate's main remaining bias — the real search reaches 32 — and the
+// precision is nearly free either way (order*prec is ~120 bits against a
+// payload of thousands), so it sits at the top of the range for predictor
+// fidelity rather than to save bits.
+#ifndef FLACOUT_EST_ORDER
+#define FLACOUT_EST_ORDER 8
+#endif
+#ifndef FLACOUT_EST_PREC
+#define FLACOUT_EST_PREC 15
+#endif
+// Also price a Fixed order-2 subframe and take the cheaper. Worth -0.0226% of
+// the album corpus on top of the LPC-only estimate (-0.2072% against -0.1846%),
+// and it is what pulls the two regressing tracks back: +1.015% -> +0.860% and
+// +0.039% -> +0.012%. It costs the biggest winner a little (-3.99% -> -3.83%),
+// so this is a net call, not a free one.
+#ifndef FLACOUT_EST_FIXED
+#define FLACOUT_EST_FIXED 1
+#endif
+
+// One band of W lags. W must be a compile-time constant or a[] is indexed
+// dynamically and spills, which is the whole point of banding (see above).
+// Safe whenever lag0 + W <= n, which every caller below guarantees via
+// max_lag <= n - 1.
+template <int W>
+static inline void autocorr_band(
+    const double* w, uint32_t n, int lag0, double* autoc)
+{
+    double a[W] = {};
+    // Range of j where every lag in this band is still in bounds.
+    const uint32_t jend = n - (uint32_t)(lag0 + W - 1);
+    for (uint32_t j = 0; j < jend; ++j) {
+        const double x = w[j];
+        for (int l = 0; l < W; ++l) a[l] += x * w[j + lag0 + l];
+    }
+    // Ragged tail: lag0+l runs off the end later for smaller l.
+    for (int l = 0; l < W; ++l) {
+        const uint32_t lim = n - (uint32_t)(lag0 + l);
+        for (uint32_t j = jend; j < lim; ++j) a[l] += w[j] * w[j + lag0 + l];
+    }
+    for (int l = 0; l < W; ++l) autoc[lag0 + l] = a[l];
+}
+
 static void autocorrelation(
     const double* w, uint32_t n, int max_lag, double* autoc)
 {
     constexpr int LAG_BAND = 33;
 
     int lag0 = 0;
-    for (; lag0 + LAG_BAND <= max_lag + 1; lag0 += LAG_BAND) {
-        double a[LAG_BAND] = {};
-        // Range of j where every lag in this band is still in bounds.
-        const uint32_t jend = n - (uint32_t)(lag0 + LAG_BAND - 1);
-        for (uint32_t j = 0; j < jend; ++j) {
-            const double x = w[j];
-            for (int l = 0; l < LAG_BAND; ++l) a[l] += x * w[j + lag0 + l];
-        }
-        // Ragged tail: lag0+l runs off the end later for smaller l.
-        for (int l = 0; l < LAG_BAND; ++l) {
-            const uint32_t lim = n - (uint32_t)(lag0 + l);
-            for (uint32_t j = jend; j < lim; ++j) a[l] += w[j] * w[j + lag0 + l];
-        }
-        for (int l = 0; l < LAG_BAND; ++l) autoc[lag0 + l] = a[l];
-    }
+    for (; lag0 + LAG_BAND <= max_lag + 1; lag0 += LAG_BAND)
+        autocorr_band<LAG_BAND>(w, n, lag0, autoc);
+
+    // Deliberately *not* generalised to narrower bands here. The DP estimator
+    // also wants a band (of FLACOUT_EST_ORDER + 1 lags) but it calls
+    // autocorr_band directly, because giving this function a second caller made
+    // the compiler stop inlining it into analyse_window — which is the one thing
+    // the note above says must not happen. Measured: bare -e on music_3s went
+    // 1.056x with two callers, and back to parity with one.
 
     // Leftover lags that do not fill a band.
     for (int lag = lag0; lag <= max_lag; ++lag) {
@@ -2212,29 +2249,76 @@ uint32_t Optimizer::estimate_subframe_cost(
     std::vector<int32_t> residuals(bsize);
 
     if (mode == 2) {
-        for (uint32_t i = 0; i < bsize; ++i) {
-            int32_t s  = samples[i]     >> wasted;
-            int32_t s1 = (i>0) ? (samples[i-1] >> wasted) : 0;
-            int32_t s2 = (i>1) ? (samples[i-2] >> wasted) : 0;
-            int32_t s3 = (i>2) ? (samples[i-3] >> wasted) : 0;
-            int32_t s4 = (i>3) ? (samples[i-4] >> wasted) : 0;
-            if ((uint32_t)i < (uint32_t)order) { residuals[i] = s; continue; }
-            switch (order) {
-                case 0: residuals[i]=s; break;
-                case 1: residuals[i]=s-s1; break;
-                case 2: residuals[i]=s-2*s1+s2; break;
-                case 3: residuals[i]=s-3*s1+3*s2-s3; break;
-                case 4: residuals[i]=s-4*s1+6*s2-4*s3+s4; break;
-            }
+        // Warm-up verbatim, then one loop per order with the shift hoisted.
+        //
+        // This used to read and shift four history samples for every output
+        // regardless of order, and switch on `order` inside the loop: 5 shifts
+        // and a jump per sample to do work that at order 2 needs 2 shifts and
+        // no branch. It did not matter while this only priced the Fixed modes
+        // of optimize_subframe, but estimate_lpc_bits_fast now calls it for
+        // every (node, candidate) in the DP, so it is on the estimated path's
+        // hot loop. Same arithmetic in the same order — bit-identical.
+        for (uint32_t i = 0; i < (uint32_t)order && i < bsize; ++i)
+            residuals[i] = samples[i] >> wasted;
+        const uint32_t i0 = (uint32_t)order;
+        switch (order) {
+            case 0:
+                for (uint32_t i = i0; i < bsize; ++i)
+                    residuals[i] = samples[i] >> wasted;
+                break;
+            case 1:
+                for (uint32_t i = i0; i < bsize; ++i)
+                    residuals[i] = (samples[i] >> wasted) - (samples[i-1] >> wasted);
+                break;
+            case 2:
+                for (uint32_t i = i0; i < bsize; ++i)
+                    residuals[i] = (samples[i] >> wasted)
+                                 - 2 * (samples[i-1] >> wasted)
+                                 +     (samples[i-2] >> wasted);
+                break;
+            case 3:
+                for (uint32_t i = i0; i < bsize; ++i)
+                    residuals[i] = (samples[i] >> wasted)
+                                 - 3 * (samples[i-1] >> wasted)
+                                 + 3 * (samples[i-2] >> wasted)
+                                 -     (samples[i-3] >> wasted);
+                break;
+            case 4:
+                for (uint32_t i = i0; i < bsize; ++i)
+                    residuals[i] = (samples[i] >> wasted)
+                                 - 4 * (samples[i-1] >> wasted)
+                                 + 6 * (samples[i-2] >> wasted)
+                                 - 4 * (samples[i-3] >> wasted)
+                                 +     (samples[i-4] >> wasted);
+                break;
         }
     } else {
         // LPC (rectangular window — fast path only)
+        //
+        // `shifted` is materialised rather than re-deriving `samples[i] >> wasted`
+        // per use, because compute_lpc_residuals below wants it as an array —
+        // see the note there.
+        std::vector<int32_t> shifted(bsize);
+        for (uint32_t i = 0; i < bsize; ++i) shifted[i] = samples[i] >> wasted;
         std::vector<double> f(bsize);
-        for (uint32_t i = 0; i < bsize; ++i) f[i] = (double)(samples[i] >> wasted);
+        for (uint32_t i = 0; i < bsize; ++i) f[i] = (double)shifted[i];
+        // One banded pass, not order+1 separate reduction passes. Identical
+        // arithmetic in identical order — a band accumulates each lag over
+        // ascending j exactly as the per-lag loop did — and this was the largest
+        // single self-time item in default mode (36% of worker self time) once
+        // estimate_lpc_bits_fast began calling it for every (node, candidate).
+        //
+        // autocorr_band directly rather than autocorrelation(): that function
+        // must keep exactly one caller so it stays inlined into analyse_window,
+        // see the note there.
         double autoc[33] = {};
-        for (int lag = 0; lag <= order; ++lag)
-            for (uint32_t j = 0; j < bsize - (uint32_t)lag; ++j)
-                autoc[lag] += f[j] * f[j+lag];
+        if (order == FLACOUT_EST_ORDER && bsize > (uint32_t)order) {
+            autocorr_band<FLACOUT_EST_ORDER + 1>(f.data(), bsize, 0, autoc);
+        } else {
+            for (int lag = 0; lag <= order && (uint32_t)lag < bsize; ++lag)
+                for (uint32_t j = 0; j < bsize - (uint32_t)lag; ++j)
+                    autoc[lag] += f[j] * f[j+lag];
+        }
 
         float lpc[32];
         compute_lpc_coefficients(autoc, lpc, order);
@@ -2254,14 +2338,21 @@ uint32_t Optimizer::estimate_subframe_cost(
             std::memcpy(out->q_coeffs, qc, order * sizeof(int32_t));
         }
 
-        for (uint32_t i = 0; i < bsize; ++i) {
-            int32_t s = samples[i] >> wasted;
-            if ((uint32_t)i < (uint32_t)order) { residuals[i] = s; continue; }
-            int64_t pred = 0;
-            for (int j = 0; j < order; ++j)
-                pred += (int64_t)qc[j] * (int64_t)(samples[i-1-j] >> wasted);
-            residuals[i] = s - (int32_t)(pred >> shift);
-        }
+        // The hand-vectorized kernel, not a scalar dot product. It computes the
+        // same partial products in the same order, and its narrow-accumulator
+        // path is documented bit-identical, so this is a pure speedup — but it
+        // is the one that matters here: the loop this replaced re-shifted every
+        // history sample *inside* the tap loop, so at order 8 it paid 8 shifts
+        // and 8 scalar multiply-adds per output where the kernel keeps 16
+        // outputs in registers and walks the taps outside.
+        const uint32_t eff_bps = (uint32_t)(bps - wasted);
+        const int64_t max_sum_abs_qc =
+            (eff_bps >= 1 && eff_bps <= 31) ? (int64_t)(INT32_MAX >> (eff_bps - 1)) : 0;
+        if (order >= 1)
+            compute_lpc_residuals(shifted.data(), bsize, qc, order, shift,
+                                  residuals.data(), nullptr, max_sum_abs_qc);
+        else
+            for (uint32_t i = 0; i < bsize; ++i) residuals[i] = shifted[i];
         header += 4u + 5u + (uint32_t)(order * precision);
 
     }
@@ -3397,26 +3488,6 @@ void Optimizer::precompute_granules(
         }
 
 }
-
-// Order and coefficient precision of the estimator's predictor. The order is
-// the estimate's main remaining bias — the real search reaches 32 — and the
-// precision is nearly free either way (order*prec is ~120 bits against a
-// payload of thousands), so it sits at the top of the range for predictor
-// fidelity rather than to save bits.
-#ifndef FLACOUT_EST_ORDER
-#define FLACOUT_EST_ORDER 8
-#endif
-#ifndef FLACOUT_EST_PREC
-#define FLACOUT_EST_PREC 15
-#endif
-// Also price a Fixed order-2 subframe and take the cheaper. Worth -0.0226% of
-// the album corpus on top of the LPC-only estimate (-0.2072% against -0.1846%),
-// and it is what pulls the two regressing tracks back: +1.015% -> +0.860% and
-// +0.039% -> +0.012%. It costs the biggest winner a little (-3.99% -> -3.83%),
-// so this is a net call, not a free one.
-#ifndef FLACOUT_EST_FIXED
-#define FLACOUT_EST_FIXED 1
-#endif
 
 uint32_t Optimizer::estimate_lpc_bits_fast(
     const std::vector<std::vector<int32_t>>& pcm_data,

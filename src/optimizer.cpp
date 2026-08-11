@@ -3438,7 +3438,26 @@ uint32_t Optimizer::estimate_lpc_bits_fast(
 std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
     const std::vector<std::vector<int32_t>>& pcm_data)
 {
+    // Only the estimated path reads the granule cache: estimate_lpc_bits_fast
+    // is called from the !full_search() branch of phase 1, and select_windows
+    // (which already falls back to the configured set on an empty cache) is
+    // gated on m_adaptive && !full_search() in compute_block. Under -e the
+    // cache was built and then never touched, at 4.5 bytes per sample per
+    // channel — 91.5 MB on a 10.2M-sample stereo track, a fifth of that run's
+    // 466 MB peak — plus a single-threaded pass over the whole stream before
+    // any worker starts.
+    //
+    // Nothing reads what this skips, so exact-DP output is unchanged by
+    // construction rather than by measurement.
+    //
+    // FLACOUT_DUMP_BLOCKCOST is the exception: its phase-1 block *does* read
+    // the cache under full_search(), because comparing the estimator against
+    // exact costs is the entire point of that build.
+#ifdef FLACOUT_DUMP_BLOCKCOST
     precompute_granules(pcm_data);
+#else
+    if (!full_search()) precompute_granules(pcm_data);
+#endif
 
     const size_t total_samples  = pcm_data[0].size();
 

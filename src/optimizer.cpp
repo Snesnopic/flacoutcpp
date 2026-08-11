@@ -977,6 +977,95 @@ std::atomic<uint64_t> g_pdump_sf{0};
 } // namespace
 #endif
 
+#ifdef FLACOUT_DUMP_FP32RANK
+// Third offline sink, and the one that prices a GPU port. A GPU can evaluate
+// candidates in fp32 roughly 2.2x faster than in exact integer (measured on an
+// M4 Max: 3963 vs 1835 GMAC/s), but fp32 cannot produce the emitted residual —
+// a 15-bit coefficient times a 16-bit sample carries up to 30 significant bits
+// against fp32's 24-bit mantissa, so the products are inexact before any
+// accumulation. The workable split is FLACCL's: sweep every candidate in fp32,
+// then exactly evaluate only the best K.
+//
+// That is only sound if the fp32 ordering keeps the true winner near the top.
+// This sink measures exactly that. Per subframe it costs every candidate twice
+// — once exactly, once with the residual computed in fp32 the way a GPU kernel
+// would — then records where the exact winner lands in the fp32 ordering, and
+// what keeping only the top K would have cost in real bits.
+//
+// The excess-bits columns are the decision metric, not the rank histogram:
+// rank only matters through the bits it costs.
+namespace {
+struct Fp32RankDump {
+    static constexpr int NK = 6;
+    static constexpr int KS[NK] = {1, 2, 4, 8, 16, 32};
+    std::mutex mu;
+    std::vector<uint64_t> rank_hist;      // exact winner's index in fp32 order
+    uint64_t subframes = 0;
+    uint64_t candidates = 0;
+    uint64_t exact_bits = 0;              // sum of the true minimum cost
+    uint64_t excess[NK] = {};             // extra bits if only top-K kept
+
+    void record(std::vector<std::pair<uint32_t,uint32_t>>& cc) {
+        if (cc.empty()) return;
+        // order by fp32 cost, tie-broken by index so the result is stable
+        std::vector<uint32_t> idx(cc.size());
+        for (uint32_t i = 0; i < idx.size(); ++i) idx[i] = i;
+        std::sort(idx.begin(), idx.end(), [&](uint32_t a, uint32_t b){
+            if (cc[a].second != cc[b].second) return cc[a].second < cc[b].second;
+            return a < b;
+        });
+        uint32_t truemin = UINT32_MAX, truearg = 0;
+        for (uint32_t i = 0; i < cc.size(); ++i)
+            if (cc[i].first < truemin) { truemin = cc[i].first; truearg = i; }
+        size_t rank = 0;
+        while (rank < idx.size() && idx[rank] != truearg) ++rank;
+
+        std::lock_guard<std::mutex> lk(mu);
+        if (rank_hist.size() <= rank) rank_hist.resize(rank + 1, 0);
+        rank_hist[rank]++;
+        subframes++;
+        candidates += cc.size();
+        exact_bits += truemin;
+        for (int k = 0; k < NK; ++k) {
+            uint32_t best = UINT32_MAX;
+            for (size_t i = 0; i < idx.size() && i < (size_t)KS[k]; ++i)
+                if (cc[idx[i]].first < best) best = cc[idx[i]].first;
+            excess[k] += (uint64_t)(best - truemin);
+        }
+    }
+
+    ~Fp32RankDump() {
+        if (!subframes) return;
+        std::fprintf(stderr,
+            "\nFP32RANK  subframes=%llu  candidates=%llu (%.1f per subframe)\n",
+            (unsigned long long)subframes, (unsigned long long)candidates,
+            (double)candidates / (double)subframes);
+        uint64_t cum = 0;
+        std::fprintf(stderr, "  exact winner's rank in the fp32 ordering:\n");
+        for (size_t r = 0; r < rank_hist.size() && r < 16; ++r) {
+            cum += rank_hist[r];
+            std::fprintf(stderr, "    rank %-3zu %8llu  (%.2f%% cumulative)\n",
+                r, (unsigned long long)rank_hist[r],
+                100.0 * (double)cum / (double)subframes);
+        }
+        if (rank_hist.size() > 16) {
+            uint64_t tail = 0;
+            for (size_t r = 16; r < rank_hist.size(); ++r) tail += rank_hist[r];
+            std::fprintf(stderr, "    rank >=16 %7llu  (worst %zu)\n",
+                (unsigned long long)tail, rank_hist.size() - 1);
+        }
+        std::fprintf(stderr, "  cost of keeping only the top K by fp32 cost:\n");
+        for (int k = 0; k < NK; ++k)
+            std::fprintf(stderr, "    K=%-3d  +%llu bits  (%+.4f%% of subframe bits)\n",
+                KS[k], (unsigned long long)excess[k],
+                100.0 * (double)excess[k] / (double)exact_bits);
+    }
+};
+constexpr int Fp32RankDump::KS[];
+Fp32RankDump g_fp32rank;
+} // namespace
+#endif
+
 // How small a window coefficient must be, relative to the window's peak, to
 // count the sample as one the window cannot see. 0.0 means "exactly zero",
 // which is what the blind-region term originally tested; see the calibration
@@ -2113,6 +2202,11 @@ SubframeParams Optimizer::optimize_subframe(
         std::vector<int> precisions;
         for (int p = 8; p <= 15; ++p) precisions.push_back(p);
         const uint32_t min_prec  = (uint32_t)precisions.front();
+#ifdef FLACOUT_DUMP_FP32RANK
+        // (exact cost, fp32 cost) for every candidate this subframe evaluates.
+        std::vector<std::pair<uint32_t,uint32_t>> fp32_costs;
+        std::vector<int32_t> fp32_res;
+#endif
 
         // Narrow-accumulator bound for compute_lpc_residuals; see its comment.
         // Same expression the ladder delta applies to its correction taps.
@@ -2336,6 +2430,37 @@ SubframeParams Optimizer::optimize_subframe(
                 // +6: residual block header (2-bit coding method + 4-bit
                 // partition order), see estimate_subframe_cost for detail.
                 const uint32_t cost = hdr + 6u + rice;
+#ifdef FLACOUT_DUMP_FP32RANK
+                {
+                    // The same candidate priced the way a GPU fp32 kernel
+                    // would. Coefficients are pre-scaled by 2^-shift, which is
+                    // exact (power-of-two divisor), so every bit of error here
+                    // comes from the products and their accumulation — the
+                    // thing fp32 genuinely cannot represent.
+                    //
+                    // floor(), not rint(): the integer path is an arithmetic
+                    // right shift, so flooring isolates precision loss instead
+                    // of confounding it with a different rounding rule.
+                    //
+                    // Conservative against a real GPU in one respect: this is
+                    // built with -ffp-contract=off, so no FMA. A GPU kernel
+                    // would contract and be slightly *more* accurate.
+                    fp32_res.resize(bsize);
+                    const float inv = 1.0f / (float)((int64_t)1 << shift);
+                    float fc[32];
+                    for (int j = 0; j < ord; ++j) fc[j] = (float)qc[j] * inv;
+                    for (int j = 0; j < ord; ++j) fp32_res[j] = shifted[j];
+                    for (uint32_t i2 = (uint32_t)ord; i2 < bsize; ++i2) {
+                        float sum = 0.0f;
+                        for (int j = 0; j < ord; ++j)
+                            sum += fc[j] * (float)shifted[i2 - 1 - j];
+                        fp32_res[i2] = shifted[i2] - (int32_t)std::floor(sum);
+                    }
+                    const uint32_t frice = calculate_rice_cost(
+                        fp32_res.data(), bsize, (uint32_t)ord, nullptr);
+                    fp32_costs.emplace_back(cost, hdr + 6u + frice);
+                }
+#endif
 #ifdef FLACOUT_DUMP_PRECISION
                 {
                     // E_a = r0 - a'r, the Levinson residual energy at this
@@ -2787,6 +2912,10 @@ SubframeParams Optimizer::optimize_subframe(
                 if (!improved) break; // a clean sweep: this is an axis-local min
             }
         }
+
+#ifdef FLACOUT_DUMP_FP32RANK
+        g_fp32rank.record(fp32_costs);
+#endif
 
         // Materialize the winning LPC candidate, if it beat the non-LPC modes.
         // Re-deriving its residuals costs one more pass out of the millions the

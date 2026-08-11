@@ -106,6 +106,32 @@ public:
     void set_slots(int n);
     int  slots() const;
 
+    /// Percentage of offered subframes the GPU accepts (1..100). Below 100
+    /// hands work back to the CPU; see the note on the throttle in gpu.cpp.
+    void set_duty(int pct);
+    int  duty() const;
+
+    /**
+     * @brief Cheap advisory check: would a batch be accepted right now?
+     *
+     * Callers must build a candidate batch before they can offer it, and that
+     * costs a quantize pass over every candidate. If evaluate() then declines
+     * -- because no slot is free, or the duty throttle refuses -- that work is
+     * thrown away and the CPU path redoes it. Asking first turns a wasted
+     * batch build into a cheap load and a branch.
+     *
+     * Advisory only: a slot can be taken between the ask and the offer, in
+     * which case evaluate() still declines and the caller still falls back.
+     * That is a rarer race, not a correctness question — both paths produce
+     * the same winner.
+     */
+    bool would_accept() const;
+
+    /// Multiply-accumulates the GPU absorbed, directly comparable to the
+    /// CPU's residual_macs counter — candidate counts are not, since a
+    /// candidate at bsize 16384 is sixteen times one at 1024.
+    uint64_t macs() const;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> m_impl;

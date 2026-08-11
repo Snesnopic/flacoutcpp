@@ -94,6 +94,9 @@ struct ProcessorConfig {
     /// See flacoutcpp::Config::gpu_slots.
     unsigned gpu_slots = 3;
 
+    /// See flacoutcpp::Config::gpu_duty.
+    unsigned gpu_duty = 100;
+
     /**
      * @brief Adaptive per-subframe window selection (experimental,
      * estimated-DP modes only). See flacoutcpp::Config::adaptive_windows.

@@ -236,6 +236,9 @@ struct Config {
     /// Dispatches in flight (`--gpu-slots`, 1-16). See GpuEvaluator::set_slots.
     unsigned gpu_slots = 3;
 
+    /// Percent of subframes the GPU accepts (`--gpu-duty`, 1-100).
+    unsigned gpu_duty = 100;
+
     /**
      * @brief Effort level 0-9: one dial across the measured size/time frontier.
      *

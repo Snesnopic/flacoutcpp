@@ -239,6 +239,18 @@ int main(int argc, char* argv[]) {
                 return EXIT_FAILURE;
             }
 
+        } else if (arg == "--gpu-duty") {
+            if (i + 1 >= argc) { std::cerr << "Error: --gpu-duty requires a number.\n"; return EXIT_FAILURE; }
+            ++i;
+            try {
+                unsigned v = static_cast<unsigned>(std::stoul(argv[i]));
+                if (v < 1 || v > 100) throw std::invalid_argument("range");
+                cfg.gpu_duty = v;
+            } catch (const std::exception&) {
+                std::cerr << "Error: --gpu-duty takes 1-100, got '" << argv[i] << "'.\n";
+                return EXIT_FAILURE;
+            }
+
         } else if (arg == "--gpu-slots") {
             if (i + 1 >= argc) { std::cerr << "Error: --gpu-slots requires a number.\n"; return EXIT_FAILURE; }
             ++i;

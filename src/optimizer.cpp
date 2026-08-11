@@ -319,7 +319,8 @@ Optimizer::Optimizer(uint32_t channels, uint32_t bps, uint32_t sample_rate,
                      bool     use_gpu,
                      unsigned gpu_min_batch,
                      unsigned gpu_partition_cap,
-                     unsigned gpu_slots)
+                     unsigned gpu_slots,
+                     unsigned gpu_duty)
     : m_channels(channels), m_bps(bps), m_sample_rate(sample_rate),
       m_max_threads(max_threads),
       m_exhaustive(exhaustive), m_verbose(verbose), m_max_candidates(max_candidates),
@@ -332,6 +333,7 @@ Optimizer::Optimizer(uint32_t channels, uint32_t bps, uint32_t sample_rate,
         m_gpu->set_min_batch(gpu_min_batch);
         m_gpu->set_partition_cap((int)gpu_partition_cap);
         m_gpu->set_slots((int)gpu_slots);
+        m_gpu->set_duty((int)gpu_duty);
         if (m_verbose) {
             if (m_gpu->available())
                 std::fprintf(stderr, "GPU: %s\n", m_gpu->why().c_str());
@@ -1364,6 +1366,13 @@ void Optimizer::report_gpu(uint64_t total_candidates) const
                   "GPU: %llu candidates in %.2fs (%.3g candidates/s)\n",
                   (unsigned long long)gc, gs,
                   gs > 0.0 ? (double)gc / gs : 0.0);
+    std::cout << buf;
+    // MACs, not candidates: a candidate at bsize 16384 is sixteen times one at
+    // 1024, so a count-based share badly overstates what the device absorbed
+    // if it skews toward short blocks -- which it does, since a long dispatch
+    // holds its slot while short ones cycle through.
+    std::snprintf(buf, sizeof buf, "GPU: %llu MACs\n",
+                  (unsigned long long)m_gpu->macs());
     std::cout << buf;
     (void)total_candidates;
 }
@@ -2721,7 +2730,8 @@ SubframeParams Optimizer::optimize_subframe(
         // never have won; evaluating them anyway costs time and changes
         // nothing. The winner, and therefore the output, is identical.
         if (gpu && gpu->available() && (bsize % 32u) == 0u &&
-            max_candidates == 0 && precision_rungs == 0) {
+            max_candidates == 0 && precision_rungs == 0 &&
+            gpu->would_accept()) {
             struct Meta { int ord, prec, shift; };
             std::vector<GpuEvaluator::Candidate> gcands;
             std::vector<Meta> meta;
@@ -2971,6 +2981,7 @@ SubframeParams Optimizer::optimize_subframe(
             auto gpu_prepass = [&]() {
                 if (!gpu || !gpu->available() || (bsize % 32u) != 0u) return;
                 if (precision_rungs != 0) return;
+                if (!gpu->would_accept()) return;
                 // Batch only as far down the ranked list as the scan can
                 // plausibly reach. Pricing the whole list is speculative work,
                 // and at small -c almost all of it is thrown away: with
@@ -3456,7 +3467,11 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
     std::vector<BlockParams> cost_table(num_nodes * NUM_CANDS);
 
     unsigned nthreads = std::max(1u, static_cast<unsigned>(std::thread::hardware_concurrency()));
-    if (m_max_threads > 0) nthreads = std::min(nthreads, (unsigned)m_max_threads);
+    // -t is absolute, not a cap. Clamping it to hardware_concurrency made it
+    // impossible to oversubscribe, which is exactly what -G wants: a worker
+    // blocked on a GPU fence is not runnable, so a pool sized to the core
+    // count leaves cores idle while the device works.
+    if (m_max_threads > 0) nthreads = (unsigned)m_max_threads;
 
     if (m_verbose)
         std::cout << "DP: " << num_nodes << " nodes × " << NUM_CANDS

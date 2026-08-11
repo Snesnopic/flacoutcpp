@@ -206,7 +206,8 @@ bool Processor::process() {
                   m_config.use_gpu,
                   m_config.gpu_min_batch,
                   m_config.gpu_partition_cap,
-                  m_config.gpu_slots);
+                  m_config.gpu_slots,
+                  m_config.gpu_duty);
     if (!reuse_edges.empty())
         opt.set_reuse_edges(std::move(reuse_edges));
     std::vector<BlockParams> blocks = opt.find_optimal_block_partitioning(m_pcm_data);

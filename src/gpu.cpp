@@ -21,6 +21,13 @@ void GpuEvaluator::set_partition_cap(int) {}
 int GpuEvaluator::partition_cap() const { return 8; }
 void GpuEvaluator::set_slots(int) {}
 int GpuEvaluator::slots() const { return 0; }
+void GpuEvaluator::set_duty(int) {}
+int GpuEvaluator::duty() const { return 100; }
+uint64_t GpuEvaluator::macs() const {
+    return m_impl->n_macs.load(std::memory_order_relaxed);
+}
+bool GpuEvaluator::would_accept() const { return false; }
+uint64_t GpuEvaluator::macs() const { return 0; }
 } // namespace flacoutcpp
 
 #else
@@ -97,6 +104,7 @@ struct GpuEvaluator::Impl {
 
     std::mutex submit_mu;                // vkQueueSubmit only
     std::atomic<uint64_t> n_cands{0};
+    std::atomic<uint64_t> n_macs{0};   // (bsize-ord)*ord, comparable to the CPU's
     // Per-call elapsed cannot be summed once dispatches overlap -- with six
     // slots in flight that counts the same wall time up to six times. Track
     // the span from the first dispatch's start to the last one's end instead,
@@ -106,6 +114,14 @@ struct GpuEvaluator::Impl {
     std::chrono::steady_clock::time_point t_origin = std::chrono::steady_clock::now();
     std::atomic<size_t>   min_batch{0};
     std::atomic<int>      pcap{8};
+    // Share throttle. Work is claimed greedily -- a subframe goes to the GPU
+    // whenever a slot is free -- which over-commits a device slower than the
+    // host: the CPU finishes its share early and idles at the DP's barrier
+    // while the GPU is still working. Accepting only `duty` percent of offers
+    // hands the surplus back. Deterministic (a counter, not a coin) so a run
+    // stays reproducible; the output is invariant to the split either way.
+    std::atomic<int>      duty{100};
+    std::atomic<uint64_t> offers{0};
 
     static constexpr uint32_t WG = 128;  // 4 candidates per work group
 
@@ -440,6 +456,24 @@ void GpuEvaluator::set_slots(int n) {
 int GpuEvaluator::slots() const {
     return m_impl->nslot.load(std::memory_order_relaxed);
 }
+void GpuEvaluator::set_duty(int pct) {
+    m_impl->duty.store(pct < 1 ? 1 : (pct > 100 ? 100 : pct),
+                       std::memory_order_relaxed);
+}
+int GpuEvaluator::duty() const {
+    return m_impl->duty.load(std::memory_order_relaxed);
+}
+uint64_t GpuEvaluator::macs() const {
+    return m_impl->n_macs.load(std::memory_order_relaxed);
+}
+bool GpuEvaluator::would_accept() const {
+    Impl& I = *m_impl;
+    if (!I.ok) return false;
+    const int nsl = I.nslot.load(std::memory_order_relaxed);
+    for (int i = 0; i < nsl; ++i)
+        if (!I.slots[i].busy.load(std::memory_order_relaxed)) return true;
+    return false;
+}
 void GpuEvaluator::set_partition_cap(int p) {
     m_impl->pcap.store(p < 1 ? 1 : (p > 8 ? 8 : p), std::memory_order_relaxed);
 }
@@ -465,6 +499,12 @@ bool GpuEvaluator::evaluate(const int32_t* shifted, uint32_t bsize,
     // The kernel walks the block in fixed 32-sample chunks.
     if (bsize % 32u != 0u) return false;
     if (cands.size() < I.min_batch.load(std::memory_order_relaxed)) return false;
+
+    const int dty = I.duty.load(std::memory_order_relaxed);
+    if (dty < 100) {
+        const uint64_t n = I.offers.fetch_add(1, std::memory_order_relaxed);
+        if ((int)((n * 100) % 10000 / 100) >= dty) return false;
+    }
 
     // Claim a slot. Failing is not an error: the caller encodes on the CPU
     // instead, and both paths produce the same winner, so the output is
@@ -553,6 +593,10 @@ bool GpuEvaluator::evaluate(const int32_t* shifted, uint32_t bsize,
     uint64_t last = I.t_last.load(std::memory_order_relaxed);
     while (us1 > last &&
            !I.t_last.compare_exchange_weak(last, us1, std::memory_order_relaxed)) {}
+    uint64_t macs = 0;
+    for (const auto& cd : cands)
+        macs += (uint64_t)(bsize - (uint32_t)cd.order) * (uint64_t)cd.order;
+    I.n_macs.fetch_add(macs, std::memory_order_relaxed);
     I.n_cands.fetch_add(cands.size(), std::memory_order_relaxed);
     return true;
 }

@@ -294,7 +294,8 @@ public:
               bool     use_gpu = false,
               unsigned gpu_min_batch = 0,
               unsigned gpu_partition_cap = 8,
-              unsigned gpu_slots = 3);
+              unsigned gpu_slots = 3,
+              unsigned gpu_duty = 100);
 
     /**
      * @brief Find the optimal variable block-size partition for the stream.

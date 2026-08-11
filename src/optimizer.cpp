@@ -2,6 +2,7 @@
 #include "frame_writer.hpp"
 #include <algorithm>
 #include <array>
+#include <unordered_map>
 #if defined(_MSC_VER) && !defined(__clang__)
 #include <intrin.h>
 #endif
@@ -2356,6 +2357,26 @@ SubframeParams Optimizer::optimize_subframe(
         std::vector<int32_t> fp32_res;
 #endif
 
+        // Rice costs memoised by predictor. Different windows routinely
+        // quantize to the SAME (order, shift, coefficients) at a given order,
+        // and an identical predictor has an identical residual and an
+        // identical Rice cost -- only the header differs, and that is
+        // recomputed per candidate anyway. Measured on real subframes (golden
+        // vectors): 4.2% of 6656 candidates at bsize 1024, 8.4% at 4096, none
+        // of them adjacent, so a backward peek finds none of it.
+        //
+        // Keyed by a hash into an arena of coefficients so a hit costs one
+        // lookup and one memcmp against ~100k multiply-accumulates avoided.
+        // Only worth it on the full sweep. Duplicates are cross-window, so a
+        // ranked search evaluating a handful of (window, order) pairs almost
+        // never hits one and just pays the hash: measured -2% at -c 8 against
+        // +4 to +16% at -c 0.
+        const bool use_memo = (max_candidates == 0);
+        struct MemoEnt { int ord, shift; uint32_t qoff; uint32_t rice; };
+        std::vector<MemoEnt>  memo;
+        std::vector<int32_t>  memo_qc;
+        std::unordered_map<uint64_t, std::vector<uint32_t>> memo_ix;
+
         // Narrow-accumulator bound for compute_lpc_residuals; see its comment.
         // Same expression the ladder delta applies to its correction taps.
         const int64_t max_sum_abs_qc =
@@ -2551,6 +2572,37 @@ SubframeParams Optimizer::optimize_subframe(
                     continue; // degenerate coefficients, no usable quantization
                 if (clamped) { INSTR(g_instr.overflow_skips.fetch_add(1, std::memory_order_relaxed)); }
 
+
+                // Have we already priced this exact predictor?
+                bool memo_hit = false;
+                uint64_t mh = 0;
+                if (use_memo) {
+                    mh = 1469598103934665603ull ^ (uint64_t)ord;
+                    mh = mh * 1099511628211ull ^ (uint64_t)(uint32_t)shift;
+                    for (int j = 0; j < ord; ++j)
+                        mh = (mh ^ (uint64_t)(uint32_t)qc[j]) * 1099511628211ull;
+                    auto it = memo_ix.find(mh);
+                    if (it != memo_ix.end()) {
+                        for (uint32_t mi : it->second) {
+                            const MemoEnt& e = memo[mi];
+                            if (e.ord != ord || e.shift != shift) continue;
+                            if (std::memcmp(&memo_qc[e.qoff], qc,
+                                            (size_t)ord * sizeof(int32_t)) != 0) continue;
+                            const uint32_t cost2 = hdr + 6u + e.rice;
+                            if (cost2 < cand_best) cand_best = cost2;
+                            if (cost2 < best_lpc_cost) {
+                                best_lpc_cost = cost2;
+                                bl_ord = ord; bl_prec = prec; bl_shift = shift;
+                                std::memcpy(bl_qc, qc, (size_t)ord * sizeof(int32_t));
+                                INSTR(instr_best_win = (int)wt);
+                            }
+                            memo_hit = true;
+                            break;
+                        }
+                    }
+                }
+                if (memo_hit) continue;
+
                 INSTR(g_instr.residual_calls.fetch_add(1, std::memory_order_relaxed));
 
                 // One ladder step up from the coefficients pred[] was built
@@ -2680,6 +2732,13 @@ SubframeParams Optimizer::optimize_subframe(
                         window_energy(wt, bsize), ac[0], sd2, drd1, drd4);
                 }
 #endif
+                if (use_memo) {
+                    MemoEnt e{ord, shift, (uint32_t)memo_qc.size(), rice};
+                    memo_qc.insert(memo_qc.end(), qc, qc + ord);
+                    memo_ix[mh].push_back((uint32_t)memo.size());
+                    memo.push_back(e);
+                }
+
                 if (cost < cand_best) cand_best = cost;
                 if (cost < best_lpc_cost) {
                     best_lpc_cost = cost;

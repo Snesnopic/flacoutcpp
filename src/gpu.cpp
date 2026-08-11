@@ -111,6 +111,13 @@ struct GpuEvaluator::Impl {
     std::chrono::steady_clock::time_point t_origin = std::chrono::steady_clock::now();
     std::atomic<size_t>   min_batch{0};
     std::atomic<int>      pcap{8};
+    // Batches the device declined to price (see the sentinel check in
+    // evaluate). Warn once, then keep counting: a device that does this for
+    // every batch has silently become a CPU run, which the user should know.
+    std::atomic<uint64_t> n_invalid{0};
+    std::atomic<bool>     warned_invalid{false};
+    // VK_EXT_subgroup_size_control present, usable, and able to pin 32.
+    bool size_ctl = false;
     // Share throttle. Work is claimed greedily -- a subframe goes to the GPU
     // whenever a slot is free -- which over-commits a device slower than the
     // host: the CPU finishes its share early and idles at the DP's barrier
@@ -243,17 +250,57 @@ bool GpuEvaluator::Impl::init() {
     vkGetPhysicalDeviceProperties(phys, &props);
     vkGetPhysicalDeviceMemoryProperties(phys, &memprops);
 
+    // VkPhysicalDeviceSubgroupProperties::subgroupSize is the device's
+    // *default*, not a promise about any particular dispatch: on Intel ANV the
+    // compiler picks SIMD8/16/32 per shader, so a device advertising 32 can
+    // still run this kernel at 16. The kernel notices (gl_SubgroupSize) and
+    // bails, which used to poison the search. Checking this property was
+    // therefore validating a number that does not govern the dispatch.
+    //
+    // VK_EXT_subgroup_size_control fixes it properly by *pinning* the width at
+    // pipeline creation. Where it is available the property is only used to
+    // check that 32 is reachable; where it is not, fall back to trusting the
+    // property as before and rely on the kernel's guard.
+    uint32_t nde = 0;
+    vkEnumerateDeviceExtensionProperties(phys, nullptr, &nde, nullptr);
+    std::vector<VkExtensionProperties> de(nde);
+    vkEnumerateDeviceExtensionProperties(phys, nullptr, &nde, de.data());
+    for (const auto& e : de)
+        if (!std::strcmp(e.extensionName, VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME))
+            size_ctl = true;
+
     VkPhysicalDeviceSubgroupProperties sgp{};
     sgp.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
+    VkPhysicalDeviceSubgroupSizeControlPropertiesEXT sgc{};
+    sgc.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES_EXT;
     VkPhysicalDeviceProperties2 p2{};
     p2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
     p2.pNext = &sgp;
+    if (size_ctl) sgp.pNext = &sgc;
     vkGetPhysicalDeviceProperties2(phys, &p2);
 
+    if (size_ctl) {
+        VkPhysicalDeviceSubgroupSizeControlFeaturesEXT sgf{};
+        sgf.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT;
+        VkPhysicalDeviceFeatures2 f2{};
+        f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+        f2.pNext = &sgf;
+        vkGetPhysicalDeviceFeatures2(phys, &f2);
+        // Full subgroups matter as much as the size: without it a partially
+        // filled subgroup leaves lanes inactive, and this kernel maps one
+        // bit-plane per lane. WG (128) is a multiple of 32, so every subgroup
+        // is full by construction once the size is pinned.
+        if (!sgf.subgroupSizeControl || !sgf.computeFullSubgroups ||
+            !(sgc.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT) ||
+            sgc.minSubgroupSize > 32u || sgc.maxSubgroupSize < 32u)
+            size_ctl = false;
+    }
+
     // The kernel assigns one bit-plane per lane, so it needs exactly 32.
-    if (sgp.subgroupSize != 32) {
+    if (!size_ctl && sgp.subgroupSize != 32) {
         why = std::string(props.deviceName) + ": subgroup size is " +
-              std::to_string(sgp.subgroupSize) + ", the kernel requires 32";
+              std::to_string(sgp.subgroupSize) + ", the kernel requires 32" +
+              " (and VK_EXT_subgroup_size_control is unavailable to pin it)";
         return false;
     }
     const VkSubgroupFeatureFlags needsg =
@@ -286,14 +333,11 @@ bool GpuEvaluator::Impl::init() {
             if (qp[i].queueFlags & VK_QUEUE_COMPUTE_BIT) { qfam = i; found = true; break; }
     if (!found) { why = "no compute queue"; return false; }
 
-    uint32_t nde = 0;
-    vkEnumerateDeviceExtensionProperties(phys, nullptr, &nde, nullptr);
-    std::vector<VkExtensionProperties> de(nde);
-    vkEnumerateDeviceExtensionProperties(phys, nullptr, &nde, de.data());
     std::vector<const char*> dexts;
     for (const auto& e : de)
         if (!std::strcmp(e.extensionName, "VK_KHR_portability_subset"))
             dexts.push_back("VK_KHR_portability_subset");
+    if (size_ctl) dexts.push_back(VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME);
 
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qci{};
@@ -303,8 +347,13 @@ bool GpuEvaluator::Impl::init() {
     qci.pQueuePriorities = &prio;
     VkPhysicalDeviceFeatures want{};
     want.shaderInt64 = VK_TRUE;
+    VkPhysicalDeviceSubgroupSizeControlFeaturesEXT sgf_on{};
+    sgf_on.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT;
+    sgf_on.subgroupSizeControl  = VK_TRUE;
+    sgf_on.computeFullSubgroups = VK_TRUE;
     VkDeviceCreateInfo dci{};
     dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+    if (size_ctl) dci.pNext = &sgf_on;
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
     dci.enabledExtensionCount = (uint32_t)dexts.size();
@@ -368,12 +417,25 @@ bool GpuEvaluator::Impl::init() {
     if (vkCreateShaderModule(dev, &smci, nullptr, &shader) != VK_SUCCESS) {
         why = "shader module"; return false;
     }
+    // Pin the dispatch width. Without this the driver is free to compile the
+    // kernel at any supported subgroup size and the one-bit-plane-per-lane
+    // mapping silently stops holding.
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT rss{};
+    rss.sType =
+        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT;
+    rss.requiredSubgroupSize = 32;
+
     VkComputePipelineCreateInfo cpi{};
     cpi.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
     cpi.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
     cpi.stage.module = shader;
     cpi.stage.pName = "main";
+    if (size_ctl) {
+        cpi.stage.pNext = &rss;
+        cpi.stage.flags =
+            VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT_EXT;
+    }
     cpi.layout = plo;
     if (vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &pipe) != VK_SUCCESS) {
         why = std::string(props.deviceName) + ": compute pipeline creation failed";
@@ -403,7 +465,8 @@ bool GpuEvaluator::Impl::init() {
         }
     }
 
-    why = std::string(props.deviceName) + " (subgroup 32, shaderInt64)";
+    why = std::string(props.deviceName) + " (subgroup 32 " +
+          (size_ctl ? "pinned" : "by default") + ", shaderInt64)";
     ok = true;
     return true;
 }
@@ -583,6 +646,32 @@ bool GpuEvaluator::evaluate(const int32_t* shifted, uint32_t bsize,
 
     out_costs.resize(cands.size());
     std::memcpy(out_costs.data(), sl.bCosts.map, (size_t)needO);
+
+    // The kernel writes UINT32_MAX for any invocation it could not price (see
+    // the gl_SubgroupSize guard at the end of sweep.comp). That value must
+    // never reach a caller: both call sites compute `hdr + 6 + cost`, which
+    // wraps in uint32 to `hdr + 5` -- the *cheapest* cost representable, so a
+    // failed candidate would beat every real one and win the subframe. It is
+    // the exact defect that made -G pick order 1 where the CPU picks order 32
+    // (see GPU_PLAN.md); a sentinel that means "no answer" must not be
+    // arithmetic.
+    //
+    // Rejecting the whole batch rather than the individual entries keeps the
+    // fallback honest: `false` here means the caller prices these candidates on
+    // the CPU, which is the same answer, so the output is unchanged rather than
+    // merely less wrong.
+    for (uint32_t c : out_costs) {
+        if (c == UINT32_MAX) {
+            if (!I.warned_invalid.exchange(true, std::memory_order_relaxed))
+                std::fprintf(stderr,
+                    "GPU: device returned no result for a batch (subgroup size "
+                    "is not %d at dispatch); those candidates run on the CPU.\n",
+                    32);
+            I.n_invalid.fetch_add(1, std::memory_order_relaxed);
+            out_costs.clear();
+            return false;
+        }
+    }
 
     const auto t1 = std::chrono::steady_clock::now();
     const uint64_t us1 = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(

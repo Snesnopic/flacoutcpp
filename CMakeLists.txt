@@ -26,6 +26,12 @@ endif()
 # binaries that may not run on other machines, so it is off by default.
 option(FLACOUT_NATIVE "Optimize for the build host's CPU (not portable)" OFF)
 
+# Opt-in Vulkan compute backend (`-G`). Off by default so the build keeps its
+# single dependency; when off, src/gpu.cpp compiles to a stub and `-G` reports
+# why rather than failing to link. The kernel is bit-exact with the CPU cost
+# model, so a GPU build still passes bench/check.sh.
+option(FLACOUT_VULKAN "Build the Vulkan compute backend (-G)" OFF)
+
 # Skip vendoring our own copy if a FLAC target already exists — e.g. when
 # flacoutcpp is add_subdirectory'd into a parent project that already
 # provides one (its own libflac submodule), so the two don't collide.
@@ -47,8 +53,49 @@ add_library(flacout_lib
     src/bitwriter.cpp
     src/frame_writer.cpp
     src/flacoutcpp.cpp
+    src/gpu.cpp
 )
 target_link_libraries(flacout_lib FLAC)
+
+if(FLACOUT_VULKAN)
+    find_package(Vulkan REQUIRED)
+    # glslangValidator ships with the Vulkan SDK; glslc with shaderc. Either
+    # will do, and Homebrew installs them separately, so accept both.
+    find_program(FLACOUT_GLSLC NAMES glslc)
+    find_program(FLACOUT_GLSLANG NAMES glslangValidator)
+    set(SWEEP_SPV "${CMAKE_CURRENT_BINARY_DIR}/sweep.spv")
+    set(SWEEP_HDR "${CMAKE_CURRENT_BINARY_DIR}/generated/sweep_spv.h")
+    if(FLACOUT_GLSLC)
+        set(SWEEP_CMD ${FLACOUT_GLSLC} -O --target-env=vulkan1.1
+            -fshader-stage=compute "${CMAKE_CURRENT_SOURCE_DIR}/shaders/sweep.comp"
+            -o "${SWEEP_SPV}")
+    elseif(FLACOUT_GLSLANG)
+        set(SWEEP_CMD ${FLACOUT_GLSLANG} -V --target-env vulkan1.1 -S comp
+            "${CMAKE_CURRENT_SOURCE_DIR}/shaders/sweep.comp" -o "${SWEEP_SPV}")
+    else()
+        message(FATAL_ERROR "FLACOUT_VULKAN=ON needs glslc or glslangValidator on PATH")
+    endif()
+
+    # Embed the SPIR-V so the binary is self-contained -- no shader file to
+    # ship, lose, or get out of sync with the cost model it mirrors.
+    add_custom_command(
+        OUTPUT "${SWEEP_HDR}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated"
+        COMMAND ${SWEEP_CMD}
+        COMMAND ${CMAKE_COMMAND}
+                -DSPV=${SWEEP_SPV} -DHDR=${SWEEP_HDR}
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_spv.cmake"
+        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/sweep.comp"
+                "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_spv.cmake"
+        COMMENT "Compiling and embedding shaders/sweep.comp"
+        VERBATIM)
+    add_custom_target(flacout_shaders DEPENDS "${SWEEP_HDR}")
+    add_dependencies(flacout_lib flacout_shaders)
+
+    target_include_directories(flacout_lib PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
+    target_compile_definitions(flacout_lib PUBLIC FLACOUT_HAVE_VULKAN)
+    target_link_libraries(flacout_lib Vulkan::Vulkan)
+endif()
 
 # Pin floating-point contraction off.
 #

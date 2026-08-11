@@ -1,0 +1,238 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic            : require
+#extension GL_KHR_shader_subgroup_ballot           : require
+#extension GL_KHR_shader_subgroup_arithmetic       : require
+#extension GL_KHR_shader_subgroup_shuffle_relative : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+//
+// GPU candidate evaluation for Optimizer::optimize_subframe.
+//
+// One subgroup per candidate; lanes are samples. Produces exactly the value
+// Optimizer::calculate_rice_cost returns, so the winner the CPU picks from
+// these costs is the same one it would have picked on its own and the encoded
+// file is byte-identical. That property is the whole reason this is worth
+// having -- bench/check.sh still gates a GPU build.
+//
+// The residual is never stored. It is produced a sample at a time and folded
+// straight into the Rice accumulators, because materialising it would make the
+// design bandwidth-bound: a 3-minute track sweeps ~10^9 candidates, and at
+// 4 KB of residual each that is petabytes.
+//
+// Rice sums come from bit-plane population counts rather than 15 shift-
+// accumulates per residual:
+//
+//     u >> k == sum over j >= k of 2^(j-k) * bit_j(u)
+//     S_k    == sum_n (u_n >> k) == sum_{j>=k} 2^(j-k) * B_j
+//
+// B_j (the number of residuals with bit j set) is a sufficient statistic for
+// every k at once, and exact -- floor semantics preserved, and B_j cannot
+// overflow since it is bounded by the partition size. One subgroupBallot per
+// plane prices 32 residuals across all 31 rice parameters. RICE2 (k=15..30)
+// therefore needs no separate pass and no separate accumulator: it is just
+// planes 15..30, already computed. Lane j owns plane j, so the partition fold
+// lives in registers and uses no shared memory at all.
+//
+// The partition-order search uses a streaming fold: walking finest partitions
+// left to right, exactly one partition per tree level is open at any instant,
+// like a binary counter. State is 15 sums x (max_p_order + 1) LEVELS, not
+// x 2^max_p_order partitions.
+//
+// Samples are read straight from the storage buffer rather than staged in
+// shared memory. Every lane of a subgroup reads the SAME address, which the
+// hardware broadcasts; measured identical to a shared-memory copy for the
+// integer path, and it is what lets one module serve every DP block size
+// (16384 samples would not fit in a 32 KB shared allocation anyway).
+
+#define SG      32
+#define NPLANE  32
+#define MAXP    8               // FLAC's partition order ceiling
+#define NLEV    (MAXP + 1)
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly  buffer Samples { int  samples[]; };
+layout(std430, binding = 1) readonly  buffer Cands   { int  cand[];    };
+layout(std430, binding = 2) writeonly buffer OutCost { uint outCost[]; };
+
+layout(push_constant) uniform PC {
+    int ncand;
+    int bsize;
+    int flags;      // bit 0: use the fp32 ranking residual instead of exact
+} pc;
+
+// S_0 is the sum of a partition's folded residuals: ~2^40 for 24-bit content
+// over a 16384-sample partition, well past uint32. The CPU accumulates in
+// uint64; here the sums saturate instead, which is exact where it matters.
+//
+// The scan only ever reads LARGER k (smaller values), so saturation propagates
+// towards small k and never pollutes a lane whose true value fits. And a
+// saturated lane can never be the minimum: the escape code bounds the best
+// cost by 5 + 32*n <= ~524k for any legal partition. So min-over-k is
+// identical to the 64-bit computation, without needing
+// shaderSubgroupExtendedTypes.
+uint satmul(uint a, uint b) {
+    return (b != 0u && a > 0xFFFFFFFFu / b) ? 0xFFFFFFFFu : a * b;
+}
+uint satadd(uint a, uint b) {
+    return (a > 0xFFFFFFFFu - b) ? 0xFFFFFFFFu : a + b;
+}
+
+uint Bacc[NLEV], Nacc[NLEV], Hacc[NLEV];
+uint total0[NLEV], total1[NLEV];
+int  gP;
+
+// Close finest partition q, then every coarser level whose span it completes.
+// Subgroup-uniform: q and the loop bounds are uniform across the subgroup.
+void closePartition(int q, uint B0, uint N0, uint H0) {
+    const uint lane = gl_SubgroupInvocationID;
+    for (int l = gP; l >= 0; --l) {
+        if (((q + 1) & ((1 << (gP - l)) - 1)) != 0) break;
+
+        const uint B  = (l == gP) ? B0 : Bacc[l];
+        const uint n  = (l == gP) ? N0 : Nacc[l];
+        const uint hi = (l == gP) ? H0 : Hacc[l];
+
+        // S_k as a weighted reverse scan across lanes: five steps for 32 lanes.
+        // Every intermediate is bounded by S_0, the sum of the folded
+        // residuals, so uint32 holds while n * max_u < 2^32.
+        uint v = B, w = 2u;
+        for (int st = 0; st < 5; ++st) {
+            const uint up = subgroupShuffleDown(v, 1u << st);
+            if (lane + (1u << st) < uint(SG)) v = satadd(v, satmul(w, up));
+            w = (st < 4) ? satmul(w, w) : w;
+        }
+
+        // bits(k) is convex in k, so the CPU's ascending scan with an early
+        // break lands on the global minimum at the smallest k -- which is a
+        // min-reduction. Only the value is needed; the parameter itself is
+        // reconstructed on the CPU for the winner alone.
+        const uint bits = satadd(n * (1u + lane), v);
+        uint best0 = subgroupMin(lane <= 14u ? bits : 0xFFFFFFFFu);
+        uint best1 = subgroupMin(lane <= 30u ? bits : 0xFFFFFFFFu);
+
+        // Escape code. mabs = m >> 1 so findMSB(mabs) == hi - 1, turning the
+        // CPU's (mabs ? findMSB(mabs) + 2 : 1) into (hi >= 1 ? hi + 1 : 1);
+        // the guard mabs < 2^30 becomes hi <= 30.
+        if (hi <= 30u) {
+            const uint ebps = (hi >= 1u) ? (hi + 1u) : 1u;
+            const uint eb   = 5u + ebps * n;
+            best0 = min(best0, eb);
+            best1 = min(best1, eb);
+        }
+
+        total0[l] = satadd(total0[l], best0);
+        total1[l] = satadd(total1[l], best1);
+
+        if (l > 0) {
+            Bacc[l - 1] += B;
+            Nacc[l - 1] += n;
+            Hacc[l - 1]  = max(Hacc[l - 1], hi);
+        }
+        Bacc[l] = 0u; Nacc[l] = 0u; Hacc[l] = 0u;
+    }
+}
+
+void main() {
+    const uint lane = gl_SubgroupInvocationID;
+    const uint cidx = gl_WorkGroupID.x * (gl_WorkGroupSize.x / SG) + gl_SubgroupID;
+
+    // Clamp rather than return: the subgroup ops below need uniform control
+    // flow. Only the final store is gated.
+    const uint c     = min(cidx, uint(pc.ncand) - 1u);
+    const int  BS    = pc.bsize;
+    const int  base  = int(c) * 34;
+    const int  ord   = cand[base + 0];
+    const int  shift = cand[base + 1];
+    const bool fp32  = (pc.flags & 1) != 0;
+
+    int qc[32];
+    for (int j = 0; j < 32; ++j) qc[j] = cand[base + 2 + j];
+    float fc[32];
+    if (fp32) {
+        const float inv = 1.0 / float(1 << shift);
+        for (int j = 0; j < 32; ++j) fc[j] = float(qc[j]) * inv;
+    }
+
+    int P = 0;
+    for (int p = 1; p <= MAXP; ++p) {
+        if ((BS % (1 << p)) != 0) break;
+        if ((BS >> p) < ord)      break;
+        P = p;
+    }
+    gP = P;
+    const int psize = BS >> P;
+
+    for (int l = 0; l <= P; ++l) {
+        Bacc[l] = 0u; Nacc[l] = 0u; Hacc[l] = 0u;
+        total0[l] = uint(4 << l);
+        total1[l] = uint(5 << l);
+    }
+
+    uint Bcur = 0u, Ncur = 0u, Hcur = 0u;
+    int  q = 0;
+
+    // Fixed 32-sample chunks that ignore partition boundaries, so every lane
+    // always carries a sample. psize is a power of two and chunks are
+    // 32-aligned, so a chunk holds either whole partitions (psize < 32) or
+    // part of one (psize >= 32) -- never a ragged mix. Walking one partition
+    // at a time instead would leave psize of 32 lanes idle on every low-order
+    // candidate, since max_p_order is bounded by (BS >> p) >= ord.
+    for (int c0 = 0; c0 < BS; c0 += SG) {
+        const int  i   = c0 + int(lane);
+        const bool act = (i >= ord) && (i < BS);
+
+        uint u = 0u;
+        if (act) {
+            int r;
+            if (fp32) {
+                float fsum = 0.0;
+                for (int j = 0; j < ord; ++j) fsum += fc[j] * float(samples[i - 1 - j]);
+                r = samples[i] - int(floor(fsum));
+            } else {
+                int64_t sum = 0L;
+                for (int j = 0; j < ord; ++j)
+                    sum += int64_t(qc[j]) * int64_t(samples[i - 1 - j]);
+                r = samples[i] - int(sum >> shift);
+            }
+            u = (uint(r) << 1) ^ uint(r >> 31);       // zigzag
+        }
+
+        uint myBallot = 0u;
+        for (int j = 0; j < NPLANE; ++j) {
+            const uvec4 b = subgroupBallot(act && ((u >> j) & 1u) != 0u);
+            if (lane == uint(j)) myBallot = b.x;
+        }
+        const uint actMask = subgroupBallot(act).x;
+
+        if (psize >= SG) {
+            Bcur += bitCount(myBallot);
+            Ncur += uint(bitCount(actMask));
+            Hcur  = max(Hcur, subgroupMax((myBallot != 0u) ? lane : 0u));
+            if (((c0 + SG) & (psize - 1)) == 0) {
+                closePartition(q, Bcur, Ncur, Hcur);
+                ++q; Bcur = 0u; Ncur = 0u; Hcur = 0u;
+            }
+        } else {
+            for (int p = 0; p < SG / psize; ++p) {
+                const uint mask = ((1u << psize) - 1u) << uint(p * psize);
+                closePartition(q,
+                    uint(bitCount(myBallot & mask)),
+                    uint(bitCount(actMask  & mask)),
+                    subgroupMax(((myBallot & mask) != 0u) ? lane : 0u));
+                ++q;
+            }
+        }
+    }
+
+    // Descending p_order with '<=' for method 0 keeps the smallest order on a
+    // tie; method 1 must win strictly, so 16-bit content -- where the two tie
+    // at best -- keeps its method-0 bitstream untouched.
+    uint best_total = 0xFFFFFFFFu;
+    for (int l = P; l >= 0; --l) {
+        if (total0[l] <= best_total) best_total = total0[l];
+        if (total1[l] <  best_total) best_total = total1[l];
+    }
+
+    if (cidx < uint(pc.ncand))
+        outCost[cidx] = (gl_SubgroupSize == uint(SG)) ? best_total : 0xFFFFFFFFu;
+}

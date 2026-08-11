@@ -202,7 +202,9 @@ bool Processor::process() {
                   m_config.exhaustive, m_config.verbose, m_config.max_candidates,
                   m_config.adaptive_windows, resolved_patience,
                   m_config.precision_rungs, m_config.dp_candidates,
-                  m_config.lattice_sweeps);
+                  m_config.lattice_sweeps,
+                  m_config.use_gpu,
+                  m_config.gpu_min_batch);
     if (!reuse_edges.empty())
         opt.set_reuse_edges(std::move(reuse_edges));
     std::vector<BlockParams> blocks = opt.find_optimal_block_partitioning(m_pcm_data);

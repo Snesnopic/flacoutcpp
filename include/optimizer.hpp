@@ -24,7 +24,10 @@
 
 #include <vector>
 #include <cstdint>
+#include <memory>
 #include <string>
+
+#include "gpu.hpp"
 
 namespace flacoutcpp {
 
@@ -287,7 +290,9 @@ public:
               unsigned patience = 0,
               unsigned precision_rungs = 0,
               std::vector<uint32_t> dp_candidates = {},
-              unsigned lattice_sweeps = 0);
+              unsigned lattice_sweeps = 0,
+              bool     use_gpu = false,
+              unsigned gpu_min_batch = 0);
 
     /**
      * @brief Find the optimal variable block-size partition for the stream.
@@ -337,7 +342,8 @@ public:
         unsigned                    max_candidates = 0,
         unsigned                    patience = 0,
         unsigned                    precision_rungs = 0,
-        unsigned                    lattice_sweeps = 0);
+        unsigned                    lattice_sweeps = 0,
+        GpuEvaluator*               gpu = nullptr);
 
 private:
     /// @cond INTERNAL
@@ -411,6 +417,8 @@ private:
     unsigned              m_patience;
     unsigned              m_precision_rungs;
     unsigned              m_lattice_sweeps;
+    bool                  m_use_gpu = false;
+    std::unique_ptr<GpuEvaluator> m_gpu;
 
     /// DP block-size ladder, ascending. Every entry is a multiple of
     /// m_dp_step (itself a multiple of the 16-sample granule), because the DP

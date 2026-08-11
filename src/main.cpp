@@ -56,6 +56,19 @@ static void print_usage(const char* prog) {
         << "                       -c and -L are not independent —\n"
         << "                       prefer -E, which pairs them along the measured\n"
         << "                       frontier, unless you know which pair you want.\n"
+        << "  -G, --gpu            Evaluate LPC candidates on the GPU (Vulkan).\n"
+        << "                       Bit-exact with the CPU path, so the output is\n"
+        << "                       byte-identical; only the search runs elsewhere.\n"
+        << "                       Composes with -c/-p/-e; prices the whole\n"
+        << "                       precision ladder, so it does not combine\n"
+        << "                       with -L. Needs a\n"
+        << "      --gpu-min-batch N  Smallest candidate batch worth dispatching\n"
+        << "                       (default 0 = dispatch everything, which\n"
+        << "                       measured fastest here). Raise it if a device\n"
+        << "                       has a long submit path; small batches then\n"
+        << "                       stay on the CPU.\n"
+        << "                       build with -DFLACOUT_VULKAN=ON and a device\n"
+        << "                       with 32-lane subgroups and shaderInt64.\n"
         << "  -Q, --lattice N      Refine the winning subframe's quantized LPC\n"
         << "                       coefficients by coordinate descent: try each\n"
         << "                       tap at +-1, keep what lowers the exact cost,\n"
@@ -215,6 +228,28 @@ int main(int argc, char* argv[]) {
                 std::cerr << "Error: -L requires a non-negative integer, got '" << argv[i] << "'.\n";
                 return EXIT_FAILURE;
             }
+
+        } else if (arg == "--gpu-min-batch") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --gpu-min-batch requires a number.\n";
+                return EXIT_FAILURE;
+            }
+            ++i;
+            try {
+                if (argv[i][0] == '-') throw std::invalid_argument("negative");
+                cfg.gpu_min_batch = static_cast<unsigned>(std::stoul(argv[i]));
+            } catch (const std::exception&) {
+                std::cerr << "Error: --gpu-min-batch requires a non-negative "
+                             "integer, got '" << argv[i] << "'.\n";
+                return EXIT_FAILURE;
+            }
+
+        } else if (arg == "-G" || arg == "--gpu") {
+            // The search defaults are applied below, alongside -e's: the GPU
+            // batches a whole subframe's candidates in one dispatch, which
+            // only the unlimited sweep produces, and the precision ladder
+            // exists to dodge CPU cost that the GPU does not pay.
+            cfg.use_gpu = true;
 
         } else if (arg == "-Q" || arg == "--lattice") {
             if (i + 1 >= argc) {
@@ -398,6 +433,26 @@ int main(int argc, char* argv[]) {
     if (cfg.exhaustive && effort < 0) {
         if (!candidates_given) cfg.max_candidates  = 0;
         if (!rungs_given)      cfg.precision_rungs = 0;
+    }
+
+    // -G composes with whatever search is configured -- the ranked driver's
+    // costs are batchable, since its only sequential state is best_lpc_cost
+    // and the pruning that reads it can only skip candidates that could not
+    // have won. The precision ladder is the exception: it *selects* rungs on
+    // that bound rather than merely skipping losers, so batching it would
+    // change which rungs are encoded. The ladder exists to dodge CPU cost the
+    // GPU does not pay, so -G prices the whole ladder instead, unless -L was
+    // asked for explicitly -- in which case those subframes stay on the CPU.
+    // Only the bare default is overridden, never an explicit -E or -L: -G is
+    // a statement about where the search runs, not what it searches, and that
+    // invariant is what makes "byte-identical to the CPU build" mean anything.
+    // Measured on the master mix, silently turning -E 0's -L 1 into -L 0 moved
+    // both size (-3944 B) and time (+0.07 s) -- a different search wearing the
+    // same flag. Same treatment -e already gets a few lines up.
+    if (cfg.use_gpu && effort < 0 && !rungs_given) cfg.precision_rungs = 0;
+    if (cfg.use_gpu && cfg.precision_rungs != 0) {
+        std::cerr << "Note: -L and -G do not combine; those subframes run "
+                     "on the CPU.\n";
     }
     // -e and -w each define their own window set. The adaptive *default* yields
     // to them silently; only an explicit -a is a contradiction worth rejecting.

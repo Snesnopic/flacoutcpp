@@ -73,6 +73,8 @@ bool optimise(const std::string& input_path, const std::string& output_path, con
     pc.patience = config.patience;
     pc.precision_rungs = config.precision_rungs;
     pc.lattice_sweeps = config.lattice_sweeps;
+    pc.use_gpu        = config.use_gpu;
+    pc.gpu_min_batch  = config.gpu_min_batch;
     pc.dp_candidates = config.dp_candidates;
     pc.reuse_frames  = config.reuse_frames;
     pc.warn_superior = config.warn_superior;

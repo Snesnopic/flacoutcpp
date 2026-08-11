@@ -1,6 +1,7 @@
 #include "optimizer.hpp"
 #include "frame_writer.hpp"
 #include <algorithm>
+#include <array>
 #if defined(_MSC_VER) && !defined(__clang__)
 #include <intrin.h>
 #endif
@@ -309,13 +310,27 @@ Optimizer::Optimizer(uint32_t channels, uint32_t bps, uint32_t sample_rate,
                      unsigned patience,
                      unsigned precision_rungs,
                      std::vector<uint32_t> dp_candidates,
-                     unsigned lattice_sweeps)
+                     unsigned lattice_sweeps,
+                     bool     use_gpu,
+                     unsigned gpu_min_batch)
     : m_channels(channels), m_bps(bps), m_sample_rate(sample_rate),
       m_max_threads(max_threads),
       m_exhaustive(exhaustive), m_verbose(verbose), m_max_candidates(max_candidates),
       m_adaptive(adaptive_windows), m_patience(patience),
-      m_precision_rungs(precision_rungs), m_lattice_sweeps(lattice_sweeps)
+      m_precision_rungs(precision_rungs), m_lattice_sweeps(lattice_sweeps),
+      m_use_gpu(use_gpu)
 {
+    if (m_use_gpu) {
+        m_gpu.reset(new GpuEvaluator());
+        m_gpu->set_min_batch(gpu_min_batch);
+        if (m_verbose) {
+            if (m_gpu->available())
+                std::fprintf(stderr, "GPU: %s\n", m_gpu->why().c_str());
+            else
+                std::fprintf(stderr, "GPU unavailable (%s); using the CPU path\n",
+                             m_gpu->why().c_str());
+        }
+    }
     // Block-size ladder. Empty means the built-in one, whose coefficient
     // tables are precomputed; any other size falls back to computing window
     // coefficients per block (correct, just slower), so a custom ladder costs
@@ -974,6 +989,43 @@ struct PrecisionDump {
 };
 PrecisionDump g_pdump;
 std::atomic<uint64_t> g_pdump_sf{0};
+} // namespace
+#endif
+
+#ifdef FLACOUT_DUMP_GOLDEN
+// Golden test vectors for the GPU sweep kernel. Captures one subframe's worth
+// of (shifted samples, quantized candidates, exact Rice cost) so an
+// out-of-tree kernel can be held to exact agreement with calculate_rice_cost
+// rather than to "looks about right". The cost model is a contract (see
+// CLAUDE.md); a GPU reimplementation of it needs the same regression net the
+// CPU side has.
+//
+// Binary, little-endian, native int32:
+//   char[8] "FLGOLD1"
+//   u32 bsize, u32 eff_bps, u32 hdr_fixed, u32 ncand
+//   i32 shifted[bsize]
+//   ncand x { i32 ord, i32 shift, i32 qc[32], u32 rice, u32 cost }
+namespace {
+struct GoldenDump {
+    std::FILE*        fh = nullptr;
+    std::mutex        mu;
+    std::atomic<bool> claimed{false};
+    uint32_t          want_bs = 1024;
+    uint32_t          ncand = 0;
+    long              ncand_pos = 0;
+    GoldenDump() {
+        if (const char* p = std::getenv("FLACOUT_GOLDEN_PATH")) fh = std::fopen(p, "wb");
+        if (const char* b = std::getenv("FLACOUT_GOLDEN_BS")) want_bs = (uint32_t)std::atoi(b);
+    }
+    ~GoldenDump() {
+        if (!fh) return;
+        std::fseek(fh, ncand_pos, SEEK_SET);
+        std::fwrite(&ncand, 4, 1, fh);   // patch the count now that it is known
+        std::fclose(fh);
+        std::fprintf(stderr, "GOLDEN wrote %u candidates at bsize=%u\n", ncand, want_bs);
+    }
+};
+GoldenDump g_golden;
 } // namespace
 #endif
 
@@ -2135,7 +2187,8 @@ SubframeParams Optimizer::optimize_subframe(
     const int32_t* samples, uint32_t bsize, uint32_t bps,
     const std::vector<WindowType>& windows,
     unsigned max_candidates, unsigned patience, unsigned precision_rungs,
-    unsigned lattice_sweeps)
+    unsigned lattice_sweeps,
+    GpuEvaluator* gpu)
 {
     SubframeParams best{};
     best.bits_cost = std::numeric_limits<uint32_t>::max();
@@ -2202,6 +2255,7 @@ SubframeParams Optimizer::optimize_subframe(
         std::vector<int> precisions;
         for (int p = 8; p <= 15; ++p) precisions.push_back(p);
         const uint32_t min_prec  = (uint32_t)precisions.front();
+
 #ifdef FLACOUT_DUMP_FP32RANK
         // (exact cost, fp32 cost) for every candidate this subframe evaluates.
         std::vector<std::pair<uint32_t,uint32_t>> fp32_costs;
@@ -2213,6 +2267,24 @@ SubframeParams Optimizer::optimize_subframe(
         const int64_t max_sum_abs_qc =
             (eff_bps >= 1 && eff_bps <= 31) ? (int64_t)(INT32_MAX >> (eff_bps - 1)) : 0;
         const uint32_t hdr_fixed = 8u + (wasted ? (uint32_t)(1 + wasted) : 0u) + 4u + 5u;
+
+#ifdef FLACOUT_DUMP_GOLDEN
+        // First subframe of the requested block size wins the capture; the
+        // rest run untouched, so this cannot perturb the search it observes.
+        bool golden_active = false;
+        if (g_golden.fh && bsize == g_golden.want_bs &&
+            !g_golden.claimed.exchange(true, std::memory_order_acq_rel)) {
+            std::lock_guard<std::mutex> lk(g_golden.mu);
+            golden_active = true;
+            std::fwrite("FLGOLD1", 1, 8, g_golden.fh);
+            uint32_t v = bsize;                 std::fwrite(&v, 4, 1, g_golden.fh);
+            v = eff_bps;                        std::fwrite(&v, 4, 1, g_golden.fh);
+            v = hdr_fixed;                      std::fwrite(&v, 4, 1, g_golden.fh);
+            g_golden.ncand_pos = std::ftell(g_golden.fh);
+            v = 0;                              std::fwrite(&v, 4, 1, g_golden.fh);
+            std::fwrite(shifted.data(), 4, bsize, g_golden.fh);
+        }
+#endif
 
         // Winner tracked as a bare description rather than a filled-in
         // SubframeParams; see the cost-only call below. Seeded from the best
@@ -2430,6 +2502,20 @@ SubframeParams Optimizer::optimize_subframe(
                 // +6: residual block header (2-bit coding method + 4-bit
                 // partition order), see estimate_subframe_cost for detail.
                 const uint32_t cost = hdr + 6u + rice;
+#ifdef FLACOUT_DUMP_GOLDEN
+                if (golden_active) {
+                    std::lock_guard<std::mutex> lk(g_golden.mu);
+                    int32_t rec_ord = ord, rec_shift = shift;
+                    int32_t rec_qc[32] = {};
+                    for (int j = 0; j < ord; ++j) rec_qc[j] = qc[j];
+                    std::fwrite(&rec_ord,   4,  1, g_golden.fh);
+                    std::fwrite(&rec_shift, 4,  1, g_golden.fh);
+                    std::fwrite(rec_qc,     4, 32, g_golden.fh);
+                    std::fwrite(&rice,      4,  1, g_golden.fh);
+                    std::fwrite(&cost,      4,  1, g_golden.fh);
+                    g_golden.ncand++;
+                }
+#endif
 #ifdef FLACOUT_DUMP_FP32RANK
                 {
                     // The same candidate priced the way a GPU fp32 kernel
@@ -2534,7 +2620,71 @@ SubframeParams Optimizer::optimize_subframe(
             return true;
         };
 
-        if (max_candidates == 0) {
+        bool gpu_done = false;
+#ifdef FLACOUT_HAVE_VULKAN
+        // ---- GPU: one batch per subframe (-G) ----
+        //
+        // Only the exhaustive path offloads. The ranked driver's patience rule
+        // is a sequential stop condition -- it decides whether to look at the
+        // next candidate from the cost of the last -- so there is no batch to
+        // form. That is not a limitation worth working around: `-G` exists to
+        // make the unlimited sweep affordable, which is the search the ranking
+        // was invented to avoid.
+        //
+        // The GPU skips the header-bound pruning the CPU loop does. Pruned
+        // candidates have hdr >= best_lpc_cost and rice >= 0, so they could
+        // never have won; evaluating them anyway costs time and changes
+        // nothing. The winner, and therefore the output, is identical.
+        if (gpu && gpu->available() && (bsize % 32u) == 0u &&
+            max_candidates == 0 && precision_rungs == 0) {
+            struct Meta { int ord, prec, shift; };
+            std::vector<GpuEvaluator::Candidate> gcands;
+            std::vector<Meta> meta;
+            gcands.reserve(windows.size() * (size_t)max_order * precisions.size());
+            meta.reserve(gcands.capacity());
+
+            for (WindowType wt : windows) {
+                if (!analyse_window(wt, nullptr)) continue;
+                for (int ord = 1; ord <= max_order; ++ord) {
+                    const float* lpc = all_lpc[ord - 1];
+                    const int log2cmax = lpc_log2cmax(lpc, ord);
+                    for (size_t pi = 0; pi < precisions.size(); ++pi) {
+                        const int prec = precisions[pi];
+                        GpuEvaluator::Candidate cd{};
+                        int  shift = 0;
+                        bool clamped = false;
+                        if (!quantize_lpc_coeffs(lpc, ord, prec, log2cmax,
+                                                 cd.qc, &shift, &clamped))
+                            continue;
+                        cd.order = ord;
+                        cd.shift = shift;
+                        gcands.push_back(cd);
+                        meta.push_back({ord, prec, shift});
+                    }
+                }
+            }
+
+            std::vector<uint32_t> gcosts;
+            if (gcands.size() >= gpu->min_batch() &&
+                gpu->evaluate(shifted.data(), bsize, gcands, gcosts)) {
+                for (size_t i = 0; i < gcosts.size(); ++i) {
+                    const uint32_t hdr = hdr_fixed +
+                        (uint32_t)meta[i].ord * (eff_bps + (uint32_t)meta[i].prec);
+                    const uint32_t cost = hdr + 6u + gcosts[i];
+                    if (cost < best_lpc_cost) {
+                        best_lpc_cost = cost;
+                        bl_ord   = meta[i].ord;
+                        bl_prec  = meta[i].prec;
+                        bl_shift = meta[i].shift;
+                        std::memcpy(bl_qc, gcands[i].qc, sizeof(bl_qc));
+                    }
+                }
+                gpu_done = true;
+            }
+        }
+#endif
+
+        if (max_candidates == 0 && !gpu_done) {
             // ---- Exhaustive: every (window, order) pair ----
             for (WindowType wt : windows) {
                 if (!analyse_window(wt, nullptr)) continue;
@@ -2550,7 +2700,7 @@ SubframeParams Optimizer::optimize_subframe(
                     eval_candidate(all_lpc[ord - 1], ord, wt);
                 }
             }
-        } else {
+        } else if (!gpu_done) {
             // ---- Ranked: score every (window, order) pair, then fully
             //      evaluate only the most promising `max_candidates` of them.
             //
@@ -2626,6 +2776,8 @@ SubframeParams Optimizer::optimize_subframe(
             };
             std::vector<Cand> cands;
             cands.reserve(windows.size() * (size_t)max_order);
+
+
 // How much of the gap between the model's claim and the raw signal's cost a
 // blind sample is charged. 1.0 — the original — assumes the predictor has no
 // power at all outside the window, which measured 4x too pessimistic: audio
@@ -2694,6 +2846,7 @@ SubframeParams Optimizer::optimize_subframe(
                         if (k < 0 || k > max_order) return lderr[ord];
                         return lderr[k] > 0.0 ? lderr[k] : lderr[ord];
                     };
+
                     cands.push_back({ resid_bits + coef_bits, (int)wi, ord,
                                       lderr[0], lderr[ord], wsq, zf,
                                       model_bits_per_sample,
@@ -2711,7 +2864,101 @@ SubframeParams Optimizer::optimize_subframe(
 #endif
             auto by_score = [](const Cand& a, const Cand& b) { return a.score < b.score; };
             size_t keep = std::min((size_t)max_candidates, cands.size());
+#ifdef FLACOUT_HAVE_VULKAN
+            // ---- GPU pre-pass for the ranked driver ----
+            //
+            // The ranked scan looks sequential, but its only state is
+            // best_lpc_cost, and the one thing that reads it -- eval_candidate's
+            // precision pruning -- can only skip precisions whose header alone
+            // already exceeds it. Those can never lower best_lpc_cost, so
+            // pricing them anyway changes nothing. The whole ranked list is
+            // therefore computable in one batch, and the scan replayed against
+            // it lands on the same winner, in the same order, with the same
+            // patience stop. Byte-identical, not merely equivalent.
+            //
+            // Not usable with -L: the ladder's rung scoring *selects* on
+            // best_lpc_cost rather than merely skipping losers, so batching
+            // would change which rungs are encoded and therefore the output.
+            std::vector<uint32_t> gcost;      // per ranked candidate: best cost
+            std::vector<int>      gprec, gshift;
+            std::vector<std::array<int32_t,32>> gqc;
+            bool gpu_ranked = false;
+            auto gpu_prepass = [&]() {
+                if (!gpu || !gpu->available() || (bsize % 32u) != 0u) return;
+                if (precision_rungs != 0) return;
+                // Batch only as far down the ranked list as the scan can
+                // plausibly reach. Pricing the whole list is speculative work,
+                // and at small -c almost all of it is thrown away: with
+                // -e -c 8 the list is 26x32x8 = 6656 candidates and patience
+                // consumes ~50, so the GPU did 100x the CPU's work and ran
+                // 0.94x. The scan cannot pass `keep` until it has seen
+                // `patience` consecutive non-improvements, so keep + a few
+                // patience windows covers it in all but pathological cases --
+                // and anything past the batch simply falls back to
+                // eval_candidate, which is the same answer either way.
+                const size_t reach = std::min(cands.size(),
+                    (size_t)keep + 4u * (size_t)patience + 16u);
+                std::vector<GpuEvaluator::Candidate> batch;
+                std::vector<std::pair<uint32_t,int>> owner;   // (ranked index, prec)
+                batch.reserve(reach * precisions.size());
+                owner.reserve(batch.capacity());
+                for (size_t c = 0; c < reach; ++c) {
+                    const Cand& cd = cands[c];
+                    const float* lpc =
+                        &lpc_store[cd.wi * LPC_STRIDE + (size_t)(cd.ord - 1) * 32];
+                    const int log2cmax = lpc_log2cmax(lpc, cd.ord);
+                    for (size_t pi = 0; pi < precisions.size(); ++pi) {
+                        GpuEvaluator::Candidate gc{};
+                        int  sh = 0; bool cl = false;
+                        if (!quantize_lpc_coeffs(lpc, cd.ord, precisions[pi],
+                                                 log2cmax, gc.qc, &sh, &cl)) continue;
+                        gc.order = cd.ord; gc.shift = sh;
+                        batch.push_back(gc);
+                        owner.emplace_back((uint32_t)c, precisions[pi]);
+                    }
+                }
+                std::vector<uint32_t> costs;
+                if (batch.size() < gpu->min_batch() ||
+                    !gpu->evaluate(shifted.data(), bsize, batch, costs))
+                    return;
+                gcost.assign(reach, std::numeric_limits<uint32_t>::max());
+                gprec.assign(reach, 0);
+                gshift.assign(reach, 0);
+                gqc.resize(reach);
+                for (size_t i = 0; i < costs.size(); ++i) {
+                    const uint32_t c = owner[i].first;
+                    const uint32_t hdr = hdr_fixed +
+                        (uint32_t)batch[i].order * (eff_bps + (uint32_t)owner[i].second);
+                    const uint32_t tot = hdr + 6u + costs[i];
+                    if (tot < gcost[c]) {
+                        gcost[c]  = tot;
+                        gprec[c]  = owner[i].second;
+                        gshift[c] = batch[i].shift;
+                        std::memcpy(gqc[c].data(), batch[i].qc, 32 * sizeof(int32_t));
+                    }
+                }
+                gpu_ranked = true;
+            };
+
+            // Same contract as eval_candidate: returns the candidate's best
+            // cost and folds it into the running winner.
+            auto eval_ranked_gpu = [&](size_t c) -> uint32_t {
+                const uint32_t cc = gcost[c];
+                if (cc < best_lpc_cost) {
+                    best_lpc_cost = cc;
+                    bl_ord   = cands[c].ord;
+                    bl_prec  = gprec[c];
+                    bl_shift = gshift[c];
+                    std::memcpy(bl_qc, gqc[c].data(), sizeof(bl_qc));
+                }
+                return cc;
+            };
+#endif
+
             std::partial_sort(cands.begin(), cands.begin() + keep, cands.end(), by_score);
+#ifdef FLACOUT_HAVE_VULKAN
+            if (patience == 0) gpu_prepass();
+#endif
 
             // ---- Patience ----
             // The winner's rank is heavy-tailed, not tied: measured over all
@@ -2729,6 +2976,9 @@ SubframeParams Optimizer::optimize_subframe(
             // down. Cost is paid only on the subframes that need it.
             if (patience > 0) {
                 std::sort(cands.begin(), cands.end(), by_score);
+#ifdef FLACOUT_HAVE_VULKAN
+                gpu_prepass();
+#endif
                 uint32_t prev  = best_lpc_cost;
                 size_t   since = 0;
                 for (size_t c = 0; c < cands.size(); ++c) {
@@ -2737,7 +2987,11 @@ SubframeParams Optimizer::optimize_subframe(
                     uint32_t hdr_min = hdr_fixed + (uint32_t)cd.ord * (eff_bps + min_prec);
                     if (hdr_min >= best_lpc_cost) { ++since; continue; }
                     cand_autoc = &autoc_store[(size_t)cd.wi * 33];
-                    uint32_t cc = eval_candidate(
+                    uint32_t cc;
+#ifdef FLACOUT_HAVE_VULKAN
+                    if (gpu_ranked && c < gcost.size()) cc = eval_ranked_gpu(c); else
+#endif
+                    cc = eval_candidate(
                         &lpc_store[cd.wi * LPC_STRIDE + (size_t)(cd.ord - 1) * 32],
                         cd.ord, windows[cd.wi]);
 #ifdef FLACOUT_DUMP_CANDIDATES
@@ -2769,7 +3023,11 @@ SubframeParams Optimizer::optimize_subframe(
                 uint32_t hdr_min = hdr_fixed + (uint32_t)cd.ord * (eff_bps + min_prec);
                 if (hdr_min >= best_lpc_cost) continue;
                 cand_autoc = &autoc_store[(size_t)cd.wi * 33];
-                uint32_t cc = eval_candidate(
+                uint32_t cc;
+#ifdef FLACOUT_HAVE_VULKAN
+                if (gpu_ranked && c < gcost.size()) cc = eval_ranked_gpu(c); else
+#endif
+                cc = eval_candidate(
                     &lpc_store[cd.wi * LPC_STRIDE + (size_t)(cd.ord - 1) * 32],
                     cd.ord, windows[cd.wi]);
 #ifdef FLACOUT_DUMP_CANDIDATES
@@ -3023,7 +3281,7 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
         if (m_channels == 1) {
             bp.stereo_mode  = 0;
             bp.subframes[0] = optimize_subframe(pcm_data[0].data(),
-                                                (uint32_t)total_samples, m_bps, m_windows, m_max_candidates, m_patience, m_precision_rungs, m_lattice_sweeps);
+                                                (uint32_t)total_samples, m_bps, m_windows, m_max_candidates, m_patience, m_precision_rungs, m_lattice_sweeps, m_gpu.get());
         } else {
             uint32_t best_bits = std::numeric_limits<uint32_t>::max();
             for (int mode : {0, 8, 9, 10}) {
@@ -3038,8 +3296,8 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
                 // mode 9 = right+side: ch0 is side (needs +1 bit), ch1 is right
                 uint32_t bps0 = (mode == 9) ? m_bps + 1 : m_bps;
                 uint32_t bps1 = (mode == 9) ? m_bps     : (mode == 0 ? m_bps : m_bps + 1);
-                SubframeParams s0 = optimize_subframe(ch0.data(), (uint32_t)total_samples, bps0, m_windows, m_max_candidates, m_patience, m_precision_rungs, m_lattice_sweeps);
-                SubframeParams s1 = optimize_subframe(ch1.data(), (uint32_t)total_samples, bps1, m_windows, m_max_candidates, m_patience, m_precision_rungs, m_lattice_sweeps);
+                SubframeParams s0 = optimize_subframe(ch0.data(), (uint32_t)total_samples, bps0, m_windows, m_max_candidates, m_patience, m_precision_rungs, m_lattice_sweeps, m_gpu.get());
+                SubframeParams s1 = optimize_subframe(ch1.data(), (uint32_t)total_samples, bps1, m_windows, m_max_candidates, m_patience, m_precision_rungs, m_lattice_sweeps, m_gpu.get());
                 if (s0.bits_cost + s1.bits_cost < best_bits) {
                     best_bits = s0.bits_cost + s1.bits_cost;
                     bp.stereo_mode  = mode;
@@ -3689,7 +3947,7 @@ BlockParams Optimizer::compute_block(
     if (m_channels == 1) {
         bp.stereo_mode  = 0;
         bp.subframes[0] = optimize_subframe(
-            &pcm_data[0][sample_start], block_size, m_bps, wins, m_max_candidates, patience, m_precision_rungs, m_lattice_sweeps);
+            &pcm_data[0][sample_start], block_size, m_bps, wins, m_max_candidates, patience, m_precision_rungs, m_lattice_sweeps, m_gpu.get());
     } else {
         uint32_t best_bits = std::numeric_limits<uint32_t>::max();
 
@@ -3739,9 +3997,9 @@ BlockParams Optimizer::compute_block(
         auto get_sig = [&](int sig) -> const SubframeParams& {
             if (have[sig]) return cache[sig];
             if (sig == SIG_L) {
-                cache[sig] = optimize_subframe(&pcm_data[0][sample_start], block_size, m_bps, wins, m_max_candidates, patience, m_precision_rungs, m_lattice_sweeps);
+                cache[sig] = optimize_subframe(&pcm_data[0][sample_start], block_size, m_bps, wins, m_max_candidates, patience, m_precision_rungs, m_lattice_sweeps, m_gpu.get());
             } else if (sig == SIG_R) {
-                cache[sig] = optimize_subframe(&pcm_data[1][sample_start], block_size, m_bps, wins, m_max_candidates, patience, m_precision_rungs, m_lattice_sweeps);
+                cache[sig] = optimize_subframe(&pcm_data[1][sample_start], block_size, m_bps, wins, m_max_candidates, patience, m_precision_rungs, m_lattice_sweeps, m_gpu.get());
             } else {
                 std::vector<int32_t> ch(block_size);
                 uint32_t bps_s;
@@ -3754,7 +4012,7 @@ BlockParams Optimizer::compute_block(
                         ch[k] = (pcm_data[0][sample_start + k] + pcm_data[1][sample_start + k]) >> 1;
                     bps_s = m_bps;
                 }
-                cache[sig] = optimize_subframe(ch.data(), block_size, bps_s, wins, m_max_candidates, patience, m_precision_rungs, m_lattice_sweeps);
+                cache[sig] = optimize_subframe(ch.data(), block_size, bps_s, wins, m_max_candidates, patience, m_precision_rungs, m_lattice_sweeps, m_gpu.get());
             }
             have[sig] = true;
             return cache[sig];

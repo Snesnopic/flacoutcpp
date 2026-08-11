@@ -200,6 +200,27 @@ struct Config {
     unsigned lattice_sweeps = 0;
 
     /**
+     * @brief Evaluate LPC candidates on the GPU (`-G`, experimental).
+     *
+     * Offloads the per-candidate Rice cost to a Vulkan compute shader that
+     * reproduces Optimizer::calculate_rice_cost exactly, so the encoded file
+     * is byte-identical to a CPU-only run and bench/check.sh still applies.
+     * Requires a build configured with -DFLACOUT_VULKAN=ON and a device with
+     * a 32-lane subgroup and shaderInt64; otherwise the run reports why and
+     * falls back to the CPU.
+     */
+    bool use_gpu = false;
+
+    /**
+     * @brief Smallest candidate batch worth sending to the GPU (`--gpu-min-batch`).
+     *
+     * Below this the subframe is encoded on the CPU, because a dispatch costs
+     * more than it saves. 0 forces every batch onto the GPU — the setting to
+     * use when measuring where a new device's crossover actually is.
+     */
+    unsigned gpu_min_batch = 0;
+
+    /**
      * @brief Effort level 0-9: one dial across the measured size/time frontier.
      *
      * @ref max_candidates and @ref precision_rungs are not independent — they

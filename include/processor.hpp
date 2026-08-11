@@ -81,6 +81,14 @@ struct ProcessorConfig {
     unsigned lattice_sweeps = 0;
 
     /**
+     * @brief Evaluate LPC candidates on the GPU; see flacoutcpp::Config::use_gpu.
+     */
+    bool use_gpu = false;
+
+    /// See flacoutcpp::Config::gpu_min_batch.
+    unsigned gpu_min_batch = 0;
+
+    /**
      * @brief Adaptive per-subframe window selection (experimental,
      * estimated-DP modes only). See flacoutcpp::Config::adaptive_windows.
      */

@@ -437,8 +437,19 @@ int main(int argc, char* argv[]) {
         if (cfg.windows.empty()) {
             if (cfg.exhaustive)
                 std::cout << "Windows: all (" << all_window_types().size() << " functions)\n";
-            else
-                std::cout << "Windows: default short list (tukey050, hann, welch, rect)\n";
+            else {
+                // Printed from default_shortlist(), never from a copy of it:
+                // this line named four windows long after the list grew to ten.
+                const auto sl = default_shortlist();
+                std::cout << "Windows: default short list (" << sl.size() << "): ";
+                for (size_t i = 0; i < sl.size(); ++i) {
+                    if (i) std::cout << ", ";
+                    std::cout << window_to_name(sl[i]);
+                }
+                if (cfg.adaptive_windows)
+                    std::cout << " (+ adaptive per-block additions)";
+                std::cout << "\n";
+            }
         }
         else {
             std::cout << "Windows: ";

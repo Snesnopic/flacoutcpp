@@ -312,7 +312,8 @@ Optimizer::Optimizer(uint32_t channels, uint32_t bps, uint32_t sample_rate,
                      std::vector<uint32_t> dp_candidates,
                      unsigned lattice_sweeps,
                      bool     use_gpu,
-                     unsigned gpu_min_batch)
+                     unsigned gpu_min_batch,
+                     unsigned gpu_partition_cap)
     : m_channels(channels), m_bps(bps), m_sample_rate(sample_rate),
       m_max_threads(max_threads),
       m_exhaustive(exhaustive), m_verbose(verbose), m_max_candidates(max_candidates),
@@ -323,6 +324,7 @@ Optimizer::Optimizer(uint32_t channels, uint32_t bps, uint32_t sample_rate,
     if (m_use_gpu) {
         m_gpu.reset(new GpuEvaluator());
         m_gpu->set_min_batch(gpu_min_batch);
+        m_gpu->set_partition_cap((int)gpu_partition_cap);
         if (m_verbose) {
             if (m_gpu->available())
                 std::fprintf(stderr, "GPU: %s\n", m_gpu->why().c_str());
@@ -3215,7 +3217,12 @@ SubframeParams Optimizer::optimize_subframe(
             uint32_t rice = calculate_rice_cost(residuals.data(), bsize,
                                                 (uint32_t)bl_ord, &cur);
             const uint32_t hdr = hdr_fixed + (uint32_t)bl_ord * (eff_bps + (uint32_t)bl_prec);
-            assert(hdr + 6u + rice == best_lpc_cost);
+            // A capped GPU partition search returns costs that are upper
+            // bounds, so the exact re-pricing here can come in lower. The
+            // encoder uses this exact value either way; only the equality
+            // pinning the two together stops holding.
+            assert(hdr + 6u + rice == best_lpc_cost ||
+                   (gpu && gpu->partition_cap() < 8));
             try_update(cur, hdr + 6u + rice);
         }
     }

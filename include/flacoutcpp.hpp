@@ -221,6 +221,19 @@ struct Config {
     unsigned gpu_min_batch = 0;
 
     /**
+     * @brief Cap on the GPU's partition-order search (`--gpu-partition-cap`).
+     *
+     * 8 is the format maximum and the default: the GPU then reproduces
+     * calculate_rice_cost exactly and the output is byte-identical to a
+     * CPU-only run. Lower values make the kernel markedly faster (its cost is
+     * dominated by partition closes, of which there are 2^(P+1)-1) at the
+     * price of possibly ranking a candidate wrong. The winner is still
+     * re-priced exactly on the CPU, so a cap can never mis-state a cost or
+     * break losslessness — it can only pick a slightly worse candidate.
+     */
+    unsigned gpu_partition_cap = 8;
+
+    /**
      * @brief Effort level 0-9: one dial across the measured size/time frontier.
      *
      * @ref max_candidates and @ref precision_rungs are not independent — they

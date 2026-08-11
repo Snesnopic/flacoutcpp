@@ -80,6 +80,18 @@ public:
     void   set_min_batch(size_t n);
     size_t min_batch() const;
 
+    /**
+     * @brief Cap on the kernel's partition-order search (1..8; 8 = no cap).
+     *
+     * The kernel's cost is dominated by partition closes, of which there are
+     * 2^(P+1)-1, so lowering P is the cheapest speed available. It cannot make
+     * the encoder wrong — the winning candidate is re-priced exactly on the
+     * CPU with the full search — but it can change which candidate wins, so
+     * anything below 8 is an optimality trade and belongs behind -U.
+     */
+    void set_partition_cap(int p);
+    int  partition_cap() const;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> m_impl;

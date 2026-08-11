@@ -58,6 +58,7 @@ layout(push_constant) uniform PC {
     int ncand;
     int bsize;
     int flags;      // bit 0: use the fp32 ranking residual instead of exact
+    int maxPOrder;  // cap on the partition-order search; 8 = the format's max
 } pc;
 
 // S_0 is the sum of a partition's folded residuals: ~2^40 for 24-bit content
@@ -153,8 +154,14 @@ void main() {
         for (int j = 0; j < 32; ++j) fc[j] = float(qc[j]) * inv;
     }
 
+    // Capping the partition-order search makes the kernel markedly cheaper --
+    // the cost is dominated by partition closes, of which there are 2^(P+1)-1.
+    // It cannot make the encoder wrong: the winner is re-priced exactly on the
+    // CPU with the full search, so a cap can only change WHICH candidate is
+    // picked, never what that candidate is said to cost. See -U.
+    const int pcap = min(MAXP, pc.maxPOrder);
     int P = 0;
-    for (int p = 1; p <= MAXP; ++p) {
+    for (int p = 1; p <= pcap; ++p) {
         if ((BS % (1 << p)) != 0) break;
         if ((BS >> p) < ord)      break;
         P = p;

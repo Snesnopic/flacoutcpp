@@ -17,6 +17,8 @@ bool GpuEvaluator::evaluate(const int32_t*, uint32_t,
 void GpuEvaluator::stats(uint64_t* c, double* s) const { if(c)*c=0; if(s)*s=0.0; }
 void GpuEvaluator::set_min_batch(size_t) {}
 size_t GpuEvaluator::min_batch() const { return 0; }
+void GpuEvaluator::set_partition_cap(int) {}
+int GpuEvaluator::partition_cap() const { return 8; }
 } // namespace flacoutcpp
 
 #else
@@ -48,6 +50,7 @@ struct PushConsts {
     int32_t ncand;
     int32_t bsize;
     int32_t flags;
+    int32_t maxPOrder;
 };
 
 } // namespace
@@ -96,6 +99,7 @@ struct GpuEvaluator::Impl {
     std::atomic<uint64_t> t_last{0};
     std::chrono::steady_clock::time_point t_origin = std::chrono::steady_clock::now();
     std::atomic<size_t>   min_batch{0};
+    std::atomic<int>      pcap{8};
 
     static constexpr uint32_t WG = 128;  // 4 candidates per work group
 
@@ -423,6 +427,12 @@ void GpuEvaluator::set_min_batch(size_t n) {
 size_t GpuEvaluator::min_batch() const {
     return m_impl->min_batch.load(std::memory_order_relaxed);
 }
+void GpuEvaluator::set_partition_cap(int p) {
+    m_impl->pcap.store(p < 1 ? 1 : (p > 8 ? 8 : p), std::memory_order_relaxed);
+}
+int GpuEvaluator::partition_cap() const {
+    return m_impl->pcap.load(std::memory_order_relaxed);
+}
 const std::string& GpuEvaluator::why() const { return m_impl->why; }
 
 void GpuEvaluator::stats(uint64_t* candidates, double* seconds) const {
@@ -487,7 +497,8 @@ bool GpuEvaluator::evaluate(const int32_t* shifted, uint32_t bsize,
         std::memcpy(&cp[i * 34 + 2], cands[i].qc, 32 * sizeof(int32_t));
     }
 
-    PushConsts pcv{ (int32_t)cands.size(), (int32_t)bsize, 0 };
+    PushConsts pcv{ (int32_t)cands.size(), (int32_t)bsize, 0,
+                    (int32_t)I.pcap.load(std::memory_order_relaxed) };
     const uint32_t cpw    = Impl::WG / 32;               // candidates per group
     const uint32_t groups = ((uint32_t)cands.size() + cpw - 1) / cpw;
 

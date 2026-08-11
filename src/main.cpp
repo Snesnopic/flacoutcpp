@@ -67,6 +67,12 @@ static void print_usage(const char* prog) {
         << "                       measured fastest here). Raise it if a device\n"
         << "                       has a long submit path; small batches then\n"
         << "                       stay on the CPU.\n"
+        << "      --gpu-partition-cap N\n"
+        << "                       Cap the GPU's partition-order search (1-8).\n"
+        << "                       8 (default) reproduces the CPU exactly. Lower\n"
+        << "                       is faster but may rank a candidate wrong; the\n"
+        << "                       winner is still priced exactly, so output\n"
+        << "                       stays lossless and its size never mis-stated.\n"
         << "                       build with -DFLACOUT_VULKAN=ON and a device\n"
         << "                       with 32-lane subgroups and shaderInt64.\n"
         << "  -Q, --lattice N      Refine the winning subframe's quantized LPC\n"
@@ -226,6 +232,22 @@ int main(int argc, char* argv[]) {
                 rungs_given = true;
             } catch (const std::exception&) {
                 std::cerr << "Error: -L requires a non-negative integer, got '" << argv[i] << "'.\n";
+                return EXIT_FAILURE;
+            }
+
+        } else if (arg == "--gpu-partition-cap") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --gpu-partition-cap requires a number.\n";
+                return EXIT_FAILURE;
+            }
+            ++i;
+            try {
+                unsigned v = static_cast<unsigned>(std::stoul(argv[i]));
+                if (v < 1 || v > 8) throw std::invalid_argument("range");
+                cfg.gpu_partition_cap = v;
+            } catch (const std::exception&) {
+                std::cerr << "Error: --gpu-partition-cap takes 1-8, got '"
+                          << argv[i] << "'.\n";
                 return EXIT_FAILURE;
             }
 

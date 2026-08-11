@@ -292,7 +292,8 @@ public:
               std::vector<uint32_t> dp_candidates = {},
               unsigned lattice_sweeps = 0,
               bool     use_gpu = false,
-              unsigned gpu_min_batch = 0);
+              unsigned gpu_min_batch = 0,
+              unsigned gpu_partition_cap = 8);
 
     /**
      * @brief Find the optimal variable block-size partition for the stream.

@@ -23,9 +23,6 @@ void GpuEvaluator::set_slots(int) {}
 int GpuEvaluator::slots() const { return 0; }
 void GpuEvaluator::set_duty(int) {}
 int GpuEvaluator::duty() const { return 100; }
-uint64_t GpuEvaluator::macs() const {
-    return m_impl->n_macs.load(std::memory_order_relaxed);
-}
 bool GpuEvaluator::would_accept() const { return false; }
 uint64_t GpuEvaluator::macs() const { return 0; }
 } // namespace flacoutcpp

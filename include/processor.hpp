@@ -91,6 +91,9 @@ struct ProcessorConfig {
     /// See flacoutcpp::Config::gpu_partition_cap.
     unsigned gpu_partition_cap = 8;
 
+    /// See flacoutcpp::Config::gpu_slots.
+    unsigned gpu_slots = 3;
+
     /**
      * @brief Adaptive per-subframe window selection (experimental,
      * estimated-DP modes only). See flacoutcpp::Config::adaptive_windows.

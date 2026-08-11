@@ -233,6 +233,9 @@ struct Config {
      */
     unsigned gpu_partition_cap = 8;
 
+    /// Dispatches in flight (`--gpu-slots`, 1-16). See GpuEvaluator::set_slots.
+    unsigned gpu_slots = 3;
+
     /**
      * @brief Effort level 0-9: one dial across the measured size/time frontier.
      *

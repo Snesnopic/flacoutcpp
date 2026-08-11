@@ -19,6 +19,8 @@ void GpuEvaluator::set_min_batch(size_t) {}
 size_t GpuEvaluator::min_batch() const { return 0; }
 void GpuEvaluator::set_partition_cap(int) {}
 int GpuEvaluator::partition_cap() const { return 8; }
+void GpuEvaluator::set_slots(int) {}
+int GpuEvaluator::slots() const { return 0; }
 } // namespace flacoutcpp
 
 #else
@@ -71,16 +73,19 @@ struct GpuEvaluator::Impl {
     VkPipelineLayout      plo   = VK_NULL_HANDLE;
     VkPipeline            pipe  = VK_NULL_HANDLE;
     VkShaderModule        shader= VK_NULL_HANDLE;
-    VkCommandPool         cpool = VK_NULL_HANDLE;
-
     // Independent slots, so several workers can have dispatches in flight.
     // With a single command buffer the whole submit-and-wait sat inside one
     // lock, which capped the device at one dispatch at a time: measured, the
     // GPU absorbed only ~31% of the search while 15 of 16 threads took the CPU
     // path. Only vkQueueSubmit needs serialising (the queue is externally
     // synchronised); waiting is per-slot and lock-free.
-    static constexpr int NSLOT = 6;
+    static constexpr int NSLOT = 16;   // allocated; `nslot` is how many are used
     struct Slot {
+        // One pool per slot. A VkCommandPool is externally synchronised, so
+        // two threads may not record into buffers from the same pool at once;
+        // sharing one pool across slots is a data race that happens to survive
+        // at low slot counts and produced differing output at 16.
+        VkCommandPool   pool  = VK_NULL_HANDLE;
         VkCommandBuffer cmd   = VK_NULL_HANDLE;
         VkFence         fence = VK_NULL_HANDLE;
         VkDescriptorSet dset  = VK_NULL_HANDLE;
@@ -88,6 +93,7 @@ struct GpuEvaluator::Impl {
         std::atomic<bool> busy{false};
     };
     Slot slots[NSLOT];
+    std::atomic<int> nslot{3};
 
     std::mutex submit_mu;                // vkQueueSubmit only
     std::atomic<uint64_t> n_cands{0};
@@ -361,17 +367,17 @@ bool GpuEvaluator::Impl::init() {
         return false;
     }
 
-    VkCommandPoolCreateInfo cpci{};
-    cpci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-    cpci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-    cpci.queueFamilyIndex = qfam;
-    if (vkCreateCommandPool(dev, &cpci, nullptr, &cpool) != VK_SUCCESS) {
-        why = "command pool"; return false;
-    }
     for (int i = 0; i < NSLOT; ++i) {
+        VkCommandPoolCreateInfo cpci{};
+        cpci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        cpci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        cpci.queueFamilyIndex = qfam;
+        if (vkCreateCommandPool(dev, &cpci, nullptr, &slots[i].pool) != VK_SUCCESS) {
+            why = "command pool"; return false;
+        }
         VkCommandBufferAllocateInfo cbai{};
         cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-        cbai.commandPool = cpool;
+        cbai.commandPool = slots[i].pool;
         cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
         cbai.commandBufferCount = 1;
         if (vkAllocateCommandBuffers(dev, &cbai, &slots[i].cmd) != VK_SUCCESS) {
@@ -401,8 +407,8 @@ void GpuEvaluator::Impl::destroy() {
     for (int i = 0; i < NSLOT; ++i) {
         killbuf(slots[i].bSamples); killbuf(slots[i].bCands); killbuf(slots[i].bCosts);
         if (slots[i].fence) vkDestroyFence(dev, slots[i].fence, nullptr);
+        if (slots[i].pool)  vkDestroyCommandPool(dev, slots[i].pool, nullptr);
     }
-    if (cpool)  vkDestroyCommandPool(dev, cpool, nullptr);
     if (pipe)   vkDestroyPipeline(dev, pipe, nullptr);
     if (shader) vkDestroyShaderModule(dev, shader, nullptr);
     if (plo)    vkDestroyPipelineLayout(dev, plo, nullptr);
@@ -426,6 +432,13 @@ void GpuEvaluator::set_min_batch(size_t n) {
 }
 size_t GpuEvaluator::min_batch() const {
     return m_impl->min_batch.load(std::memory_order_relaxed);
+}
+void GpuEvaluator::set_slots(int n) {
+    m_impl->nslot.store(n < 1 ? 1 : (n > Impl::NSLOT ? Impl::NSLOT : n),
+                        std::memory_order_relaxed);
+}
+int GpuEvaluator::slots() const {
+    return m_impl->nslot.load(std::memory_order_relaxed);
 }
 void GpuEvaluator::set_partition_cap(int p) {
     m_impl->pcap.store(p < 1 ? 1 : (p > 8 ? 8 : p), std::memory_order_relaxed);
@@ -458,7 +471,8 @@ bool GpuEvaluator::evaluate(const int32_t* shifted, uint32_t bsize,
     // unchanged either way. Idling a worker to wait for the device is strictly
     // worse than having it do the work itself.
     int si = -1;
-    for (int i = 0; i < Impl::NSLOT; ++i) {
+    const int nsl = I.nslot.load(std::memory_order_relaxed);
+    for (int i = 0; i < nsl; ++i) {
         bool expect = false;
         if (I.slots[i].busy.compare_exchange_strong(expect, true,
                                                     std::memory_order_acquire)) {

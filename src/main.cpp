@@ -67,6 +67,9 @@ static void print_usage(const char* prog) {
         << "                       measured fastest here). Raise it if a device\n"
         << "                       has a long submit path; small batches then\n"
         << "                       stay on the CPU.\n"
+        << "      --gpu-slots N      Dispatches in flight (1-16, default 3).\n"
+        << "                       Each parks a worker on a fence, so more is\n"
+        << "                       not better unless the GPU outruns the CPU.\n"
         << "      --gpu-partition-cap N\n"
         << "                       Cap the GPU's partition-order search (1-8).\n"
         << "                       8 (default) reproduces the CPU exactly. Lower\n"
@@ -232,6 +235,18 @@ int main(int argc, char* argv[]) {
                 rungs_given = true;
             } catch (const std::exception&) {
                 std::cerr << "Error: -L requires a non-negative integer, got '" << argv[i] << "'.\n";
+                return EXIT_FAILURE;
+            }
+
+        } else if (arg == "--gpu-slots") {
+            if (i + 1 >= argc) { std::cerr << "Error: --gpu-slots requires a number.\n"; return EXIT_FAILURE; }
+            ++i;
+            try {
+                unsigned v = static_cast<unsigned>(std::stoul(argv[i]));
+                if (v < 1 || v > 16) throw std::invalid_argument("range");
+                cfg.gpu_slots = v;
+            } catch (const std::exception&) {
+                std::cerr << "Error: --gpu-slots takes 1-16, got '" << argv[i] << "'.\n";
                 return EXIT_FAILURE;
             }
 

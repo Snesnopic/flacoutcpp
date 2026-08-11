@@ -313,7 +313,8 @@ Optimizer::Optimizer(uint32_t channels, uint32_t bps, uint32_t sample_rate,
                      unsigned lattice_sweeps,
                      bool     use_gpu,
                      unsigned gpu_min_batch,
-                     unsigned gpu_partition_cap)
+                     unsigned gpu_partition_cap,
+                     unsigned gpu_slots)
     : m_channels(channels), m_bps(bps), m_sample_rate(sample_rate),
       m_max_threads(max_threads),
       m_exhaustive(exhaustive), m_verbose(verbose), m_max_candidates(max_candidates),
@@ -325,6 +326,7 @@ Optimizer::Optimizer(uint32_t channels, uint32_t bps, uint32_t sample_rate,
         m_gpu.reset(new GpuEvaluator());
         m_gpu->set_min_batch(gpu_min_batch);
         m_gpu->set_partition_cap((int)gpu_partition_cap);
+        m_gpu->set_slots((int)gpu_slots);
         if (m_verbose) {
             if (m_gpu->available())
                 std::fprintf(stderr, "GPU: %s\n", m_gpu->why().c_str());

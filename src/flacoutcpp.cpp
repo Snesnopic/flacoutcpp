@@ -76,6 +76,7 @@ bool optimise(const std::string& input_path, const std::string& output_path, con
     pc.use_gpu        = config.use_gpu;
     pc.gpu_min_batch  = config.gpu_min_batch;
     pc.gpu_partition_cap = config.gpu_partition_cap;
+    pc.gpu_slots      = config.gpu_slots;
     pc.dp_candidates = config.dp_candidates;
     pc.reuse_frames  = config.reuse_frames;
     pc.warn_superior = config.warn_superior;

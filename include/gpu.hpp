@@ -92,6 +92,20 @@ public:
     void set_partition_cap(int p);
     int  partition_cap() const;
 
+    /**
+     * @brief How many dispatches may be in flight (`--gpu-slots`, 1..16).
+     *
+     * Each in-flight slot parks a CPU worker on a fence. Since the GPU is
+     * worth roughly half a CPU here, too many slots lose more CPU throughput
+     * than the device adds: measured on the master mix at -E 9, 1 slot gives
+     * 1.16x, 3 gives 1.34x, 8 gives 1.15x and 16 gives 0.68x — at which point
+     * every worker is parked and the run is GPU-only. The optimum tracks the
+     * GPU/CPU throughput ratio, so it is a knob; a device that dominates its
+     * host wants more.
+     */
+    void set_slots(int n);
+    int  slots() const;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> m_impl;

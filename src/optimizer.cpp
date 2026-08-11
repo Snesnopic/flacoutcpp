@@ -41,6 +41,8 @@ struct InstrCounters {
     std::atomic<uint64_t> rice_scan_samples{0}; // residuals scanned in sums pass
     std::atomic<uint64_t> rice_k_ops{0};        // (u>>k) accumulations
     std::atomic<uint64_t> rice_fold_ops{0};
+    std::atomic<uint64_t> rice_sums2_parts{0};   // partitions taking the RICE2 pass
+    std::atomic<uint64_t> rice_sums2_samples{0}; // residuals it rescans, scalar
     std::atomic<uint64_t> rice_chunk_fast{0};  // 32-bit lane accumulation held
     std::atomic<uint64_t> rice_chunk_slow{0};  // OR proved it could wrap; redone in 64-bit
     std::atomic<uint64_t> autoc_macs{0};
@@ -74,6 +76,9 @@ struct InstrCounters {
         std::fprintf(stderr, "rice residuals scanned  : %llu\n", (unsigned long long)rice_scan_samples);
         std::fprintf(stderr, "rice (u>>k) ops         : %llu\n", (unsigned long long)rice_k_ops);
         std::fprintf(stderr, "rice fold ops           : %llu\n", (unsigned long long)rice_fold_ops);
+        std::fprintf(stderr, "rice sums2 parts/samples: %llu / %llu\n",
+                     (unsigned long long)rice_sums2_parts,
+                     (unsigned long long)rice_sums2_samples);
         {
             unsigned long long f = rice_chunk_fast, sl = rice_chunk_slow;
             std::fprintf(stderr, "rice chunks fast/slow   : %llu / %llu (%.4f%% fell back)\n",
@@ -1891,13 +1896,66 @@ uint32_t Optimizer::calculate_rice_cost(
         const uint32_t start = p * p_size;
         const uint32_t end   = start + p_size;
         const uint32_t first = std::max(start, order);
+        INSTR(g_instr.rice_sums2_parts.fetch_add(1, std::memory_order_relaxed));
+        INSTR(g_instr.rice_sums2_samples.fetch_add(end - first, std::memory_order_relaxed));
         uint64_t* s2 = sums2[p];
-        // v ≤ 2^17 and n ≤ 65535, so plain 64-bit accumulation cannot wrap;
-        // no chunking needed. This path never runs for 16-bit content.
+        // Vectorized the same way as the 15-lane low-k scan above, and for the
+        // same reason: this is not the rare path the original comment assumed.
+        // 24-bit content rescans 41-73% of all residuals here (measured,
+        // music_3s and s24_2s under -e), against 0.18% at 16 bits -- so a
+        // scalar loop doing 16 shift-adds per residual was costing roughly
+        // what the whole vectorized low-k pass costs, on exactly the content
+        // where RICE2 exists to help.
+        //
+        // 32-bit lanes need the same wrap guard the low-k scan uses: v is
+        // bounded by 2^17 and a partition by 65535 residuals, whose product
+        // exceeds 32 bits. The OR of every v bounds each lane's total, so one
+        // compare decides whether the fast accumulation held.
+#if FLACOUT_HAVE_VECEXT
+        {
+            u32x4 acc2[NUM_K2] = {};
+            u32x4 orv2 = {};
+            uint32_t i = first;
+            for (; i + 4 <= end; i += 4) {
+                const u32x4 v = { zigzag(residuals[i])     >> 15,
+                                  zigzag(residuals[i + 1]) >> 15,
+                                  zigzag(residuals[i + 2]) >> 15,
+                                  zigzag(residuals[i + 3]) >> 15 };
+                orv2 |= v;
+#  if defined(__clang__)
+#    pragma unroll
+#  elif defined(__GNUC__)
+#    pragma GCC unroll 16
+#  endif
+                for (int k = 0; k < NUM_K2; ++k) acc2[k] += v >> k;
+            }
+            uint32_t tail2[NUM_K2] = {};
+            uint32_t or_tail2 = 0;
+            for (; i < end; ++i) {
+                const uint32_t v = zigzag(residuals[i]) >> 15;
+                or_tail2 |= v;
+                for (int k = 0; k < NUM_K2; ++k) tail2[k] += v >> k;
+            }
+            const uint32_t or_all2 =
+                or_tail2 | orv2[0] | orv2[1] | orv2[2] | orv2[3];
+            if ((uint64_t)(end - first) * or_all2 <= 0xFFFFFFFFull) {
+                for (int k = 0; k < NUM_K2; ++k)
+                    s2[k] = (uint64_t)acc2[k][0] + acc2[k][1] + acc2[k][2]
+                          + acc2[k][3] + tail2[k];
+            } else {
+                for (int k = 0; k < NUM_K2; ++k) s2[k] = 0;
+                for (uint32_t j = first; j < end; ++j) {
+                    const uint32_t v = zigzag(residuals[j]) >> 15;
+                    for (int k = 0; k < NUM_K2; ++k) s2[k] += v >> k;
+                }
+            }
+        }
+#else
         for (uint32_t i = first; i < end; ++i) {
             const uint32_t v = zigzag(residuals[i]) >> 15;
             for (int k = 0; k < NUM_K2; ++k) s2[k] += v >> k;
         }
+#endif
     }
     uint64_t best_total = std::numeric_limits<uint64_t>::max();
     int      best_porder = 0;

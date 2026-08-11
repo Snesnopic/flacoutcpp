@@ -357,7 +357,11 @@ private:
     struct Granule { double autoc[9]; }; ///< Cached autocorrelation for one 16-sample granule.
     std::vector<std::vector<Granule>> m_granules;
     void precompute_granules(const std::vector<std::vector<int32_t>>& pcm_data);
-    [[nodiscard]] uint32_t estimate_lpc_bits_fast(int channel,
+    /// @param pcm_data Source samples; the estimate builds real residuals and
+    ///        counts their Rice bits rather than modelling them.
+    [[nodiscard]] uint32_t estimate_lpc_bits_fast(
+                                    const std::vector<std::vector<int32_t>>& pcm_data,
+                                    int channel,
                                     uint32_t n_start, uint32_t n_end,
                                     int bps) const;
 

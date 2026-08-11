@@ -3398,28 +3398,87 @@ void Optimizer::precompute_granules(
 
 }
 
+// Order and coefficient precision of the estimator's predictor. The order is
+// the estimate's main remaining bias — the real search reaches 32 — and the
+// precision is nearly free either way (order*prec is ~120 bits against a
+// payload of thousands), so it sits at the top of the range for predictor
+// fidelity rather than to save bits.
+#ifndef FLACOUT_EST_ORDER
+#define FLACOUT_EST_ORDER 8
+#endif
+#ifndef FLACOUT_EST_PREC
+#define FLACOUT_EST_PREC 15
+#endif
+// Also price a Fixed order-2 subframe and take the cheaper. Worth -0.0226% of
+// the album corpus on top of the LPC-only estimate (-0.2072% against -0.1846%),
+// and it is what pulls the two regressing tracks back: +1.015% -> +0.860% and
+// +0.039% -> +0.012%. It costs the biggest winner a little (-3.99% -> -3.83%),
+// so this is a net call, not a free one.
+#ifndef FLACOUT_EST_FIXED
+#define FLACOUT_EST_FIXED 1
+#endif
+
 uint32_t Optimizer::estimate_lpc_bits_fast(
+    const std::vector<std::vector<int32_t>>& pcm_data,
     int channel, uint32_t n_start, uint32_t n_end, int bps) const
 {
-    double autoc[9] = {};
-    for (uint32_t g = n_start; g < n_end; ++g)
-        for (int i = 0; i <= 8; ++i)
-            autoc[i] += m_granules[channel][g].autoc[i];
+    // Real Rice bits off a cheap predictor, not the entropy of its residual
+    // energy.
+    //
+    // This used to price a block as 0.5*log2(2*pi*e*var) bits per sample from
+    // the order-8 Levinson error — a Gaussian differential entropy standing in
+    // for what Rice coding actually charges. That proxy is what made the
+    // estimate *disperse*: per block against the real cost, est/exact ran p10
+    // 1.075 to p90 1.515 (cv 12.5%), and replaying the DP on both cost columns
+    // showed the dispersion costs 0.45-0.65% of the file in partition regret
+    // alone — most of what -e is worth. Recalibrating the median recovers at
+    // most 6% of that, because the error is spread rather than bias, so the
+    // model itself had to go. See "What the estimated DP's gap actually is".
+    //
+    // estimate_subframe_cost already prices a subframe the way the encoder
+    // does — rectangular autocorrelation, Levinson, quantize, residuals,
+    // calculate_rice_cost — so this is a call, not new arithmetic, and the
+    // remaining error is only what the real search does *better* (up to order
+    // 32, ten windows, eight precisions, four stereo modes) rather than a model
+    // of the coder.
+    //
+    // It no longer reads the granule cache. That is not a saving: the cache was
+    // O(bsize/16) per call and this is several O(bsize) passes. What it buys is
+    // accuracy, and the wall-clock is in the commit message.
+    const int32_t* smp   = &pcm_data[(size_t)channel][(size_t)n_start * 16];
+    const uint32_t bsize = (n_end - n_start) * 16;
 
-    float coeffs[32];
-    compute_lpc_coefficients(autoc, coeffs, 8);
+    // Wasted-bits detection, as optimize_subframe does it: the real encoder
+    // will strip these, so an estimate that ignored them would price
+    // reduced-depth content (a common master-tape artefact) far too high.
+    int wasted = 0;
+    int32_t mask = 0;
+    for (uint32_t i = 0; i < bsize; ++i) mask |= smp[i];
+    // Digital silence: a CONSTANT subframe, header plus one value. Reproduces
+    // what the old model's `err <= 0` branch returned, and keeps degenerate
+    // all-zero autocorrelations out of the Levinson recursion below.
+    if (mask == 0) return 8u + (uint32_t)bps;
+    while ((mask & 1) == 0) { mask >>= 1; ++wasted; }
 
-    double err = autoc[0];
-    for (int i = 0; i < 8; ++i) err -= (double)coeffs[i] * autoc[i+1];
-
-    uint32_t bsize = (n_end - n_start) * 16;
-    // +8: subframe header. Frame-level overhead is priced by the DP itself
-    // via FrameWriter::frame_bits, so it must not be baked in here too.
-    if (err <= 0) return 8 + (uint32_t)bps;
-
-    double bps_est = 0.5 * std::log2(2.0 * M_PI * M_E * (err / bsize));
-    if (bps_est < 1.0) bps_est = 1.0;
-    return 8u + (uint32_t)(bsize * bps_est);
+    // Frame-level overhead is priced by the DP itself via
+    // FrameWriter::frame_bits, so it must not be baked in here too;
+    // estimate_subframe_cost returns subframe bits only, which is the same
+    // footing the exact path's SubframeParams::bits_cost is on.
+    const uint32_t lpc = estimate_subframe_cost(smp, bsize, 3, FLACOUT_EST_ORDER,
+                                                FLACOUT_EST_PREC, wasted, bps);
+#if FLACOUT_EST_FIXED
+    // The encoder picks the cheapest of Constant / Verbatim / Fixed / LPC, so an
+    // LPC-only estimate overcharges every block that ends up Fixed by the
+    // coefficients and warm-up an LPC subframe pays and a Fixed one does not
+    // (order*prec + order*bps — ~250 bits at order 8). That is noise against a
+    // loud block's payload and can dominate a quiet one, which biases the
+    // partition exactly where the payload is smallest. A Fixed order-2 pass is
+    // the cheap half of the comparison: no autocorrelation, no quantisation.
+    const uint32_t fixed = estimate_subframe_cost(smp, bsize, 2, 2, 0, wasted, bps);
+    return std::min(lpc, fixed);
+#else
+    return lpc;
+#endif
 }
 
 // ============================================================
@@ -3438,10 +3497,13 @@ uint32_t Optimizer::estimate_lpc_bits_fast(
 std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
     const std::vector<std::vector<int32_t>>& pcm_data)
 {
-    // Only the estimated path reads the granule cache: estimate_lpc_bits_fast
-    // is called from the !full_search() branch of phase 1, and select_windows
-    // (which already falls back to the configured set on an empty cache) is
-    // gated on m_adaptive && !full_search() in compute_block. Under -e the
+    // Only the estimated path reads the granule cache, and since
+    // estimate_lpc_bits_fast started counting real Rice bits from PCM, the only
+    // reader left is select_windows (which already falls back to the configured
+    // set on an empty cache), gated on m_adaptive && !full_search() in
+    // compute_block. `-a` is on at every effort level, so the cache still earns
+    // its keep in estimated mode — but if it ever stops being the default,
+    // this guard should tighten to `!full_search() && m_adaptive`. Under -e the
     // cache was built and then never touched, at 4.5 bytes per sample per
     // channel — 91.5 MB on a 10.2M-sample stereo track, a fifth of that run's
     // 466 MB peak — plus a single-threaded pass over the whole stream before
@@ -3593,10 +3655,10 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
                         uint32_t g_start = (uint32_t)(node * (STEP / GRANULE_SIZE));
                         uint32_t g_end   = g_start + CANDIDATES[ci] / GRANULE_SIZE;
                         if (m_channels == 1) {
-                            bits = estimate_lpc_bits_fast(0, g_start, g_end, m_bps);
+                            bits = estimate_lpc_bits_fast(pcm_data, 0, g_start, g_end, m_bps);
                         } else {
-                            bits = estimate_lpc_bits_fast(0, g_start, g_end, m_bps) +
-                                   estimate_lpc_bits_fast(1, g_start, g_end, m_bps);
+                            bits = estimate_lpc_bits_fast(pcm_data, 0, g_start, g_end, m_bps) +
+                                   estimate_lpc_bits_fast(pcm_data, 1, g_start, g_end, m_bps);
                         }
                         BlockParams bp{};
                         bp.block_size = CANDIDATES[ci];
@@ -3620,7 +3682,7 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
                         const uint32_t g1 = g0 + bsize / GS;
                         uint32_t est = 0;
                         for (uint32_t ch = 0; ch < std::min(m_channels, 2u); ++ch)
-                            est += estimate_lpc_bits_fast((int)ch, g0, g1, m_bps);
+                            est += estimate_lpc_bits_fast(pcm_data, (int)ch, g0, g1, m_bps);
                         const BlockParams exact = full_search()
                             ? cost_table[node * NUM_CANDS + ci]
                             : compute_block(pcm_data, (uint64_t)node * STEP, bsize);

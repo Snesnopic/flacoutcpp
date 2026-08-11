@@ -1336,6 +1336,29 @@ static double window_zero_frac(WindowType wt, uint32_t N)
     return blind_fraction(tmp.data(), N);
 }
 
+
+// How much of the search the GPU actually absorbed. Worth printing because it
+// is the number that explains -G's speedup, and it is not guessable: workers
+// take the queue with try_lock, so the share depends on how dispatch latency
+// happens to interleave with CPU encode time, not on anything configured.
+void Optimizer::report_gpu(uint64_t total_candidates) const
+{
+    if (!m_gpu || !m_gpu->available() || !m_verbose) return;
+    uint64_t gc = 0; double gs = 0.0;
+    m_gpu->stats(&gc, &gs);
+    if (!gc) { std::cout << "GPU: no batches dispatched\n"; return; }
+    // Candidates per second is the portable figure: it does not depend on the
+    // fixture's length or on how the CPU/GPU split happened to fall, so it is
+    // what to compare when running this on a different device.
+    char buf[160];
+    std::snprintf(buf, sizeof buf,
+                  "GPU: %llu candidates in %.2fs (%.3g candidates/s)\n",
+                  (unsigned long long)gc, gs,
+                  gs > 0.0 ? (double)gc / gs : 0.0);
+    std::cout << buf;
+    (void)total_candidates;
+}
+
 void Optimizer::apply_window(
     const int32_t* samples, uint32_t N, int wasted_bits,
     WindowType wt, double* out)
@@ -3797,6 +3820,7 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
             std::cout << "  bs=" << bs << "×" << cnt;
         std::cout << "\n";
     }
+        report_gpu(0);
 
     return result;
 }

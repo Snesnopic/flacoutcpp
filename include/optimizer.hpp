@@ -416,6 +416,9 @@ private:
     bool                  m_adaptive;
     unsigned              m_patience;
     unsigned              m_precision_rungs;
+    /// Print the GPU's share of the search; no-op without -G.
+    void report_gpu(uint64_t total_candidates) const;
+
     unsigned              m_lattice_sweeps;
     bool                  m_use_gpu = false;
     std::unique_ptr<GpuEvaluator> m_gpu;

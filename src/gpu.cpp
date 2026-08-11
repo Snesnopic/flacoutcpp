@@ -65,19 +65,36 @@ struct GpuEvaluator::Impl {
 
     VkDescriptorSetLayout dsl   = VK_NULL_HANDLE;
     VkDescriptorPool      pool  = VK_NULL_HANDLE;
-    VkDescriptorSet       dset  = VK_NULL_HANDLE;
     VkPipelineLayout      plo   = VK_NULL_HANDLE;
     VkPipeline            pipe  = VK_NULL_HANDLE;
     VkShaderModule        shader= VK_NULL_HANDLE;
     VkCommandPool         cpool = VK_NULL_HANDLE;
-    VkCommandBuffer       cmd   = VK_NULL_HANDLE;
-    VkFence               fence = VK_NULL_HANDLE;
 
-    Buffer bSamples, bCands, bCosts;
+    // Independent slots, so several workers can have dispatches in flight.
+    // With a single command buffer the whole submit-and-wait sat inside one
+    // lock, which capped the device at one dispatch at a time: measured, the
+    // GPU absorbed only ~31% of the search while 15 of 16 threads took the CPU
+    // path. Only vkQueueSubmit needs serialising (the queue is externally
+    // synchronised); waiting is per-slot and lock-free.
+    static constexpr int NSLOT = 6;
+    struct Slot {
+        VkCommandBuffer cmd   = VK_NULL_HANDLE;
+        VkFence         fence = VK_NULL_HANDLE;
+        VkDescriptorSet dset  = VK_NULL_HANDLE;
+        Buffer bSamples, bCands, bCosts;
+        std::atomic<bool> busy{false};
+    };
+    Slot slots[NSLOT];
 
-    std::mutex mu;                       // one queue, so submissions serialise
+    std::mutex submit_mu;                // vkQueueSubmit only
     std::atomic<uint64_t> n_cands{0};
-    std::atomic<uint64_t> n_micros{0};
+    // Per-call elapsed cannot be summed once dispatches overlap -- with six
+    // slots in flight that counts the same wall time up to six times. Track
+    // the span from the first dispatch's start to the last one's end instead,
+    // which is the window the device was actually working in.
+    std::atomic<uint64_t> t_first{UINT64_MAX};
+    std::atomic<uint64_t> t_last{0};
+    std::chrono::steady_clock::time_point t_origin = std::chrono::steady_clock::now();
     std::atomic<size_t>   min_batch{0};
 
     static constexpr uint32_t WG = 128;  // 4 candidates per work group
@@ -86,7 +103,7 @@ struct GpuEvaluator::Impl {
     void destroy();
     bool grow(Buffer& b, VkDeviceSize need);
     uint32_t findMem(uint32_t bits, VkMemoryPropertyFlags want) const;
-    void bindDescriptors();
+    void bindDescriptors(Slot& s);
 };
 
 uint32_t GpuEvaluator::Impl::findMem(uint32_t bits, VkMemoryPropertyFlags want) const {
@@ -132,15 +149,15 @@ bool GpuEvaluator::Impl::grow(Buffer& b, VkDeviceSize need) {
     return true;
 }
 
-void GpuEvaluator::Impl::bindDescriptors() {
+void GpuEvaluator::Impl::bindDescriptors(Slot& s) {
     VkDescriptorBufferInfo dbi[3]{};
-    dbi[0].buffer = bSamples.buf; dbi[0].range = VK_WHOLE_SIZE;
-    dbi[1].buffer = bCands.buf;   dbi[1].range = VK_WHOLE_SIZE;
-    dbi[2].buffer = bCosts.buf;   dbi[2].range = VK_WHOLE_SIZE;
+    dbi[0].buffer = s.bSamples.buf; dbi[0].range = VK_WHOLE_SIZE;
+    dbi[1].buffer = s.bCands.buf;   dbi[1].range = VK_WHOLE_SIZE;
+    dbi[2].buffer = s.bCosts.buf;   dbi[2].range = VK_WHOLE_SIZE;
     VkWriteDescriptorSet wr[3]{};
     for (int i = 0; i < 3; ++i) {
         wr[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        wr[i].dstSet = dset;
+        wr[i].dstSet = s.dset;
         wr[i].dstBinding = (uint32_t)i;
         wr[i].descriptorCount = 1;
         wr[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -290,22 +307,24 @@ bool GpuEvaluator::Impl::init() {
     if (vkCreateDescriptorSetLayout(dev, &dslci, nullptr, &dsl) != VK_SUCCESS) {
         why = "descriptor set layout"; return false;
     }
-    VkDescriptorPoolSize psz{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3};
+    VkDescriptorPoolSize psz{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 * NSLOT};
     VkDescriptorPoolCreateInfo dpci{};
     dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    dpci.maxSets = 1;
+    dpci.maxSets = NSLOT;
     dpci.poolSizeCount = 1;
     dpci.pPoolSizes = &psz;
     if (vkCreateDescriptorPool(dev, &dpci, nullptr, &pool) != VK_SUCCESS) {
         why = "descriptor pool"; return false;
     }
-    VkDescriptorSetAllocateInfo dsai{};
-    dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    dsai.descriptorPool = pool;
-    dsai.descriptorSetCount = 1;
-    dsai.pSetLayouts = &dsl;
-    if (vkAllocateDescriptorSets(dev, &dsai, &dset) != VK_SUCCESS) {
-        why = "descriptor set"; return false;
+    for (int i = 0; i < NSLOT; ++i) {
+        VkDescriptorSetAllocateInfo dsai{};
+        dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        dsai.descriptorPool = pool;
+        dsai.descriptorSetCount = 1;
+        dsai.pSetLayouts = &dsl;
+        if (vkAllocateDescriptorSets(dev, &dsai, &slots[i].dset) != VK_SUCCESS) {
+            why = "descriptor set"; return false;
+        }
     }
 
     VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushConsts)};
@@ -345,18 +364,20 @@ bool GpuEvaluator::Impl::init() {
     if (vkCreateCommandPool(dev, &cpci, nullptr, &cpool) != VK_SUCCESS) {
         why = "command pool"; return false;
     }
-    VkCommandBufferAllocateInfo cbai{};
-    cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    cbai.commandPool = cpool;
-    cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cbai.commandBufferCount = 1;
-    if (vkAllocateCommandBuffers(dev, &cbai, &cmd) != VK_SUCCESS) {
-        why = "command buffer"; return false;
-    }
-    VkFenceCreateInfo fci{};
-    fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-    if (vkCreateFence(dev, &fci, nullptr, &fence) != VK_SUCCESS) {
-        why = "fence"; return false;
+    for (int i = 0; i < NSLOT; ++i) {
+        VkCommandBufferAllocateInfo cbai{};
+        cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        cbai.commandPool = cpool;
+        cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cbai.commandBufferCount = 1;
+        if (vkAllocateCommandBuffers(dev, &cbai, &slots[i].cmd) != VK_SUCCESS) {
+            why = "command buffer"; return false;
+        }
+        VkFenceCreateInfo fci{};
+        fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        if (vkCreateFence(dev, &fci, nullptr, &slots[i].fence) != VK_SUCCESS) {
+            why = "fence"; return false;
+        }
     }
 
     why = std::string(props.deviceName) + " (subgroup 32, shaderInt64)";
@@ -373,8 +394,10 @@ void GpuEvaluator::Impl::destroy() {
         if (b.mem) vkFreeMemory(dev, b.mem, nullptr);
         b = Buffer{};
     };
-    killbuf(bSamples); killbuf(bCands); killbuf(bCosts);
-    if (fence)  vkDestroyFence(dev, fence, nullptr);
+    for (int i = 0; i < NSLOT; ++i) {
+        killbuf(slots[i].bSamples); killbuf(slots[i].bCands); killbuf(slots[i].bCosts);
+        if (slots[i].fence) vkDestroyFence(dev, slots[i].fence, nullptr);
+    }
     if (cpool)  vkDestroyCommandPool(dev, cpool, nullptr);
     if (pipe)   vkDestroyPipeline(dev, pipe, nullptr);
     if (shader) vkDestroyShaderModule(dev, shader, nullptr);
@@ -404,7 +427,11 @@ const std::string& GpuEvaluator::why() const { return m_impl->why; }
 
 void GpuEvaluator::stats(uint64_t* candidates, double* seconds) const {
     if (candidates) *candidates = m_impl->n_cands.load(std::memory_order_relaxed);
-    if (seconds)    *seconds    = (double)m_impl->n_micros.load(std::memory_order_relaxed) * 1e-6;
+    if (seconds) {
+        const uint64_t a = m_impl->t_first.load(std::memory_order_relaxed);
+        const uint64_t b = m_impl->t_last.load(std::memory_order_relaxed);
+        *seconds = (a == UINT64_MAX || b <= a) ? 0.0 : (double)(b - a) * 1e-6;
+    }
 }
 
 bool GpuEvaluator::evaluate(const int32_t* shifted, uint32_t bsize,
@@ -414,30 +441,46 @@ bool GpuEvaluator::evaluate(const int32_t* shifted, uint32_t bsize,
     if (!I.ok || cands.empty()) return false;
     // The kernel walks the block in fixed 32-sample chunks.
     if (bsize % 32u != 0u) return false;
+    if (cands.size() < I.min_batch.load(std::memory_order_relaxed)) return false;
 
-    // Try, don't block. One queue means submissions serialise, but a worker
-    // that cannot get the GPU should encode its subframe on the CPU rather
-    // than idle: with a blocking lock, 15 of 16 threads wait while one
-    // dispatch runs and the machine does less work than the CPU alone.
-    // Failing here is not an error -- the caller falls back, and both paths
-    // produce the same winner, so the output is unchanged either way.
-    std::unique_lock<std::mutex> lk(I.mu, std::try_to_lock);
-    if (!lk.owns_lock()) return false;
+    // Claim a slot. Failing is not an error: the caller encodes on the CPU
+    // instead, and both paths produce the same winner, so the output is
+    // unchanged either way. Idling a worker to wait for the device is strictly
+    // worse than having it do the work itself.
+    int si = -1;
+    for (int i = 0; i < Impl::NSLOT; ++i) {
+        bool expect = false;
+        if (I.slots[i].busy.compare_exchange_strong(expect, true,
+                                                    std::memory_order_acquire)) {
+            si = i; break;
+        }
+    }
+    if (si < 0) return false;
+    Impl::Slot& sl = I.slots[si];
+    struct Release {
+        Impl::Slot& s;
+        ~Release() { s.busy.store(false, std::memory_order_release); }
+    } release{sl};
 
     const auto t0 = std::chrono::steady_clock::now();
+    const uint64_t us0 = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+        t0 - I.t_origin).count();
+    uint64_t prev = I.t_first.load(std::memory_order_relaxed);
+    while (us0 < prev &&
+           !I.t_first.compare_exchange_weak(prev, us0, std::memory_order_relaxed)) {}
 
     const VkDeviceSize needS = (VkDeviceSize)bsize * sizeof(int32_t);
     const VkDeviceSize needC = (VkDeviceSize)cands.size() * 34 * sizeof(int32_t);
     const VkDeviceSize needO = (VkDeviceSize)cands.size() * sizeof(uint32_t);
-    const bool grew = I.bSamples.size < needS || I.bCands.size < needC ||
-                      I.bCosts.size   < needO;
-    if (!I.grow(I.bSamples, needS)) return false;
-    if (!I.grow(I.bCands,   needC)) return false;
-    if (!I.grow(I.bCosts,   needO)) return false;
-    if (grew) I.bindDescriptors();
+    const bool grew = sl.bSamples.size < needS || sl.bCands.size < needC ||
+                      sl.bCosts.size   < needO;
+    if (!I.grow(sl.bSamples, needS)) return false;
+    if (!I.grow(sl.bCands,   needC)) return false;
+    if (!I.grow(sl.bCosts,   needO)) return false;
+    if (grew) I.bindDescriptors(sl);
 
-    std::memcpy(I.bSamples.map, shifted, (size_t)needS);
-    int32_t* cp = (int32_t*)I.bCands.map;
+    std::memcpy(sl.bSamples.map, shifted, (size_t)needS);
+    int32_t* cp = (int32_t*)sl.bCands.map;
     for (size_t i = 0; i < cands.size(); ++i) {
         cp[i * 34 + 0] = cands[i].order;
         cp[i * 34 + 1] = cands[i].shift;
@@ -448,35 +491,44 @@ bool GpuEvaluator::evaluate(const int32_t* shifted, uint32_t bsize,
     const uint32_t cpw    = Impl::WG / 32;               // candidates per group
     const uint32_t groups = ((uint32_t)cands.size() + cpw - 1) / cpw;
 
-    if (vkResetCommandBuffer(I.cmd, 0) != VK_SUCCESS) return false;
+    if (vkResetCommandBuffer(sl.cmd, 0) != VK_SUCCESS) return false;
     VkCommandBufferBeginInfo bi{};
     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    if (vkBeginCommandBuffer(I.cmd, &bi) != VK_SUCCESS) return false;
-    vkCmdBindPipeline(I.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, I.pipe);
-    vkCmdBindDescriptorSets(I.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, I.plo, 0, 1,
-                            &I.dset, 0, nullptr);
-    vkCmdPushConstants(I.cmd, I.plo, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+    if (vkBeginCommandBuffer(sl.cmd, &bi) != VK_SUCCESS) return false;
+    vkCmdBindPipeline(sl.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, I.pipe);
+    vkCmdBindDescriptorSets(sl.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, I.plo, 0, 1,
+                            &sl.dset, 0, nullptr);
+    vkCmdPushConstants(sl.cmd, I.plo, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                        sizeof pcv, &pcv);
-    vkCmdDispatch(I.cmd, groups, 1, 1);
-    if (vkEndCommandBuffer(I.cmd) != VK_SUCCESS) return false;
+    vkCmdDispatch(sl.cmd, groups, 1, 1);
+    if (vkEndCommandBuffer(sl.cmd) != VK_SUCCESS) return false;
 
-    vkResetFences(I.dev, 1, &I.fence);
-    VkSubmitInfo si{};
-    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &I.cmd;
-    if (vkQueueSubmit(I.queue, 1, &si, I.fence) != VK_SUCCESS) return false;
-    if (vkWaitForFences(I.dev, 1, &I.fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) return false;
+    // Only the submit is serialised -- a VkQueue is externally synchronised,
+    // but waiting is per-fence and must stay outside the lock or the device is
+    // back to one dispatch at a time.
+    {
+        std::lock_guard<std::mutex> lk(I.submit_mu);
+        vkResetFences(I.dev, 1, &sl.fence);
+        VkSubmitInfo si2{};
+        si2.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        si2.commandBufferCount = 1;
+        si2.pCommandBuffers = &sl.cmd;
+        if (vkQueueSubmit(I.queue, 1, &si2, sl.fence) != VK_SUCCESS) return false;
+    }
+    if (vkWaitForFences(I.dev, 1, &sl.fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS)
+        return false;
 
     out_costs.resize(cands.size());
-    std::memcpy(out_costs.data(), I.bCosts.map, (size_t)needO);
+    std::memcpy(out_costs.data(), sl.bCosts.map, (size_t)needO);
 
     const auto t1 = std::chrono::steady_clock::now();
+    const uint64_t us1 = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+        t1 - I.t_origin).count();
+    uint64_t last = I.t_last.load(std::memory_order_relaxed);
+    while (us1 > last &&
+           !I.t_last.compare_exchange_weak(last, us1, std::memory_order_relaxed)) {}
     I.n_cands.fetch_add(cands.size(), std::memory_order_relaxed);
-    I.n_micros.fetch_add(
-        (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count(),
-        std::memory_order_relaxed);
     return true;
 }
 

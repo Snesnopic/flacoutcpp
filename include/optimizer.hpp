@@ -154,6 +154,16 @@ constexpr int MAX_CUSTOM_WINDOWS =
 WindowType register_custom_window(const std::string& path, std::string* error);
 
 /**
+ * @brief The window set the estimated-DP modes search by default.
+ *
+ * Exported so the startup banner can name the real list. It used to print a
+ * hardcoded copy, which drifted: the list grew to ten while the banner still
+ * said the original four, and CLAUDE.md tells the reader both to trust the
+ * banner and never to judge a window against those four.
+ */
+std::vector<WindowType> default_shortlist();
+
+/**
  * @brief Parse a window type from its name (case-insensitive).
  * @param raw  Human-readable window name (e.g. @c "hann", @c "blackman").
  * @return      The corresponding WindowType, or @c WindowType::COUNT if not found.

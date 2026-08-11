@@ -295,7 +295,7 @@ WindowType window_from_name(const std::string& raw) {
 // size (the remainder block, the short-stream path) computes on the fly.
 // The estimated-DP shortlist: six dense tapers plus the partial/punchout pair
 // at each offset. Also what exact DP falls back to at a small -c.
-static std::vector<WindowType> heuristic_shortlist() {
+std::vector<WindowType> default_shortlist() {
     return {WindowType::TUKEY_050, WindowType::HANN,
             WindowType::WELCH,    WindowType::RECTANGULAR,
             WindowType::TUKEY_005, WindowType::TUKEY_020,
@@ -431,9 +431,9 @@ Optimizer::Optimizer(uint32_t channels, uint32_t bps, uint32_t sample_rate,
         if (full_search() && m_max_candidates == 0) {
             m_windows = all_window_types();
         } else if (full_search()) {
-            m_windows = heuristic_shortlist();
+            m_windows = default_shortlist();
         } else {
-            m_windows = heuristic_shortlist();
+            m_windows = default_shortlist();
         }
     } else {
         m_windows = std::move(windows);

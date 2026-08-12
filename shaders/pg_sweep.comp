@@ -46,7 +46,7 @@
 #define NPLANE  32
 #define MAXP    8               // FLAC's partition order ceiling
 #define NLEV    (MAXP + 1)
-#define CSTRIDE 36
+#define CSTRIDE 40
 
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
@@ -140,6 +140,11 @@ void main() {
     const int  ord   = cand[base + 0];
     const int  shift = cand[base + 1];
     const int  off   = cand[base + 2];
+    // Set by pg_quant when sum|qc| * max|s| provably fits int32. Metal has no
+    // 64-bit integer ALU, so the int64 dot product below is synthesised from
+    // 32-bit ops; taking the narrow path where it is exact is the single largest
+    // saving available in this kernel, and it changes no result.
+    const bool narrow = cand[base + 36] != 0;
 
     // An order the shortlist dropped. Bailing here is uniform across the
     // subgroup (cidx is per-subgroup), so it is legal despite the subgroup ops
@@ -185,15 +190,35 @@ void main() {
 
         uint u = 0u;
         if (act) {
-            int64_t sum = 0L;
-            for (int j = 0; j < ord; ++j)
-                sum += int64_t(cand[base + 4 + j]) * int64_t(samples[off + i - 1 - j]);
-            const int r = samples[off + i] - int(sum >> shift);
+            int r;
+            if (narrow) {
+                int sum = 0;
+                for (int j = 0; j < ord; ++j)
+                    sum += cand[base + 4 + j] * samples[off + i - 1 - j];
+                r = samples[off + i] - (sum >> shift);
+            } else {
+                int64_t sum = 0L;
+                for (int j = 0; j < ord; ++j)
+                    sum += int64_t(cand[base + 4 + j]) * int64_t(samples[off + i - 1 - j]);
+                r = samples[off + i] - int(sum >> shift);
+            }
             u = (uint(r) << 1) ^ uint(r >> 31);       // zigzag
         }
 
+        // Only the planes that any lane actually populates need a ballot. The max
+        // residual in this chunk has the highest set bit of any of them, so
+        // findMSB(subgroupMax(u)) + 1 is the exact plane count -- and skipping
+        // the rest is bit-identical, not an approximation: lane j owns plane j,
+        // a lane above the top plane keeps myBallot == 0, and a zero B_j
+        // contributes nothing to the reverse scan, to bitCount, or to Hcur.
+        //
+        // Worth having because 32 ballots per 32 samples was one ballot per
+        // sample, and real 16-bit residuals under a decent predictor occupy
+        // ~10-12 planes, not 32.
         uint myBallot = 0u;
-        for (int j = 0; j < NPLANE; ++j) {
+        const uint umax   = subgroupMax(u);
+        const int  nplane = (umax == 0u) ? 0 : (findMSB(umax) + 1);
+        for (int j = 0; j < nplane; ++j) {
             const uvec4 b = subgroupBallot(act && ((u >> j) & 1u) != 0u);
             if (lane == uint(j)) myBallot = b.x;
         }

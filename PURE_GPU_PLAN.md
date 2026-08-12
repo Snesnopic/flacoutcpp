@@ -299,6 +299,75 @@ Master mix, against all 32 orders:
 8 is the default. This is the same shape as the CPU's `-c` frontier and for the
 same reason.
 
+### Attacking the sweep: it is not ALU-bound, and two "obvious" fixes prove it
+
+The sweep started at 92.4% of device time, so it is the only stage worth
+optimising. Three changes were tried. **The order they are listed in is the
+order of increasing payoff, and it is the reverse of the order they look
+promising in.**
+
+1. **Skip empty bit-planes** (bit-exact). The kernel ballotted all 32 planes per
+   32-sample chunk; the highest plane any lane populates is
+   `findMSB(subgroupMax(u))`, and skipping above it is exactly equivalent
+   (lane j owns plane j, so a lane above the top keeps `myBallot == 0`, and a
+   zero `B_j` contributes nothing to the scan, the `bitCount`, or `Hcur`).
+   Real residuals occupy ~10-12 planes, not 32. **Worth 2.7%.**
+
+2. **Narrow the dot-product accumulator to int32** where
+   `sum|qc| <= INT32_MAX >> (effBps-1)` — the same bound the CPU uses to pick
+   `lpc_residual_blocked<int32_t>`. Metal has no 64-bit integer ALU, so int64 on
+   Apple silicon is synthesised from 32-bit ops, and this looked like the big
+   one. Verified exact (four fixtures byte-identical). **Worth zero.**
+
+3. **Cap the sweep's partition-order search** (`--pg-pcap`). **Worth 3.4x.**
+
+Two null results in a row are the finding, not a disappointment: **this kernel
+is bound by cross-lane operations, not by arithmetic.** At order 8 a 32-sample
+chunk costs ~16 arithmetic ops for the residual against ~80 subgroup ops --
+~12 plane ballots plus two `closePartition` calls, each a 5-step shuffle scan
+with two `subgroupMin`s and its own ballots. The dot product is not the cost.
+
+That is also why the `FP32RANK` route (sweep in fp32, exactly refine the top K)
+is much less attractive than it looks: fp32 would speed up the arithmetic the
+kernel is not spending its time on, and leave every ballot and shuffle in place.
+It was worth reaching for when the sweep was believed to be an int64 MAC loop.
+
+The partition cap works because closes are `2^(P+1)-1` and the kernel is made of
+them -- 511 at P=8, 31 at P=4, 7 at P=2. Master mix:
+
+| pcap | bytes | sweep s | speedup | size |
+|---|---|---|---|---|
+| 8 | 16959643 | 0.1948 | 1.00x | — |
+| 6 | 16961874 | 0.0832 | 2.34x | +0.013% |
+| **4** | **16964581** | **0.0575** | **3.39x** | **+0.029%** |
+| 3 | 16965880 | 0.0522 | 3.73x | +0.037% |
+| 2 | 16969536 | 0.0508 | 3.83x | +0.058% |
+| 1 | 16978990 | 0.0492 | 3.96x | +0.114% |
+
+Sizes barely move because **the cap is a ranking approximation only** — stage 8
+re-prices the winner with the full P=8 search, so the cap can change which
+candidate wins but never what the bitstream says a partition costs. Identical
+argument to `--gpu-partition-cap`, and here it is worth far more, because
+nothing else in this kernel is the bottleneck. Default 4.
+
+After both, the profile has flattened and the sweep is no longer the whole cost
+(master mix, serialised submits, so small stages carry ~1.2 ms of submit
+overhead each):
+
+| stage | share |
+|---|---|
+| sweep | 55.0% |
+| **crc** | **15.3%** |
+| autoc | 8.2% |
+| prepare | 7.6% |
+| rice | 5.1% |
+| everything else | ~1% each |
+
+**CRC-16 is the new second bottleneck**, and it is the naive implementation on
+purpose (one lane per frame, byte at a time). The combine trick the stage note
+describes — CRC is linear over GF(2), so `CRC(A||B)` folds from its parts — is
+now worth building. So is a look at `prepare`, which reads the PCM twice.
+
 ### End-to-end, against the CPU
 
 Interleaved best-of-5, quiet machine, `-n` on every arm. Times include decode,
@@ -307,11 +376,17 @@ master mix, so the device is the bulk of `-P`).
 
 | fixture | `-P` | CPU default | CPU `-E 0` | size vs CPU default |
 |---|---|---|---|---|
-| music_10s | 0.082 s | 0.136 s (1.66x) | 0.121 s | +0.40% |
-| music_20s | 0.104 s | 0.202 s (1.94x) | 0.171 s | +0.14% |
-| MLKDream | 0.421 s | 1.469 s (**3.49x**) | 1.172 s | +1.12% |
-| master mix | 0.412 s | 0.992 s (2.41x) | 0.820 s | +0.96% |
-| syn3m_mix | 0.395 s | 0.948 s (2.40x) | 0.798 s | **+7.62%** |
+| music_10s | 0.075 s | 0.136 s (1.81x) | 0.118 s (1.57x) | +0.40% |
+| music_20s | 0.084 s | 0.195 s (2.33x) | 0.163 s (1.95x) | +0.14% |
+| MLKDream | 0.367 s | 1.461 s (**3.98x**) | 1.158 s (3.16x) | +1.12% |
+| master mix | 0.265 s | 0.981 s (3.70x) | 0.809 s (3.05x) | +0.99% |
+| syn3m_mix | 0.272 s | 0.930 s (3.41x) | 0.792 s (2.91x) | **+7.62%** |
+
+Note what the short fixtures are now bounded by: libFLAC's single-threaded
+decode is 0.109 s of the master mix's 0.265 s. **The pipeline is approaching
+decode-bound**, which is the point at which further kernel work stops showing up
+in wall clock and the next move is to overlap decode with the encode (frames are
+independent, so chunk N can be encoding while chunk N+1 decodes).
 
 Losslessness verified by decode on all 18 fixtures (`flac -t` ok and decoded
 audio MD5 equal to the input's), including 24-bit, mono, and the `<1024`-sample

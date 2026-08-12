@@ -59,6 +59,12 @@ public:
         /// Rice sweep is ~92% of device time and its cost is proportional to the
         /// summed order of the candidates it prices.
         uint32_t orders = 8;
+        /// Cap on the *sweep's* Rice partition-order search (1..8). Ranking only
+        /// -- the winner is re-priced with the full search, so this cannot
+        /// mis-state what the bitstream pays. The kernel is dominated by
+        /// cross-lane partition closes (2^(P+1)-1 of them), which makes this the
+        /// largest speed knob it has: 4 measured 3.4x for +0.029%.
+        uint32_t partition_cap = 4;
         /// Frames per device chunk. Bounds peak device memory; frames are
         /// independent at a fixed block size, so this costs nothing but memory.
         uint32_t blocks_per_chunk = 256;

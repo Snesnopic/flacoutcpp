@@ -82,6 +82,7 @@ bool optimise(const std::string& input_path, const std::string& output_path, con
     pc.pg_block_size  = config.pg_block_size;
     pc.pg_precisions  = config.pg_precisions;
     pc.pg_orders      = config.pg_orders;
+    pc.pg_partition_cap = config.pg_partition_cap;
     pc.pg_blocks_per_chunk = config.pg_blocks_per_chunk;
     pc.dp_candidates = config.dp_candidates;
     pc.reuse_frames  = config.reuse_frames;

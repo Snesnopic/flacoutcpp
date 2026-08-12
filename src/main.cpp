@@ -101,6 +101,11 @@ static void print_usage(const char* prog) {
         << "                       mix, against all 32: 8 costs +0.028% for 2.8x,\n"
         << "                       4 costs +0.084% for 4.2x, 1 costs +0.30% for\n"
         << "                       6.6x.\n"
+        << "      --pg-pcap N        Cap the sweep's Rice partition-order search\n"
+        << "                       (1-8, default 4). Ranking only -- the winner is\n"
+        << "                       re-priced with the full search. The kernel is\n"
+        << "                       dominated by cross-lane partition closes, so\n"
+        << "                       this is its biggest knob: 4 is 3.4x for +0.029%.\n"
         << "      --pg-chunk N       Frames per device chunk (default 256). Bounds\n"
         << "                       peak device memory; frames are independent at a\n"
         << "                       fixed block size, so this costs only memory.\n"
@@ -355,6 +360,20 @@ int main(int argc, char* argv[]) {
             }
             if (cfg.pg_orders < 1 || cfg.pg_orders > 32) {
                 std::cerr << "Error: --pg-orders takes 1-32.\n";
+                return EXIT_FAILURE;
+            }
+
+        } else if (arg == "--pg-pcap") {
+            if (i + 1 >= argc) { std::cerr << "Error: --pg-pcap requires a number.\n"; return EXIT_FAILURE; }
+            ++i;
+            try {
+                cfg.pg_partition_cap = (uint32_t)std::stoul(argv[i]);
+            } catch (const std::exception&) {
+                std::cerr << "Error: --pg-pcap requires a number, got '" << argv[i] << "'.\n";
+                return EXIT_FAILURE;
+            }
+            if (cfg.pg_partition_cap < 1 || cfg.pg_partition_cap > 8) {
+                std::cerr << "Error: --pg-pcap takes 1-8.\n";
                 return EXIT_FAILURE;
             }
 

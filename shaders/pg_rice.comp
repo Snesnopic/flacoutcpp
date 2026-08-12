@@ -33,7 +33,7 @@
 #define NPLANE  32
 #define MAXP    8
 #define NLEV    (MAXP + 1)
-#define CSTRIDE 36
+#define CSTRIDE 40
 #define SFP_STRIDE 272
 #define KOFF 16
 
@@ -192,6 +192,7 @@ void main() {
     const int ord   = cand[cb + 0];
     const int shift = cand[cb + 1];
     const int off   = cand[cb + 2];
+    const bool narrow = cand[cb + 36] != 0;
 
     // A slot below the LPC region is a fixed predictor; recover its precision
     // from the slot's position in the (window, order, precision) product.
@@ -226,20 +227,40 @@ void main() {
 
         uint u = 0u;
         if (i < B) {
-            int64_t sum = 0L;
-            for (int j = 0; j < ord; ++j)
-                sum += int64_t(cand[cb + 4 + j]) * int64_t(samples[off + i - 1 - j]);
+            int pred;
+            if (narrow) {
+                int sum = 0;
+                for (int j = 0; j < ord; ++j)
+                    sum += cand[cb + 4 + j] * samples[off + i - 1 - j];
+                pred = sum >> shift;
+            } else {
+                int64_t sum = 0L;
+                for (int j = 0; j < ord; ++j)
+                    sum += int64_t(cand[cb + 4 + j]) * int64_t(samples[off + i - 1 - j]);
+                pred = int(sum >> shift);
+            }
             // Warm-up samples are written verbatim by the packer, but the slot
             // still has to hold something the escape path can read; the CPU
             // stores the raw sample there and so do we.
-            const int r = act ? (samples[off + i] - int(sum >> shift))
-                              : samples[off + i];
+            const int r = act ? (samples[off + i] - pred) : samples[off + i];
             res[rbase + i] = r;
             if (act) u = (uint(r) << 1) ^ uint(r >> 31);
         }
 
+        // Only the planes that any lane actually populates need a ballot. The max
+        // residual in this chunk has the highest set bit of any of them, so
+        // findMSB(subgroupMax(u)) + 1 is the exact plane count -- and skipping
+        // the rest is bit-identical, not an approximation: lane j owns plane j,
+        // a lane above the top plane keeps myBallot == 0, and a zero B_j
+        // contributes nothing to the reverse scan, to bitCount, or to Hcur.
+        //
+        // Worth having because 32 ballots per 32 samples was one ballot per
+        // sample, and real 16-bit residuals under a decent predictor occupy
+        // ~10-12 planes, not 32.
         uint myBallot = 0u;
-        for (int j = 0; j < NPLANE; ++j) {
+        const uint umax   = subgroupMax(u);
+        const int  nplane = (umax == 0u) ? 0 : (findMSB(umax) + 1);
+        for (int j = 0; j < nplane; ++j) {
             const uvec4 b = subgroupBallot(act && ((u >> j) & 1u) != 0u);
             if (lane == uint(j)) myBallot = b.x;
         }

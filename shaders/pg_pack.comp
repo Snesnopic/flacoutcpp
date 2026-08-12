@@ -42,7 +42,7 @@
 #define KOFF 16
 #define FINFO_STRIDE 4
 #define PLAN_STRIDE  8
-#define CSTRIDE 36
+#define CSTRIDE 40
 
 #define KIND_CONSTANT 0
 #define KIND_VERBATIM 1

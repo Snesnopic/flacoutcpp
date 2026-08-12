@@ -266,6 +266,10 @@ struct Config {
     /// time and costs roughly the summed order of what it prices.
     uint32_t pg_orders = 8;
 
+    /// Sweep-side Rice partition-order cap under `-P` (1-8). Ranking only; see
+    /// PureGpuEncoder::Config::partition_cap. 4 measured 3.4x for +0.029%.
+    uint32_t pg_partition_cap = 4;
+
     /// Frames per device chunk under `-P`; bounds peak device memory.
     uint32_t pg_blocks_per_chunk = 256;
 

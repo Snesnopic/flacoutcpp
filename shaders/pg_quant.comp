@@ -14,7 +14,7 @@
 // A CANDIDATE IS THE UNIT OF WORK FOR EVERYTHING DOWNSTREAM. Layout, 36 ints:
 //
 //   0 order   1 shift   2 sample offset   3 header bits (incl. the +6 residual
-//   header)   4..35 qc[32]
+//   header)   4..35 qc[32]   36 narrow-accumulator flag
 //
 // `header bits` is everything the subframe costs that is *not* residual: the
 // subframe header, the wasted-bits unary, warm-up samples, and for LPC the
@@ -24,7 +24,7 @@
 // is wasted work but not wrong work.
 
 #define MAXO 32
-#define CSTRIDE 36
+#define CSTRIDE 40
 #define INVALID_HDR 0x10000000
 // A candidate the sweep should not spend a subgroup on at all. Distinct from
 // INVALID_HDR, which still gets priced (and still loses): this one short-circuits
@@ -110,6 +110,7 @@ void main() {
     if (myErr <= 0.0) {                 // recursion never reached this order
         cand[co + 0] = SKIP_ORDER;
         cand[co + 3] = INVALID_HDR;
+        cand[co + 36] = 0;
         return;
     }
     const float myScore = 0.5 * float(pc.bsize) * log2(myErr)
@@ -126,6 +127,7 @@ void main() {
     if (better >= pc.norders) {
         cand[co + 0] = SKIP_ORDER;
         cand[co + 3] = INVALID_HDR;
+        cand[co + 36] = 0;
         return;
     }
 
@@ -138,6 +140,7 @@ void main() {
         cand[co + 0] = 1;
         cand[co + 1] = 0;
         cand[co + 3] = INVALID_HDR;
+        cand[co + 36] = 0;
         for (int j = 0; j < MAXO; ++j) cand[co + 4 + j] = 0;
         return;
     }
@@ -155,6 +158,7 @@ void main() {
         cand[co + 0] = 1;
         cand[co + 1] = 0;
         cand[co + 3] = INVALID_HDR;
+        cand[co + 36] = 0;
         for (int j = 0; j < MAXO; ++j) cand[co + 4 + j] = 0;
         return;
     }
@@ -179,6 +183,22 @@ void main() {
         cand[co + 4 + j] = qi;
     }
     for (int j = ord; j < MAXO; ++j) cand[co + 4 + j] = 0;
+
+    // Can the sweep accumulate this candidate's dot product in 32 bits?
+    //
+    // |sum| <= sum|qc| * max|s|, and max|s| is 2^(effBps-1), so the product fits
+    // int32 exactly when sum|qc| <= INT32_MAX >> (effBps-1). This is the same
+    // bound the CPU uses to pick lpc_residual_blocked<int32_t> over the int64
+    // form -- "the same arithmetic in half the register width".
+    //
+    // It matters far more here than it does on the CPU: Metal has no 64-bit
+    // integer ALU, so int64 on Apple silicon is synthesised from 32-bit ops.
+    // This is exact, not approximate -- nothing about the chosen candidate or
+    // the emitted bits changes.
+    int sumAbs = 0;
+    for (int j = 0; j < ord; ++j) sumAbs += abs(cand[co + 4 + j]);
+    cand[co + 36] = (effBps >= 1 && effBps <= 31 &&
+                     sumAbs <= (0x7FFFFFFF >> (effBps - 1))) ? 1 : 0;
 
     cand[co + 0] = ord;
     cand[co + 1] = max(shift, 0);   // a negative shift was folded into sc

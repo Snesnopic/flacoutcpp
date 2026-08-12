@@ -53,7 +53,7 @@ namespace {
 // ---------------------------------------------------------------------------
 constexpr int MAXO        = 32;   // LPC order ceiling
 constexpr int NLAG        = 33;   // autocorrelation lags (0..32)
-constexpr int CSTRIDE     = 36;   // ints per candidate record
+constexpr int CSTRIDE     = 40;   // ints per candidate record (36 = narrow flag)
 constexpr int SFP_STRIDE  = 272;  // ints per subframe-params record
 constexpr int PLAN_STRIDE = 8;    // ints per frame plan
 constexpr int FINFO_STRIDE = 4;   // ints per frame layout record
@@ -191,6 +191,11 @@ struct PureGpuEncoder::Impl {
     /// retry on or off. 1e-6 measured best of {0, 1e-7, 1e-6, 1e-5, 1e-4, 1e-3}
     /// (see the table in pg_levinson.comp). FLACOUT_PG_RIDGE overrides it.
     float    ridge  = 1e-6f;
+    /// Cap on the *sweep's* partition-order search (1..8). Ranking only: the
+    /// winner is re-priced by pg_rice with the full search, so this can change
+    /// which candidate wins but never what the bitstream says a partition costs.
+    /// Same argument as --gpu-partition-cap.
+    int      pcap = 4;
     /// FLACOUT_PG_PROFILE: fence-wait after every stage and accumulate its cost.
     bool     profile = false;
     double   stage_secs[S_COUNT]{};
@@ -362,6 +367,9 @@ bool PureGpuEncoder::Impl::init() {
     if (const char* r = std::getenv("FLACOUT_PG_RIDGE")) ridge = (float)atof(r);
     norders = (int)std::max(1u, std::min(cfg.orders, 32u));
     profile = std::getenv("FLACOUT_PG_PROFILE") != nullptr;
+    pcap = (int)std::max(1u, std::min(cfg.partition_cap, 8u));
+    if (const char* c = std::getenv("FLACOUT_PG_PCAP"))
+        pcap = std::max(1, std::min(8, atoi(c)));
 
     // ---- instance --------------------------------------------------------
     uint32_t nie = 0;
@@ -755,7 +763,7 @@ bool PureGpuEncoder::Impl::runChunk(
       go(S_FIXED, &p, sizeof p, ceilDiv((uint64_t)nblkThis * nsig * NFIXED, 64)); }
 
     { struct { int32_t ncand, bsize, maxPOrder; } p{
-        (int32_t)ncTot, (int32_t)B, 8 };
+        (int32_t)ncTot, (int32_t)B, pcap };
       go(S_SWEEP, &p, sizeof p, ceilDiv(ncTot, 4)); }
 
     { struct { int32_t nblk, bsize, nsig, ncand, bps; } p{

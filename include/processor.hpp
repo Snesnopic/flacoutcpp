@@ -110,6 +110,9 @@ struct ProcessorConfig {
     /// See flacoutcpp::Config::pg_orders.
     uint32_t pg_orders = 8;
 
+    /// See flacoutcpp::Config::pg_partition_cap.
+    uint32_t pg_partition_cap = 4;
+
     /// See flacoutcpp::Config::pg_blocks_per_chunk.
     uint32_t pg_blocks_per_chunk = 256;
 

@@ -515,6 +515,7 @@ bool Processor::process_pure_gpu(std::vector<std::vector<uint8_t>>& extra_blocks
     gcfg.windows          = m_config.windows;
     gcfg.blocks_per_chunk = m_config.pg_blocks_per_chunk;
     gcfg.orders           = m_config.pg_orders;
+    gcfg.partition_cap    = m_config.pg_partition_cap;
     gcfg.verbose          = m_config.verbose;
     if (!m_config.pg_precisions.empty()) gcfg.precisions = m_config.pg_precisions;
 

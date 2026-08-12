@@ -25,7 +25,7 @@
 // closed-form modes. Stage 8 re-derives everything else from the slot.
 
 #define LOCAL 256
-#define CSTRIDE 36
+#define CSTRIDE 40
 #define WIN_VERBATIM (-1)
 #define WIN_CONSTANT (-2)
 #define PLAN_STRIDE 8

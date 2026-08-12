@@ -20,7 +20,7 @@
 // a plain argmin over one array.
 
 #define MAXO 32
-#define CSTRIDE 36
+#define CSTRIDE 40
 #define NFIXED 5
 
 layout(local_size_x = 64) in;
@@ -69,4 +69,12 @@ void main() {
     cand[co + 3] = subhdr + f * effBps + 6;
     for (int j = 0; j < MAXO; ++j)
         cand[co + 4 + j] = (j < 4) ? COEF[f][j] : 0;
+
+    // Same int32-accumulator test as pg_quant. Fixed predictors have tiny
+    // coefficients (sum|qc| <= 15), so this is essentially always true and the
+    // int64 path is essentially never taken for them.
+    int sumAbs = 0;
+    for (int j = 0; j < 4; ++j) sumAbs += abs(COEF[f][j]);
+    cand[co + 36] = (effBps >= 1 && effBps <= 31 &&
+                     sumAbs <= (0x7FFFFFFF >> (effBps - 1))) ? 1 : 0;
 }

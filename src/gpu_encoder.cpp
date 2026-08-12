@@ -305,7 +305,7 @@ bool PureGpuEncoder::Impl::allocAll() {
         {B_SIG,   sigN * 4},
         {B_META,  (uint64_t)nsig * nb * 4},
         {B_WIN,   (uint64_t)nwin * B * 4},
-        {B_AUTOC, solv * NLAG * 4},
+        {B_AUTOC, solv * NLAG * 8},   // vec2 per lag: double-float hi/lo
         {B_LPCF,  solv * MAXO * MAXO * 4},
         {B_CAND,  cndN * CSTRIDE * 4},
         {B_COST,  cndN * 4},
@@ -361,6 +361,28 @@ void PureGpuEncoder::Impl::uploadWindows() {
 }
 
 bool PureGpuEncoder::Impl::init() {
+    // MoltenVK compiles Metal with fast math by default, which reassociates
+    // floating point and therefore *deletes* the error terms the double-float
+    // arithmetic in pg_autoc/pg_levinson is built from: `fma(a, b, -a*b)` folds
+    // to zero and the wider format silently degrades to plain fp32.
+    //
+    // Measured on syn3m_tonal, autocorrelation relative error against a host
+    // reference that replicates the device's fp32 windowing exactly:
+    //
+    //   fast math on    1e-8 .. 7e-8     12902040 bytes
+    //   fast math off   3e-15 .. 5e-15   11857452 bytes
+    //
+    // With fast math on, the double-float code is not merely useless but
+    // *harmful* -- worse than the plain fp32 it replaced (12729698), because it
+    // adds rounding without adding precision.
+    //
+    // Set rather than required, and only when the user has not already chosen
+    // (the 0 overwrite flag): this is a MoltenVK knob, and native Vulkan drivers
+    // do not reassociate fp32 like this in the first place.
+#if defined(__APPLE__)
+    setenv("MVK_CONFIG_FAST_MATH_ENABLED", "0", 0);
+#endif
+
     // FLACOUT_PG_INITTIME: where startup latency goes. Fixed cost matters here
     // out of proportion to its size -- it is ~37% of a 10-second file's wall
     // clock, which is what caps short inputs at ~2x.
@@ -929,23 +951,134 @@ bool PureGpuEncoder::Impl::runChunk(
 
         std::vector<double> wc(B), wd(B);
         window_coefficients(cfg.windows[0], B, wc.data());
-        const double scale = 1.0 / (double)(1u << (bps - 1));
-        for (uint32_t i = 0; i < B; ++i) wd[i] = (double)sg[i] * scale * wc[i];
+        const float scalef = 1.0f / (float)(1u << (bps - 1));
+        // Replicate the device's *fp32* windowing exactly, including its
+        // rounding, so this reference isolates the accumulation. Comparing
+        // against a double-windowed signal instead would show a ~1e-7 difference
+        // from the window coefficients alone and say nothing about the sum.
+        for (uint32_t i = 0; i < B; ++i)
+            wd[i] = (double)((float)sg[i] * scalef * (float)wc[i]);
 
         std::cout << "PG_DEBUG solve0 (blk 0, sig 0, win 0) meta=" << mt[0] << "\n";
         std::cout << "  lag   device(fp32)         host(double)        rel.err\n";
         for (int l = 0; l <= 8; ++l) {
             double ref = 0.0;
             for (uint32_t i = 0; i + (uint32_t)l < B; ++i) ref += wd[i] * wd[i + l];
-            const double got = ac[l];
+            const double got = (double)ac[2*l] + (double)ac[2*l+1];
             const double rel = (ref != 0.0) ? (got - ref) / ref : 0.0;
             std::printf("  %3d  %18.8g  %18.8g  %12.3g\n", l, got, ref, rel);
+        }
+        // Where does the recursion's residual energy go? For tonal content the
+        // prediction gain is enormous, so err[ord] collapses -- and once it is
+        // near fp32's floor relative to err[0], k = lambda/e is noise.
+        const float* er = (const float*)bufs[B_ERR].map;
+        const float* ac_dev = ac;
+        std::cout << "  err[ord]/err[0], device:\n   ";
+        for (int o = 0; o <= 32; ++o) {
+            if (er[o] < 0.0f) { std::printf(" %2d:ABORT", o); break; }
+            if (o % 8 == 0 && o) std::cout << "\n   ";
+            std::printf(" %2d:%9.3g", o, (double)er[o] / (double)er[0]);
+        }
+        std::cout << "\n";
+        // Host reference: the *same* fp32 autocorrelation solved in double. If
+        // the device's double-float recursion is working, these agree to ~1e-6;
+        // if the Metal compiler is reassociating twoSum/twoProd into oblivion,
+        // the device column collapses to plain fp32 behaviour and they diverge.
+        {
+            double ac[NLAG];
+            for (int l = 0; l < NLAG; ++l) ac[l] = (double)ac_dev[2*l] + (double)ac_dev[2*l+1];
+            double a[33] = {0}, prev[33] = {0}, e2 = ac[0];
+            std::cout << "  err[ord]/err[0], host double from the SAME fp32 autoc:\n   ";
+            for (int o = 1; o <= 32; ++o) {
+                double lam = ac[o];
+                for (int i = 1; i < o; ++i) lam -= prev[i] * ac[o - i];
+                const double kk = lam / e2;
+                if (std::abs(kk) >= 1.0) { std::printf(" %2d:ABORT", o); break; }
+                a[o] = kk;
+                for (int i = 1; i < o; ++i) a[i] = prev[i] - kk * prev[o - i];
+                e2 *= (1.0 - kk * kk);
+                for (int i = 1; i <= o; ++i) prev[i] = a[i];
+                if (o % 8 == 1 && o > 1) std::cout << "\n   ";
+                std::printf(" %2d:%9.3g", o, e2 / ac[0]);
+            }
+            std::cout << "\n  order-32 host coefficients (first 8):";
+            for (int i = 1; i <= 8; ++i) std::printf(" %.6f", a[i]);
+            std::cout << "\n";
         }
         std::cout << "  order-8 device coefficients:";
         for (int j = 0; j < 8; ++j) std::printf(" %.6f", lp[7 * MAXO + j]);
         std::cout << "\n  order-32 device coefficients (first 8):";
         for (int j = 0; j < 8; ++j) std::printf(" %.6f", lp[31 * MAXO + j]);
         std::cout << "\n";
+
+        // How far does the recursion actually get, across the whole chunk? err[o]
+        // is left negative for orders no attempt reached, so the highest positive
+        // entry is the reach of that solve. This is the number that decides
+        // whether high-order candidates exist at all.
+        {
+            const int nsolve = (int)nblkThis * nsig * nwin;
+            int hist[33] = {0};
+            for (int i = 0; i < nsolve; ++i) {
+                int reach = 0;
+                for (int o = 1; o <= 32; ++o)
+                    if (er[(size_t)i * NLAG + o] > 0.0f) reach = o; else break;
+                ++hist[reach];
+            }
+            std::printf("  recursion reach over %d solves:", nsolve);
+            int shown = 0;
+            for (int o = 0; o <= 32; ++o)
+                if (hist[o]) { std::printf(" %d:%d", o, hist[o]); if (++shown % 10 == 0) std::printf("\n   "); }
+            std::printf("\n");
+        }
+
+        // Find the first block where the side channel's winner is a FIXED slot
+        // and dump it: 525 of 1938 side subframes chose FIXED on syn3m_tonal
+        // where the CPU chose LPC every time, and every solve reaches order 32,
+        // so the LPC candidates exist and are simply losing.
+        {
+            const int32_t* cdx = (const int32_t*)bufs[B_CAND].map;
+            const uint32_t* ctx = (const uint32_t*)bufs[B_COST].map;
+            for (int blk = 0; blk < (int)nblkThis && nsig == 4; ++blk) {
+                const int bs = 3 * (int)nblkThis + blk;
+                uint32_t best = UINT32_MAX; int bslot = -1;
+                for (int k = 0; k < ncand; ++k) {
+                    const uint32_t rc = ctx[bs * ncand + k];
+                    if (rc == UINT32_MAX) continue;
+                    const uint32_t tot = (uint32_t)cdx[(bs * ncand + k) * CSTRIDE + 3] + rc;
+                    if (tot < best) { best = tot; bslot = k; }
+                }
+                if (bslot < lpcSlots) continue;      // LPC won here; keep looking
+                std::printf("  FIXED wins on sig 3, block %d: slot=%d bits=%u\n",
+                            blk, bslot, best);
+                const int sb = ((3 * (int)nblkThis + blk) * nwin) * NLAG;
+                std::printf("    autoc[0..8]:");
+                for (int l = 0; l <= 8; ++l) std::printf(" %.6g", (double)ac[2*(sb + l)]);
+                std::printf("\n    err/err0:");
+                for (int o = 0; o <= 8; ++o)
+                    std::printf(" %d:%.4g", o, (double)er[sb + o] / (double)er[sb]);
+                std::printf("\n    range:");
+                int mn = INT32_MAX, mx = INT32_MIN;
+                for (uint32_t i = 0; i < B; ++i) {
+                    mn = std::min(mn, sg[(size_t)bs * B + i]);
+                    mx = std::max(mx, sg[(size_t)bs * B + i]);
+                }
+                std::printf(" [%d,%d] meta=%u\n", mn, mx, mt[bs]);
+                std::printf("    LPC costs:");
+                for (int ord : {1, 2, 4, 8, 16, 32}) {
+                    const int ci = bs * ncand + (ord - 1) * nprec;
+                    std::printf(" o%d:%u", ord,
+                                (uint32_t)cdx[ci * CSTRIDE + 3] + ctx[ci]);
+                }
+                std::printf("\n    FIXED costs:");
+                for (int f = 0; f < 5; ++f) {
+                    const int ci = bs * ncand + lpcSlots + f;
+                    std::printf(" f%d:%u", f,
+                                (uint32_t)cdx[ci * CSTRIDE + 3] + ctx[ci]);
+                }
+                std::printf("\n");
+                break;
+            }
+        }
 
         const int32_t* cd = (const int32_t*)bufs[B_CAND].map;
         const uint32_t* ct = (const uint32_t*)bufs[B_COST].map;

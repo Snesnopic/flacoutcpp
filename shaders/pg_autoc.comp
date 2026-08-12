@@ -1,6 +1,7 @@
 #version 450
 #extension GL_KHR_shader_subgroup_basic      : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle    : require
 //
 // Pure-GPU encoder, stage 2: apodization window x autocorrelation, lags 0..32.
 //
@@ -32,7 +33,8 @@ layout(local_size_x = LOCAL) in;
 
 layout(std430, binding = 0) readonly  buffer Sig   { int   sig[];   };
 layout(std430, binding = 1) readonly  buffer Win   { float win[];   };
-layout(std430, binding = 2) writeonly buffer Autoc { float autoc[]; };
+// Two floats per lag: the hi/lo pair of a double-float value.
+layout(std430, binding = 2) writeonly buffer Autoc { vec2 autoc[]; };
 
 layout(push_constant) uniform PC {
     int   nblk;
@@ -41,8 +43,82 @@ layout(push_constant) uniform PC {
     float scale;    // 2^-(bps-1); see above
 } pc;
 
+
+// ---------------------------------------------------------------------------
+// Double-float ("two-float") arithmetic: a hi/lo pair whose exact sum is the
+// value, giving ~48 mantissa bits out of fp32 hardware.
+//
+// This is not a general precision upgrade -- it is aimed at one measured
+// failure. The autocorrelation in plain fp32 is accurate to ~1e-7 relative
+// (verified against a double host reference at every lag), which bounds the
+// prediction gain the Levinson recursion can resolve at ~1e-7 of the signal
+// energy. Real music sits at err/err0 ~ 4e-5, a 400x margin, and is unaffected.
+// The side channel of highly-correlated tonal stereo reaches err/err0 ~ 1e-6:
+// there the reflection coefficients past order ~5 are noise, |k| >= 1 fires, and
+// the retry fills the higher orders with a worse predictor. Measured on one such
+// block, order 32 cost *more* than order 8 and a 4th-order fixed predictor beat
+// every LPC candidate (19356 bits against 24714).
+//
+// Upgrading the recursion alone does not work and was tried first: fed a noisy
+// autocorrelation it faithfully solves the noisy problem, stops aborting, and
+// loses the retry's accidental regularisation (syn3m_tonal got worse, 12610817
+// -> 12722154). The autocorrelation and the recursion have to move together.
+//
+// twoSum and twoProd rely on the compiler not reassociating, which no GLSL or
+// SPIR-V flag guarantees through MoltenVK's Metal path. Treated as empirical: if
+// it were broken the tonal fixtures would not move.
+// ---------------------------------------------------------------------------
+
+vec2 twoSum(float a, float b) {
+    const float s  = a + b;
+    const float bb = s - a;
+    return vec2(s, (a - (s - bb)) + (b - bb));
+}
+
+vec2 twoProd(float a, float b) {
+    const float p = a * b;
+    return vec2(p, fma(a, b, -p));
+}
+
+vec2 dfNorm(float hi, float lo) {
+    const float t = hi + lo;
+    return vec2(t, lo - (t - hi));
+}
+
+vec2 dfAdd(vec2 a, vec2 b) {
+    const vec2 s = twoSum(a.x, b.x);
+    return dfNorm(s.x, s.y + a.y + b.y);
+}
+
+vec2 dfNeg(vec2 a) { return vec2(-a.x, -a.y); }
+
+vec2 dfMul(vec2 a, vec2 b) {
+    const vec2 p = twoProd(a.x, b.x);
+    return dfNorm(p.x, p.y + (a.x * b.y + a.y * b.x));
+}
+
+vec2 dfDiv(vec2 a, vec2 b) {
+    const float q1 = a.x / b.x;
+    const vec2  r1 = dfAdd(a, dfNeg(dfMul(vec2(q1, 0.0), b)));
+    const float q2 = r1.x / b.x;
+    const vec2  r2 = dfAdd(r1, dfNeg(dfMul(vec2(q2, 0.0), b)));
+    const float q3 = r2.x / b.x;
+    const vec2  q  = twoSum(q1, q2);
+    return dfNorm(q.x, q.y + q3);
+}
+
 shared float wnd[MAXB];
-shared float part[(LOCAL / 32) * NLAG];
+shared vec2  part[(LOCAL / 32) * NLAG];
+
+// Butterfly all-reduce over a hi/lo pair. subgroupAdd cannot be used: the two
+// halves have to be combined together, not independently.
+vec2 dfSubgroupAdd(vec2 v) {
+    for (uint s = 1u; s < 32u; s <<= 1) {
+        const vec2 o = vec2(subgroupShuffleXor(v.x, s), subgroupShuffleXor(v.y, s));
+        v = dfAdd(v, o);
+    }
+    return v;
+}
 
 void main() {
     const int blk = int(gl_WorkGroupID.x);
@@ -57,27 +133,30 @@ void main() {
         wnd[i] = float(sig[src + i]) * pc.scale * win[w * B + i];
     barrier();
 
-    float acc[NLAG];
-    for (int l = 0; l < NLAG; ++l) acc[l] = 0.0;
+    // The products are made exact by twoProd and the accumulation is exact to
+    // ~48 bits, so what reaches Levinson is the autocorrelation of the fp32
+    // windowed block rather than an approximation of it.
+    vec2 acc[NLAG];
+    for (int l = 0; l < NLAG; ++l) acc[l] = vec2(0.0);
 
     for (int i = t; i < B; i += LOCAL) {
         const float x = wnd[i];
         for (int l = 0; l < NLAG; ++l) {
             const int j = i + l;
-            acc[l] += (j < B) ? x * wnd[j] : 0.0;
+            if (j < B) acc[l] = dfAdd(acc[l], twoProd(x, wnd[j]));
         }
     }
 
     const uint sgid = gl_SubgroupID;
     for (int l = 0; l < NLAG; ++l) {
-        const float s = subgroupAdd(acc[l]);
+        const vec2 s = dfSubgroupAdd(acc[l]);
         if (subgroupElect()) part[sgid * NLAG + l] = s;
     }
     barrier();
 
     if (t < NLAG) {
-        float s = 0.0;
-        for (int k = 0; k < LOCAL / 32; ++k) s += part[k * NLAG + t];
+        vec2 s = vec2(0.0);
+        for (int k = 0; k < LOCAL / 32; ++k) s = dfAdd(s, part[k * NLAG + t]);
         const int idx = ((sgi * pc.nblk + blk) * pc.nwin + w);
         autoc[idx * NLAG + t] = s;
     }

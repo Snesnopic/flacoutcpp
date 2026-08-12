@@ -512,47 +512,84 @@ Losslessness verified by decode on all 18 fixtures (`flac -t` ok and decoded
 audio MD5 equal to the input's), including 24-bit, mono, and the `<1024`-sample
 short-stream path.
 
-### The one real defect left: fp32 makes Levinson declare itself unstable
+### The tonal gap: fp32, but not where it looked
 
-This is where the remaining size gap lives, and it is not search depth. Held at
-an *identical* search configuration (fixed 4096 blocks, same four windows, all
-orders — `-R -b 4096 -e -c 0 -L 0 -w tukey050,hann,welch,rect`):
+This was the last real defect and it took four wrong hypotheses to corner, so the
+eliminations are worth keeping.
 
-| fixture | CPU, same config | `-P` | gap |
-|---|---|---|---|
-| music_3s | 482282 | 486300 | +0.83% |
-| stereo_4s | 310923 | 349350 | +12.4% |
-| s24_2s | 284608 | 348745 | +22.5% |
+**Where the gap is.** Held against the CPU at a fixed 4096-block partition:
 
-Diagnosed with `FLACOUT_PG_DEBUG=1`, which dumps the first solve's analysis
-chain against a double-precision host reference. The autocorrelation is fine
-(relative error ~1e-7 at every lag) and the coefficients are sensible, so the
-analysis is not "numerically mushy". The failure is discrete: on `s24_2s`'s side
-channel **every candidate of order >= 7 was invalid**, because the fp32
-recursion produced `|PARCOR| >= 1` at order 7 and the recursion then abandons
-that order and every order above it. The CPU, in double, picks exactly order 7
-there. One subframe cost 46649 bits against the CPU's ~23600.
+| fixture | gap |
+|---|---|
+| syn3m_noise | +0.02% |
+| syn3m_transient | +1.71% |
+| syn3m_mix | +5.53% |
+| syn3m_tonal | **+12.23%** |
 
-The fix applied is a per-solve retry with a white-noise ridge on lag 0. Applying
-a ridge *globally* is a bad trade — it also biases the solves that were fine:
+Entirely tonal content, and only ~1.9% of `syn3m_mix`'s original 7.62% was the
+fixed block size. Eliminated one at a time, each measured: **windows** (1 vs 4 vs
+8), **precisions** (including the low rungs the CPU actually picks), the **order
+shortlist** (8 vs 32 orders differ by 0.05%), the **partition cap**, and
+**instability** — a reach histogram showed all 4096 solves reaching order 32, so
+no candidate was missing. A `-P` run was also worse than `flac -5`, which uses one
+window and max order 8, ruling out "the CPU just searches harder".
 
-| ridge | s24_2s | stereo_4s | music_3s | music_10s |
-|---|---|---|---|---|
-| 0 | 348745 | 349350 | 486300 | 1667289 |
-| 1e-6 | 338721 | 329645 | **492044** | **1680691** |
-| 1e-5 | 351810 | 353673 | 503636 | 1715166 |
+**The mono test localised it.** Extracting one channel to a mono file put `-P`
+within **+0.37%** of the CPU and *ahead* of `flac -8`. So the LPC analysis was
+fine and the whole gap lived in the **side channel** — where `-P` chose FIXED for
+525 of 1938 subframes and the CPU chose LPC for all of them.
 
-So it retries only solves that broke, filling in just the orders the clean pass
-never reached. Real music never retries and is **byte-identical** with the retry
-on or off; `stereo_4s` gained 5.7% and `s24_2s` 3.0%.
+**The mechanism.** Dumping such a block:
 
-**That is a mitigation, not a cure, and the residual gap is still large on
-synthetic content** (`syn3m_mix` +7.6%). The cure is to stop the fp32
-autocorrelation being non-PSD in the first place: accumulate it in **emulated
-double** (two-float hi/lo with FMA-based two-product), which is ~5-10x the cost
-of a stage that is currently **1.5%** of runtime. That is the next thing to
-build, and it is cheap precisely because the plan's stage-share prediction was
-right.
+```
+err/err0:  1:0.0068  2:3.3e-05  3:2.6e-06  4:2.2e-06  5:9.8e-07  6:9.3e-06 ...
+LPC costs: o4:28152  o8:24714  o16:25984  o32:36743     FIXED f4:19356
+```
+
+`err[5] = 9.8e-7` is a **60 dB prediction gain**, sitting on fp32's 1e-7 floor.
+Past that the reflection coefficients are noise, `|k| >= 1` fires, and the retry
+fills the higher orders with something worse — note err *rising* at order 6 and
+order 32 costing more than order 8. So fp32 was the problem after all, but in the
+**autocorrelation**, whose ~1e-7 accuracy bounds the resolvable prediction gain.
+Real music sits at err/err0 ~ 4e-5, a 400x margin, which is why it barely cared.
+
+**Two things that did not work, in order.** Upgrading the *recursion* alone to
+double-float made it worse (12610817 → 12722154): fed a noisy autocorrelation it
+faithfully solves the noisy problem, stops aborting, and loses the retry's
+accidental regularisation. A global ridge is also a bad trade (see the table in
+pg_levinson.comp).
+
+**And the trap that hid the fix.** With the autocorrelation *and* the recursion
+both in double-float, the measured accuracy did not move — still ~1e-8. MoltenVK
+compiles Metal with **fast math** by default, which reassociates floating point
+and therefore deletes the very error terms double-float is built from:
+`fma(a, b, -a*b)` folds to zero. With fast math on, the double-float code is not
+merely useless but *harmful*, because it adds rounding without adding precision.
+
+```
+                autocorrelation rel. err     syn3m_tonal (1 window)
+plain fp32      1e-8 .. 7e-8                 12729698
+df, fast math   1e-8 .. 7e-8                 12902040   <- worse than fp32
+df, no fast math  3e-15 .. 5e-15             11857452
+```
+
+`MVK_CONFIG_FAST_MATH_ENABLED=0` is now set in-process before instance creation
+(Apple only, and not if the user already chose). Diagnosing this needed a host
+reference that replicates the device's *fp32* windowing exactly — comparing
+against a double-windowed signal shows a ~1e-7 difference from the window
+coefficients alone and says nothing about the sum.
+
+**Result.** Gaps against the CPU at the same partition: syn3m_tonal +12.23% →
+**+3.88%**, s24_2s +19% → **+4.08%**, stereo_4s → +4.58%, syn3m_mix → +3.94%.
+Real music improved too, against the CPU *default*: music_20s +0.14% → **+0.03%**,
+music_10s +0.40% → +0.22%, master mix +0.99% → +0.77%.
+
+**Cost.** The autocorrelation went 8.6 → 19.7 ms, 2.3x rather than the ~13x the
+op count suggests, because that stage is shared-memory bound and the extra
+arithmetic is nearly free. Device total 91.6 → 104.4 ms; master mix wall clock
+0.154 → 0.166 s (6.46x → 6.01x). Trading ~8% of time for 0.22% of size is far
+better than anything on the CPU's own frontier, where the whole estimated-DP dial
+spans ~0.1% for 6.4x.
 
 ## Build order
 

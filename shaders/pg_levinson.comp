@@ -29,7 +29,7 @@
 
 layout(local_size_x = LOCAL) in;
 
-layout(std430, binding = 0) readonly  buffer Autoc { float autoc[]; };
+layout(std430, binding = 0) readonly  buffer Autoc { vec2 autoc[]; };
 layout(std430, binding = 1) writeonly buffer Lpcf  { float lpcf[];  };
 // Residual energy after predicting at each order -- err[0] is the unpredicted
 // energy. This is what makes an order shortlist possible: it is the exact
@@ -42,6 +42,78 @@ layout(push_constant) uniform PC {
     int   nsolve;   // nblk * nsig * nwin
     float ridge;    // white-noise correction on lag 0; see below
 } pc;
+
+
+// ---------------------------------------------------------------------------
+// Double-float ("two-float") arithmetic: a hi/lo pair whose exact sum is the
+// value, giving ~48 mantissa bits out of fp32 hardware.
+//
+// This is not a general precision upgrade -- it is aimed at one measured
+// failure. The autocorrelation in plain fp32 is accurate to ~1e-7 relative
+// (verified against a double host reference at every lag), which bounds the
+// prediction gain the Levinson recursion can resolve at ~1e-7 of the signal
+// energy. Real music sits at err/err0 ~ 4e-5, a 400x margin, and is unaffected.
+// The side channel of highly-correlated tonal stereo reaches err/err0 ~ 1e-6:
+// there the reflection coefficients past order ~5 are noise, |k| >= 1 fires, and
+// the retry fills the higher orders with a worse predictor. Measured on one such
+// block, order 32 cost *more* than order 8 and a 4th-order fixed predictor beat
+// every LPC candidate (19356 bits against 24714).
+//
+// Upgrading the recursion alone does not work and was tried first: fed a noisy
+// autocorrelation it faithfully solves the noisy problem, stops aborting, and
+// loses the retry's accidental regularisation (syn3m_tonal got worse, 12610817
+// -> 12722154). The autocorrelation and the recursion have to move together.
+//
+// twoSum and twoProd rely on the compiler not reassociating, which no GLSL or
+// SPIR-V flag guarantees through MoltenVK's Metal path. Treated as empirical: if
+// it were broken the tonal fixtures would not move.
+// ---------------------------------------------------------------------------
+
+vec2 twoSum(float a, float b) {
+    const float s  = a + b;
+    const float bb = s - a;
+    return vec2(s, (a - (s - bb)) + (b - bb));
+}
+
+vec2 twoProd(float a, float b) {
+    const float p = a * b;
+    return vec2(p, fma(a, b, -p));
+}
+
+vec2 dfNorm(float hi, float lo) {
+    const float t = hi + lo;
+    return vec2(t, lo - (t - hi));
+}
+
+vec2 dfAdd(vec2 a, vec2 b) {
+    const vec2 s = twoSum(a.x, b.x);
+    return dfNorm(s.x, s.y + a.y + b.y);
+}
+
+vec2 dfNeg(vec2 a) { return vec2(-a.x, -a.y); }
+
+vec2 dfMul(vec2 a, vec2 b) {
+    const vec2 p = twoProd(a.x, b.x);
+    return dfNorm(p.x, p.y + (a.x * b.y + a.y * b.x));
+}
+
+vec2 dfDiv(vec2 a, vec2 b) {
+    const float q1 = a.x / b.x;
+    const vec2  r1 = dfAdd(a, dfNeg(dfMul(vec2(q1, 0.0), b)));
+    const float q2 = r1.x / b.x;
+    const vec2  r2 = dfAdd(r1, dfNeg(dfMul(vec2(q2, 0.0), b)));
+    const float q3 = r2.x / b.x;
+    const vec2  q  = twoSum(q1, q2);
+    return dfNorm(q.x, q.y + q3);
+}
+
+vec2 dfSubgroupAdd(vec2 v) {
+    for (uint s = 1u; s < 32u; s <<= 1) {
+        const vec2 o = vec2(subgroupShuffleXor(v.x, s), subgroupShuffleXor(v.y, s));
+        v = dfAdd(v, o);
+    }
+    return v;
+}
 
 void main() {
     // Clamp rather than return early: every subgroup op below needs uniform
@@ -85,7 +157,7 @@ void main() {
     // need this. Worst case is 3x the Levinson work, a rounding error next to
     // the sweep.
     if (live && j == 0u) {
-        err[eb] = autoc[ab];
+        err[eb] = autoc[ab].x;
         for (int o = 1; o <= MAXO; ++o) err[eb + uint(o)] = -1.0;
     }
 
@@ -94,37 +166,43 @@ void main() {
     for (int att = 0; att < 3 && from <= MAXO; ++att) {
         const float r = (att == 0) ? 0.0
                       : ((att == 1) ? pc.ridge : pc.ridge * 100.0);
-        float e = autoc[ab] * (1.0 + r);
+        vec2 e = dfMul(autoc[ab], vec2(1.0 + r, 0.0));
         // A degenerate block (silence, or a window that zeroed everything) has
         // no predictor at all, and no ridge changes that.
-        if (e <= 0.0) break;
+        if (e.x <= 0.0) break;
 
         const int f0 = from;
-        float A = 0.0;
+        vec2 A = vec2(0.0);
         int reached = 0;
 
         for (int ord = 1; ord <= MAXO; ++ord) {
-            const float term = (int(j) <= ord - 2)
-                             ? A * autoc[ab + uint(ord - 1 - int(j))] : 0.0;
-            const float k    = (autoc[ab + uint(ord)] - subgroupAdd(term)) / e;
+            const vec2 term = (int(j) <= ord - 2)
+                ? dfMul(A, autoc[ab + uint(ord - 1 - int(j))]) : vec2(0.0);
+            const vec2 k = dfDiv(dfAdd(autoc[ab + uint(ord)],
+                                       dfNeg(dfSubgroupAdd(term))), e);
 
-            if (abs(k) >= 1.0) break;
+            if (abs(k.x) >= 1.0) break;
 
             // Read the reversed element before overwriting A. The index is only
             // meaningful for j <= ord-2; clamp so the shuffle is well-formed.
-            const float rev =
-                subgroupShuffle(A, uint(clamp(ord - 2 - int(j), 0, MAXO - 1)));
+            const uint ri = uint(clamp(ord - 2 - int(j), 0, MAXO - 1));
+            const vec2 rev = vec2(subgroupShuffle(A.x, ri), subgroupShuffle(A.y, ri));
 
             A = (int(j) == ord - 1) ? k
-              : ((int(j) <= ord - 2) ? A - k * rev : A);
+              : ((int(j) <= ord - 2) ? dfAdd(A, dfNeg(dfMul(k, rev))) : A);
 
-            e *= (1.0 - k * k);
-            if (e <= 0.0) e = 1e-10;
+            // (1 - k*k) with |k| near 1 is the cancelling step: at k = 0.9956 it
+            // discards two decimal digits, and the result is the next order's
+            // denominator.
+            e = dfMul(e, dfAdd(vec2(1.0, 0.0), dfNeg(dfMul(k, k))));
+            if (e.x <= 0.0) e = vec2(1e-10, 0.0);
             reached = ord;
 
             if (live && ord >= f0) {
-                lpcf[lb + uint((ord - 1) * MAXO) + j] = (int(j) < ord) ? A : 0.0;
-                if (j == 0u) err[eb + uint(ord)] = e;
+                // fp32 is ample downstream: the quantizer only has to land on a
+                // 15-bit integer.
+                lpcf[lb + uint((ord - 1) * MAXO) + j] = (int(j) < ord) ? A.x : 0.0;
+                if (j == 0u) err[eb + uint(ord)] = e.x;
             }
         }
         from = max(from, reached + 1);

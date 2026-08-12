@@ -228,6 +228,14 @@ struct PureGpuEncoder::Impl {
     VkDescriptorPool      dpool = VK_NULL_HANDLE;
     VkPipelineLayout      plo  = VK_NULL_HANDLE;
     VkPipelineCache       pcache = VK_NULL_HANDLE;
+    /// Timestamp queries: S_COUNT+1 marks, so stage i costs ts[i+1]-ts[i]. This
+    /// is what a GPU profile should look like -- one submit, no serialisation,
+    /// device-side clock. The serialised-submit mode it replaces inflated every
+    /// small stage by a submit (~1.2 ms) and could not see a stage that was
+    /// merely *waiting*.
+    VkQueryPool           qpool = VK_NULL_HANDLE;
+    double                ts_period = 1.0;   // ns per tick
+    bool                  ts_ok = false;
     VkCommandPool         cpool = VK_NULL_HANDLE;
     VkCommandBuffer       cmd  = VK_NULL_HANDLE;
     VkFence               fence = VK_NULL_HANDLE;
@@ -752,6 +760,23 @@ bool PureGpuEncoder::Impl::init() {
         why = "fence"; return false;
     }
 
+    // Timestamp queries need the queue family to support them (timestampValidBits
+    // != 0) and a nonzero period to convert ticks to nanoseconds.
+    if (profile) {
+        ts_period = (double)props.limits.timestampPeriod;
+        const bool fam_ok = qp[qfam].timestampValidBits != 0;
+        if (fam_ok && ts_period > 0.0) {
+            VkQueryPoolCreateInfo qpci{};
+            qpci.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+            qpci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+            qpci.queryCount = S_COUNT + 1;
+            ts_ok = vkCreateQueryPool(dev, &qpci, nullptr, &qpool) == VK_SUCCESS;
+        }
+        if (!ts_ok)
+            std::cerr << "Warning: timestamp queries unavailable; "
+                         "profiling falls back to serialised submits.\n";
+    }
+
     lap("command pool + fence");
 
     if (!allocAll()) return false;
@@ -778,6 +803,7 @@ void PureGpuEncoder::Impl::destroy() {
         if (pipes[s]) vkDestroyPipeline(dev, pipes[s], nullptr);
         if (mods[s])  vkDestroyShaderModule(dev, mods[s], nullptr);
     }
+    if (qpool)  vkDestroyQueryPool(dev, qpool, nullptr);
     if (pcache) vkDestroyPipelineCache(dev, pcache, nullptr);
     if (fence) vkDestroyFence(dev, fence, nullptr);
     if (cpool) vkDestroyCommandPool(dev, cpool, nullptr);
@@ -838,6 +864,13 @@ bool PureGpuEncoder::Impl::runChunk(
     vkResetCommandBuffer(cmd, 0);
     vkBeginCommandBuffer(cmd, &bi);
 
+    int tsIdx = 0;
+    if (ts_ok) {
+        vkCmdResetQueryPool(cmd, qpool, 0, S_COUNT + 1);
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                            qpool, (uint32_t)tsIdx++);
+    }
+
     // The packer ORs bits into this buffer, so it has to start at zero -- which
     // is also what makes a unary run's zeros free.
     vkCmdFillBuffer(cmd, bufs[B_OUT].buf, 0, VK_WHOLE_SIZE, 0);
@@ -856,6 +889,13 @@ bool PureGpuEncoder::Impl::runChunk(
                            (uint32_t)pushSize, push);
         vkCmdDispatch(cmd, gx, gy, gz);
         barrier(cmd);
+        if (ts_ok) {
+            // After the barrier, so the mark lands once this stage's writes are
+            // visible -- i.e. it measures the stage, not the launch.
+            vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                                qpool, (uint32_t)tsIdx++);
+            return;
+        }
         if (!profile) return;
         vkEndCommandBuffer(cmd);
         VkSubmitInfo si{};
@@ -943,6 +983,17 @@ bool PureGpuEncoder::Impl::runChunk(
     vkResetFences(dev, 1, &fence);
     if (vkQueueSubmit(queue, 1, &si, fence) != VK_SUCCESS) return false;
     if (vkWaitForFences(dev, 1, &fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) return false;
+
+    if (ts_ok) {
+        uint64_t ts[S_COUNT + 1] = {};
+        if (vkGetQueryPoolResults(dev, qpool, 0, (uint32_t)tsIdx, sizeof(ts), ts,
+                                  sizeof(uint64_t),
+                                  VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT)
+            == VK_SUCCESS) {
+            for (int st = 0; st + 1 < tsIdx; ++st)
+                stage_secs[st] += (double)(ts[st + 1] - ts[st]) * ts_period * 1e-9;
+        }
+    }
 
     *outBytes = ((const uint32_t*)bufs[B_TOTAL].map)[0];
     if ((VkDeviceSize)*outBytes > bufs[B_OUT].size) return false;
@@ -1234,7 +1285,9 @@ bool PureGpuEncoder::encode(const std::vector<std::vector<int32_t>>& pcm,
     if (I.profile) {
         double tot = 0.0;
         for (int s = 0; s < S_COUNT; ++s) tot += I.stage_secs[s];
-        std::cout << "PG_PROFILE (serialised submits; read shares, not the sum)\n";
+        std::cout << (I.ts_ok
+            ? "PG_PROFILE (device timestamp queries, one submit -- sum is real)\n"
+            : "PG_PROFILE (serialised submits; read shares, not the sum)\n");
         for (int s = 0; s < S_COUNT; ++s)
             std::printf("  %-9s %8.4f s  %5.1f%%\n", kStages[s].name,
                         I.stage_secs[s], tot > 0 ? 100.0 * I.stage_secs[s] / tot : 0.0);

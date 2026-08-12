@@ -665,6 +665,59 @@ Faster everywhere and smaller on all real music; the two synthetic fixtures pay
 for the shallower order search and want `--pg-orders 8` back. Against the first
 working commit this is **2.6-2.8x** on the long fixtures.
 
+## How to profile this: use timestamp queries, not serialised submits
+
+`FLACOUT_PG_PROFILE=1` originally fenced after every stage. That is easy and it
+lies in two directions: it charges each stage a submit (~1.2 ms here, which is
+most of a small kernel's apparent cost) and it cannot distinguish a stage that is
+*computing* from one that is *waiting*.
+
+The in-API answer is **timestamp queries**, and this device supports them fully
+(`vulkaninfo`): `timestampComputeAndGraphics = true`, `timestampValidBits = 64`,
+`timestampPeriod = 1` (ticks are nanoseconds), plus `VK_EXT_host_query_reset` and
+`VK_EXT_calibrated_timestamps`. `pipelineStatisticsQuery` is false and
+`VK_KHR_performance_query` is absent, so counters are not available — timestamps
+are what there is.
+
+The shape: a `VK_QUERY_TYPE_TIMESTAMP` pool of `S_COUNT+1` marks,
+`vkCmdResetQueryPool` at the top of the command buffer, one
+`vkCmdWriteTimestamp(BOTTOM_OF_PIPE)` after each stage's barrier (after, so the
+mark measures the stage rather than the launch), then `vkGetQueryPoolResults` with
+`64_BIT | WAIT_BIT` once the fence signals. Stage *i* costs `ts[i+1]-ts[i]`, times
+`timestampPeriod`. **One submit, no serialisation, device clock.**
+
+**It corrected the map this document had been using.** MLKDream, same build:
+
+| stage | serialised | timestamps |
+|---|---|---|
+| sweep | 56.9 ms (57.7%) | **43.9 ms (49.1%)** |
+| autoc | 17.1 ms (17.4%) | **22.8 ms (25.5%)** |
+| **rice** | 5.5 ms (5.6%) | **12.4 ms (13.9%)** |
+| prepare | 6.8 ms (6.9%) | 2.8 ms (3.1%) |
+| select / fixed / layout / frame | ~1.2 ms each | 0.1-0.5 ms each |
+| total | 98.6 ms | 89.4 ms |
+
+Every small stage was almost entirely submit overhead, and two stages were
+*understated*: the double-float autocorrelation costs more than it appeared
+(25.5%, not 17%), and **`pg_rice` is 13.9%, nearly three times the 5.6% recorded
+above** — which makes it the third-largest stage rather than a rounding error, and
+a real target. The sum is now meaningful too: 89.4 ms against a 103 ms encode
+phase, the difference being host-side work (PCM staging, readback, file writes).
+
+**What timestamps still cannot see** is inside a kernel — occupancy, register
+spills, shared-memory throughput. Several conclusions here were inferred from
+ablation instead (the sweep is latency-bound; `pg_rice` has no registers to
+spare). For that:
+
+- **Apple**: Xcode's Metal debugger — capture the workload
+  (`MTL_CAPTURE_ENABLED=1`, or attach Xcode), which gives per-encoder timing,
+  occupancy and per-line shader cost. `xctrace record --template 'Metal System
+  Trace'` works headlessly. MoltenVK routes through Metal, so these apply to a
+  Vulkan build unchanged.
+- **Intel**: `INTEL_DEBUG=cs` prints the chosen SIMD width and spill/fill counts
+  (GPU_PLAN.md already used it to find 511:1444 spills in `sweep.comp`).
+- **AMD / Nvidia**: Radeon GPU Profiler, Nsight Graphics.
+
 ## Inside the sweep: it was the dependency chain, not the fold
 
 The fold was the suspected bottleneck. It is not, and ablation said so before any

@@ -1,15 +1,28 @@
 #include <algorithm>
+#include <chrono>
+#include <filesystem>
+#include <iomanip>
 #include <iostream>
 #include <string>
+#include <system_error>
 #include <vector>
 #include <sstream>
 #include "flacoutcpp.hpp"
+#include "gpu_encoder.hpp"
 
 using namespace flacoutcpp;
 
 static void print_usage(const char* prog) {
     std::cerr
         << "Usage: " << prog << " [options] <input.flac> [output.flac]\n"
+        << "       " << prog << " [options] <input-dir> <output-dir>\n"
+        << "\n"
+        << "When the input is a directory, every .flac under it is encoded into\n"
+        << "the output directory, mirroring the subdirectory structure. Files are\n"
+        << "processed one at a time -- each already uses every core (or the GPU)\n"
+        << "-- and a failure is reported and skipped rather than stopping the run.\n"
+        << "With -P this is also the fast path for many files: the device context\n"
+        << "is built once for the batch instead of once per file (~28 ms each).\n"
         << "Options:\n"
         << "  -e, --exhaustive     Exact search: fully encode every block-size and\n"
         << "                       stereo-mode choice instead of estimating them,\n"
@@ -181,6 +194,123 @@ static std::vector<std::string> split_csv(const std::string& s) {
         if (!tok.empty()) out.push_back(tok);
     }
     return out;
+}
+
+namespace fs = std::filesystem;
+
+// Every .flac under `root`, sorted, so a batch is reproducible and its progress
+// output is readable.
+static std::vector<fs::path> find_flacs(const fs::path& root, std::error_code& ec) {
+    std::vector<fs::path> out;
+    for (auto it = fs::recursive_directory_iterator(
+             root, fs::directory_options::skip_permission_denied, ec);
+         !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
+        if (!it->is_regular_file(ec)) continue;
+        std::string ext = it->path().extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(),
+                       [](unsigned char c) { return (char)std::tolower(c); });
+        if (ext == ".flac") out.push_back(it->path());
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+static std::string human(uintmax_t bytes) {
+    static const char* u[] = {"B", "KiB", "MiB", "GiB"};
+    double v = (double)bytes; int i = 0;
+    while (v >= 1024.0 && i < 3) { v /= 1024.0; ++i; }
+    std::ostringstream os;
+    os << std::fixed << std::setprecision(v < 10 && i ? 2 : 1) << v << " " << u[i];
+    return os.str();
+}
+
+// Encode a tree. Returns the number of files that failed.
+static int run_batch(const fs::path& in_dir, const fs::path& out_dir,
+                     flacoutcpp::Config cfg) {
+    std::error_code ec;
+    const auto files = find_flacs(in_dir, ec);
+    if (ec) {
+        std::cerr << "Error: cannot read " << in_dir << ": " << ec.message() << "\n";
+        return 1;
+    }
+    if (files.empty()) {
+        std::cerr << "Error: no .flac files under " << in_dir << ".\n";
+        return 1;
+    }
+    const bool progress = cfg.verbose;
+    // Per-file banners would be one screen per track. The batch prints one line
+    // per file instead, and the encoder stays quiet.
+    cfg.verbose = false;
+
+    if (progress)
+        std::cout << files.size() << " files under " << in_dir << " -> " << out_dir << "\n";
+
+    uintmax_t in_bytes = 0, out_bytes = 0;
+    int failed = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+
+    for (size_t i = 0; i < files.size(); ++i) {
+        const fs::path rel = fs::relative(files[i], in_dir, ec);
+        const fs::path dst = out_dir / (ec ? files[i].filename() : rel);
+        fs::create_directories(dst.parent_path(), ec);
+        if (ec) {
+            std::cerr << "Error: cannot create " << dst.parent_path() << ": "
+                      << ec.message() << "\n";
+            ++failed;
+            continue;
+        }
+        // Refuse to write over the file being read. Same-directory in/out is an
+        // easy typo and would destroy the input mid-encode.
+        if (fs::equivalent(files[i], dst, ec)) {
+            std::cerr << "Error: " << files[i] << " would overwrite itself; skipped.\n";
+            ++failed;
+            continue;
+        }
+        ec.clear();
+
+        const auto ft = std::chrono::steady_clock::now();
+        const bool ok = flacoutcpp::optimise(files[i].string(), dst.string(), cfg);
+        const double secs = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - ft).count();
+        if (!ok) {
+            std::cerr << "Failed: " << files[i].string() << "\n";
+            ++failed;
+            continue;
+        }
+        const uintmax_t ib = fs::file_size(files[i], ec);
+        const uintmax_t ob = fs::file_size(dst, ec);
+        if (!ec) { in_bytes += ib; out_bytes += ob; }
+        if (progress) {
+            std::ostringstream line;
+            line << "[" << (i + 1) << "/" << files.size() << "] "
+                 << rel.string() << "  " << std::fixed << std::setprecision(2)
+                 << secs << " s";
+            if (!ec && ib)
+                line << "  " << std::showpos << std::setprecision(2)
+                     << 100.0 * ((double)ob - (double)ib) / (double)ib << "%"
+                     << std::noshowpos;
+            std::cout << line.str() << "\n" << std::flush;
+        }
+    }
+
+    // The device context outlives a single file by design; a batch is where it
+    // gets used, and this is where it stops being needed.
+    flacoutcpp::release_shared_pure_gpu_encoder();
+
+    if (progress) {
+        const double secs = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t0).count();
+        std::cout << "\n" << (files.size() - (size_t)failed) << "/" << files.size()
+                  << " files in " << std::fixed << std::setprecision(2) << secs << " s\n"
+                  << human(in_bytes) << " -> " << human(out_bytes);
+        if (in_bytes)
+            std::cout << "  (" << std::showpos << std::setprecision(3)
+                      << 100.0 * ((double)out_bytes - (double)in_bytes) / (double)in_bytes
+                      << "%" << std::noshowpos << ")";
+        std::cout << "\n";
+        if (failed) std::cout << failed << " failed\n";
+    }
+    return failed;
 }
 
 int main(int argc, char* argv[]) {
@@ -577,6 +707,14 @@ int main(int argc, char* argv[]) {
     }
 
     const std::string input  = positional[0];
+    std::error_code dir_ec;
+    // A directory input is a batch. The output must be named: there is no
+    // sensible default that is not either in-place or a surprise.
+    const bool batch = fs::is_directory(input, dir_ec);
+    if (batch && positional.size() < 2) {
+        std::cerr << "Error: a directory input needs an output directory.\n";
+        return EXIT_FAILURE;
+    }
     const std::string output = (positional.size() >= 2)
                                  ? positional[1]
                                  : input + ".optimized.flac";
@@ -685,14 +823,21 @@ int main(int argc, char* argv[]) {
             }
             std::cout << "\n";
         }
-        std::cout << "Optimising: " << input << " -> " << output << "\n";
+        if (!batch)
+            std::cout << "Optimising: " << input << " -> " << output << "\n";
         if (!cfg.copy_metadata) std::cout << "Metadata copying disabled.\n";
+    }
+
+    if (batch) {
+        const int failed = run_batch(input, output, cfg);
+        return failed ? EXIT_FAILURE : EXIT_SUCCESS;
     }
 
     if (!flacoutcpp::optimise(input, output, cfg)) {
         std::cerr << "Optimisation failed.\n";
         return EXIT_FAILURE;
     }
+    flacoutcpp::release_shared_pure_gpu_encoder();
 
     if (cfg.verbose) std::cout << "Done.\n";
     return EXIT_SUCCESS;

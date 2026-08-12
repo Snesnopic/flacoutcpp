@@ -1065,6 +1065,37 @@ frontier in "Windows are worth more than orders" was tuned when a window cost 5x
 what it now costs in `pg_autoc`, so it is stale in the direction of buying more
 windows, and is the next thing to re-sweep.
 
+## Batch mode: the fixed cost is a quarter of a corpus run
+
+`flacoutcpp <in-dir> <out-dir>` walks the tree and encodes every `.flac` into the
+mirrored path. It exists for `-P` specifically, because the per-invocation cost is
+large next to a track:
+
+```
+27.6 ms   per invocation, measured on a 0.02-second file (best of 15)
+ 5.2 s    x188 tracks -- of a 21.6 s corpus run
+```
+
+Most of it is `vkCreateInstance` and the pipeline cache load, and **none of it
+depends on the audio**: the device buffers are sized from (channels, bps, block
+size, windows, chunk length) alone. So `shared_pure_gpu_encoder()` keeps one
+context alive across files and rebuilds it only when the shape or the config
+changes. Corpus: **21.6 s per-file, 17.1 s batched**, 188/188 outputs verified
+with `flac -t`.
+
+Storage is not the constraint and was checked rather than assumed: the corpus run
+moves 164 MB/s read and 158 MB/s written, against 2.9 GB/s measured write
+throughput on this machine, and the decode of the largest track finishes 24 ms
+into a 142 ms encode.
+
+**`-P` still does no frame reuse**, so it can emit a file larger than its input.
+Measured over the corpus, paired by path: **9 of 188 tracks are larger, by 292 KiB
+in total**, worst case +0.575%. A whole-file copy-through backstop would move the
+corpus from -1.318% to -1.326%, i.e. it buys the *guarantee* and almost none of
+the bytes. Frame-level splice is not reachable without giving up the fixed grid:
+`-P`'s boundaries rarely coincide with the input's, and its parallel decoder does
+not record input frame byte ranges.
+
 ## Build order
 
 Each step ends somewhere testable. Do not skip to step 4.

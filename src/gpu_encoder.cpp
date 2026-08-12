@@ -1501,3 +1501,63 @@ bool PureGpuEncoder::encode(const std::vector<std::vector<int32_t>>& pcm,
 } // namespace flacoutcpp
 
 #endif // FLACOUT_HAVE_VULKAN
+
+// ---------------------------------------------------------------------------
+// Batch reuse. Deliberately outside the Vulkan #ifdef: the stub build wants the
+// same behaviour (construct, ask available(), fail with a reason), and keeping
+// one copy means the two cannot drift.
+// ---------------------------------------------------------------------------
+
+namespace flacoutcpp {
+namespace {
+
+bool same_cfg(const PureGpuEncoder::Config& a, const PureGpuEncoder::Config& b) {
+    return a.block_size       == b.block_size &&
+           a.windows          == b.windows &&
+           a.precisions       == b.precisions &&
+           a.orders           == b.orders &&
+           a.partition_cap    == b.partition_cap &&
+           a.blocks_per_chunk == b.blocks_per_chunk &&
+           a.verbose          == b.verbose;
+}
+
+struct SharedEncoder {
+    std::unique_ptr<PureGpuEncoder> enc;
+    uint32_t ch = 0, bps = 0, rate = 0;
+    PureGpuEncoder::Config cfg;
+};
+SharedEncoder g_shared;
+
+} // namespace
+
+PureGpuEncoder* shared_pure_gpu_encoder(uint32_t channels, uint32_t bps,
+                                        uint32_t sample_rate,
+                                        const PureGpuEncoder::Config& cfg,
+                                        std::string* why) {
+    const bool hit = g_shared.enc && g_shared.ch == channels &&
+                     g_shared.bps == bps && g_shared.rate == sample_rate &&
+                     same_cfg(g_shared.cfg, cfg);
+    if (!hit) {
+        // Destroy before constructing: two live contexts would double the device
+        // memory for no reason, and a batch of mixed shapes would accumulate one
+        // per shape it has ever seen.
+        g_shared.enc.reset();
+        g_shared.enc.reset(new PureGpuEncoder(channels, bps, sample_rate, cfg));
+        g_shared.ch = channels; g_shared.bps = bps; g_shared.rate = sample_rate;
+        g_shared.cfg = cfg;
+    }
+    if (!g_shared.enc->available()) {
+        if (why) *why = g_shared.enc->why();
+        // A device that failed to come up will fail again for the next file of
+        // the same shape, but keeping it cached would make the *reason* stale if
+        // the next file has a different shape. Drop it.
+        g_shared.enc.reset();
+        return nullptr;
+    }
+    if (why) *why = g_shared.enc->why();
+    return g_shared.enc.get();
+}
+
+void release_shared_pure_gpu_encoder() { g_shared.enc.reset(); }
+
+} // namespace flacoutcpp

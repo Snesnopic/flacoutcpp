@@ -753,14 +753,19 @@ bool Processor::process_pure_gpu(std::vector<std::vector<uint8_t>>& extra_blocks
     gcfg.verbose          = m_config.verbose;
     if (!m_config.pg_precisions.empty()) gcfg.precisions = m_config.pg_precisions;
 
-    PureGpuEncoder enc(m_channels, m_bps, m_sample_rate, gcfg);
-    if (!enc.available()) {
+    // Shared across files rather than per-file: Vulkan init and the pipeline
+    // load are ~20 ms and depend on the stream's shape, not its samples, so a
+    // batch of same-shaped tracks pays them once. A single run is unaffected.
+    std::string gwhy;
+    PureGpuEncoder* enc = shared_pure_gpu_encoder(m_channels, m_bps,
+                                                  m_sample_rate, gcfg, &gwhy);
+    if (!enc) {
         finish_decode();
-        std::cerr << "Error: -P unavailable: " << enc.why() << "\n";
+        std::cerr << "Error: -P unavailable: " << gwhy << "\n";
         return false;
     }
     if (m_config.verbose)
-        std::cout << "Pure GPU: " << enc.why() << "\n";
+        std::cout << "Pure GPU: " << gwhy << "\n";
 
     wlap("Vulkan init (overlapped)");
     const std::string tmp_output = m_output + ".partial";
@@ -790,7 +795,7 @@ bool Processor::process_pure_gpu(std::vector<std::vector<uint8_t>>& extra_blocks
     wlap("open + header");
     PureGpuEncoder::Stats st{};
     bool wrote_ok = true;
-    const bool enc_ok = enc.encode(m_pcm_data,
+    const bool enc_ok = enc->encode(m_pcm_data,
         [&](const uint8_t* p, size_t n) {
             out.write(reinterpret_cast<const char*>(p), (std::streamsize)n);
             if (!out) { wrote_ok = false; return false; }

@@ -120,4 +120,30 @@ private:
     std::unique_ptr<Impl> m_impl;
 };
 
+/**
+ * @brief A device context reused across files, for batch encoding.
+ *
+ * Returns an encoder for this stream shape, building one only when the shape or
+ * the configuration differs from the previous call's. Nothing an encoder holds
+ * depends on the audio -- the buffers are sized from (channels, bps, block size,
+ * windows, chunk length) alone -- so a second file of the same shape can use the
+ * first one's device, pipelines and buffers unchanged.
+ *
+ * It is worth having because the fixed cost is large next to a short track:
+ * ~27.6 ms per invocation measured on a 0.02-second file, most of it
+ * `vkCreateInstance` and the pipeline cache, which is 5.2 s across a 188-track
+ * corpus that takes 21.6 s in total.
+ *
+ * Never delete the returned pointer; call release_shared_pure_gpu_encoder() when
+ * the batch is finished. Not thread-safe: one batch at a time.
+ *
+ * @return nullptr if a device could not be created; @p why receives the reason.
+ */
+PureGpuEncoder* shared_pure_gpu_encoder(uint32_t channels, uint32_t bps,
+                                        uint32_t sample_rate,
+                                        const PureGpuEncoder::Config& cfg,
+                                        std::string* why);
+/// Drop the cached context. Safe to call when there is none.
+void release_shared_pure_gpu_encoder();
+
 } // namespace flacoutcpp

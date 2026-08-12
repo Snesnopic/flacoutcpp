@@ -262,9 +262,10 @@ struct Config {
     std::vector<int> pg_precisions;
 
     /// Orders swept per (block, signal, window) under `-P`, out of 32, ranked by
-    /// Levinson error. The dominant speed knob: the Rice sweep is ~92% of device
-    /// time and costs roughly the summed order of what it prices.
-    uint32_t pg_orders = 3;
+    /// Levinson error. Trades against the window count rather than standing
+    /// alone -- 2 is the default only because the shortlist is 10 windows wide;
+    /// at 6 windows it costs size. See PureGpuEncoder::Config::orders.
+    uint32_t pg_orders = 2;
 
     /// Sweep-side Rice partition-order cap under `-P` (1-8). Ranking only; see
     /// PureGpuEncoder::Config::partition_cap. 4 measured 3.4x for +0.029%.

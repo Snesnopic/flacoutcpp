@@ -55,10 +55,16 @@ public:
         /// LPC coefficient precisions swept per (window, order). 1..4 entries.
         std::vector<int> precisions{15};
         /// Orders fully swept per (block, signal, window), out of 32, chosen by
-        /// the Levinson prediction error. This is the dominant speed knob: the
-        /// Rice sweep is ~92% of device time and its cost is proportional to the
-        /// summed order of the candidates it prices.
-        uint32_t orders = 3;
+        /// the Levinson prediction error.
+        ///
+        /// **Windows are worth far more than orders, so this is 2 and the window
+        /// shortlist is 10.** On a real album track `8 windows x 2 orders`
+        /// dominates `6 x 6` on both axes, and orders barely register there at
+        /// all (`6x2` -> `6x6` is -0.011% for 1.4x). Album corpus, 188 tracks,
+        /// 10x2 against the previous 6x3 default: **-0.1372% with all 188 tracks
+        /// smaller**, at 1.04x corpus wall clock. The two knobs are not
+        /// independent -- 2 orders is only safe because the shortlist widened.
+        uint32_t orders = 2;
         /// Cap on the *sweep's* Rice partition-order search (1..8). Ranking only
         /// -- the winner is re-priced with the full search, so this cannot
         /// mis-state what the bitstream pays. The kernel is dominated by

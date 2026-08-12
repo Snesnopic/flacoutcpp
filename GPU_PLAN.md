@@ -385,6 +385,16 @@ four at 8) so the driver can pick its preferred width *correctly*, instead of
 being forced to one that spills. That is a design change and wants its own
 measurement.
 
+> **Measured, and this is wrong.** The spills are real (`pg_sweep` 449:747,
+> `pg_rice` 350:588, `pg_autoc` 198:737 on Mesa 26.1.5) but they are not what
+> costs the A380, and a width-agnostic mapping could not fix them if they were:
+> the fold's divergent state is 32 planes x NLEV levels = 1152 bytes per
+> subgroup-candidate **whatever the width**, so redistributing it across 8, 16 or
+> 32 lanes leaves the same 36 GRFs. Cutting spills 40% for real (compile-time
+> partition ceiling of 4) bought 2% of wall clock there and 0% on Apple. See
+> "Register pressure is not the Arc's problem" in PURE_GPU_PLAN.md for the tables
+> and for what to measure instead.
+
 Apple is unaffected either way. If MoltenVK does not advertise the extension,
 `size_ctl` stays false and the path is exactly as before; if it does, 32 is
 pinned, which is what Metal does anyway.

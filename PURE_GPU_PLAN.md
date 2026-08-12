@@ -644,11 +644,46 @@ The trap: a first pass measured only *sweep* time, concluded 10 windows x 2 orde
 | 8w x 3o | 123.9 ms | 28005095 | 16896703 |
 | 10w x 3o | 140.3 ms | 28003888 | 16883922 |
 
-6w x 3o is faster *and* smaller than the old default on both fixtures, so it is
-the new one. The six are the dense tapers of the CPU's shortlist (which is those
-six plus the partial/punchout pair at each offset). Note 10w x 3o is another
-0.24% smaller on the master mix if size is what matters — the knobs expose the
-whole frontier.
+6w x 3o was faster *and* smaller than the old default on both fixtures, so it
+became the default for a while. **It is now 10 windows x 2 orders** — the whole
+CPU shortlist, at two orders — which the corpus says is strictly better.
+
+### 10 x 2, and all 188 tracks agree
+
+Re-swept as a 2-D frontier on real music instead of one axis at a time. A window
+costs **~9-10% of device time** (album track, 6 → 10 windows: autoc 43.8 → 59.6 ms,
+levinson 15.4 → 24.4, sweep 63.9 → 95.7, total 137.5 → 193.5); only `pg_rice` is
+flat, since it prices the winner alone. Below ~6 windows the cost is invisible in
+wall clock, buried under process startup and decode — 1, 2, 4 and 6 windows all
+finish an album track in 0.151–0.153 s.
+
+What windows buy, at 3 orders on that track: 6→8 **-0.081%**, 8→10 **-0.052%**,
+10→12 -0.002%, 12→16 -0.004%. **Ten is the knee**, and standard shapes past the
+shortlist (blackman, hamming, bartlett, nuttall, flattop, connes) add nothing —
+independently reproducing what the CPU shortlist concluded.
+
+Orders barely register beside that. `8w x 2o` (0.179 s, -0.077%) **dominates
+`6w x 6o`** (0.216 s, -0.006%) on both axes, and `6x2` → `6x6` is -0.011% for 1.4x.
+
+Album corpus, 188 tracks, `10x2` against `6x3`:
+
+| | |
+|---|---|
+| 6x3 | 3666771700 |
+| **10x2** | **3661740884** |
+| delta | **-0.1372%, 4.8 MiB** |
+| smaller / unchanged / larger | **188 / 0 / 0** |
+| corpus wall clock | 20.20 s → 21.08 s (1.04x) |
+
+Per album it spans -0.115% (Shovel Knight, 48 mono tracks) to -0.179% (MDK), with
+the 24-bit album (Parklands) at -0.136%. **No track regressed**, which is unusual
+here — and it disposes of the one worry the fixtures raised: `s24_2s` grows 0.5%
+at two orders, and that is a small-fixture artifact rather than a bit-depth
+effect.
+
+**The two knobs are not independent.** Two orders is only safe because the
+shortlist widened: `6w x 2o` alone is +0.005% on the album track. Do not tune one
+without the other, exactly as `-c` and `-L` behave on the CPU side.
 
 ### Result
 
@@ -717,11 +752,124 @@ no `/dev/dri` descriptors -- so the device numbers stand.
 
 The *shape* is portable -- the same three stages in the same proportions -- but the
 absolute speed is 12x apart, more than the ~3.5x raw fp32 ratio between the parts.
-`GPU_PLAN.md` already identified why for this device and it has not been acted on:
-pinning SIMD32 costs the A380 throughput (measured there at 1.5e5 -> 5.27e4
-candidates/s) because the kernel's five NLEV-deep arrays spill at that width, and
-`minSubgroupSize` is 8. The fix is a width-agnostic bit-plane mapping so the
-driver can choose SIMD16.
+`GPU_PLAN.md` proposed a width-agnostic bit-plane mapping as the fix, on the
+theory that the kernels spill at SIMD32 and the driver would rather use SIMD16.
+**The spills are real and the theory is wrong.** See below.
+
+### Register pressure is not the Arc's problem, and the width rewrite cannot fix it
+
+Measured with `INTEL_DEBUG=cs` (needs `MESA_SHADER_CACHE_DISABLE=true`, or the
+shaders never recompile and nothing prints), Mesa 26.1.5, music_3s:
+
+| kernel | instr | spills:fills | share of device time |
+|---|---|---|---|
+| **sweep** | 9391 | **449:747** | 42.6% |
+| **autoc** | 12538 | **198:737** | 29.6% |
+| **rice** | 8122 | **350:588** | 11.4% |
+| frame | 1565 | 29:22 | 0.1% |
+| the other 9 | — | 0:0 | — |
+
+So three kernels spill and they are 84% of device time. Everything after that
+point contradicts the plan:
+
+**1. The dominant state is width-invariant, so narrowing the subgroup cannot
+shrink it.** The fold's live state is `Bacc/Nacc/Hacc/total0/total1`, and the
+divergent part of it is *32 planes x NLEV levels* of counters. That is 1152 bytes
+per subgroup-candidate whatever the width: at SIMD32 it is `Bacc[9]` per lane
+(9 dwords x 4 GRFs), at SIMD16 each lane owns two planes (`Bacc[2][9]`, 18 dwords
+x 2 GRFs), at SIMD8 four planes (36 dwords x 1 GRF). **36 GRFs in every case.**
+The rewrite redistributes the state across lanes; it does not reduce it.
+
+**2. Cutting the pressure barely helps anyway.** Compiling the sweep with a
+partition ceiling of 4 instead of 8 -- which is a genuine reduction, since the
+default `--pg-pcap` is already 4 and levels 5-8 are dead weight -- cuts the kernel
+by a third and the spills by 40%, and buys almost nothing:
+
+| build | instr | cycles (compiler estimate) | spills:fills | MLKDream wall |
+|---|---|---|---|---|
+| `PG_SWEEP_MAXP=8` | 9389 | 44.8M | 449:747 | 1.320 s |
+| `PG_SWEEP_MAXP=4` | 6417 | 24.1M | 267:479 | **1.291 s (1.02x)** |
+
+Output byte-identical, and on Apple the same build is 0.109 s either way, i.e.
+exactly nothing. **-32% instructions and -40% spills bought 2%**, so scratch
+traffic is not what this device is waiting on, and the compiler's cycle estimate
+is not predictive of it.
+
+**3. The two devices disagree about the tap loop's shape.** Breaking the
+accumulator chain was worth 1.26x on Apple (925fcc1). On the Arc, `NACC` 8 / 4 / 1
+measures 1.385 / 1.322 / 1.323 s -- fewer accumulators is *slightly better*. Both
+knobs now exist (`-DFLACOUT_PG_DEFS=-DNACC=4`, `-DPG_SWEEP_MAXP=4`) precisely
+because the right value is per-device.
+
+**And cross-lane ops are not it either.** That was the last surviving
+hypothesis -- ballots and the fold are ~50% of the sweep on Apple, and cross-lane
+throughput is the obvious structural difference between an M4 Max and an
+8-Xe-core A380 at a 2.8x raw-FLOPS ratio. Tested with the same ablation on both
+devices (`-DFLACOUT_PG_DEFS=-DPG_ABLATE=n`, timing-only builds; 1 drops the LPC
+dot product, 2 drops every ballot, shuffle and the partition fold). MLKDream,
+sweep stage:
+
+| build | M4 Max | Arc A380 | Arc/M4 |
+|---|---|---|---|
+| full kernel | 44.2 ms | 483.9 ms | 10.9x |
+| no dot product | 18.4 ms | 227.8 ms | 12.4x |
+| **no ballots, no fold** | 16.5 ms | 225.9 ms | **13.7x** |
+
+**The ratio is flat.** Strip the cross-lane work entirely and the Arc is still
+13.7x slower on what is left -- an integer MAC loop with no subgroup op in it --
+so no primitive is disproportionately slow on that device. The two halves also
+measure at 53%/53% there against 58%/63% on Apple, i.e. the same shape. Note the
+shares exceed 100% on both, which is the latency-bound signature already recorded:
+removing either half lets the other's latency hide.
+
+A uniformly ~12x slower device is a throughput story, not a mapping story. The
+int-MAC-only variant being the *worst* ratio points at int32 multiply rate on
+Xe-HPG rather than anything the kernel chooses to do.
+
+### 12x is not the hardware gap: 4x is, and int32 multiply is the other 3x
+
+Tested by swapping only the arithmetic. `PG_ABLATE=3` is ablation 2's kernel --
+no ballots, no fold -- with the integer MAC loop rewritten in fp32. MLKDream,
+sweep stage:
+
+| MAC loop only, no cross-lane work | M4 Max | Arc A380 | Arc/M4 |
+|---|---|---|---|
+| int32 | 16.5 ms | 226.6 ms | **13.7x** |
+| fp32 | 19.9 ms | 80.0 ms | **4.0x** |
+
+On the Arc the same loop in fp32 is **2.83x faster**. On the M4 it is 0.83x, i.e.
+slightly *slower* -- integer multiply is full rate there and the conversions are
+pure overhead.
+
+4.0x is about what the parts predict: an M4 Max 40-core GPU is ~16.4 TFLOPS fp32
+(5120 ALUs, ~1.6 GHz) against the A380's ~5.0 TFLOPS (1024 ALUs at a measured
+2450 MHz), a 3.3x ratio, with the rest in clocks and occupancy. **So the answer
+to "is 12x expected for this hardware gap" is no -- 3-4x is expected, and the
+excess is one instruction.** Xe-HPG executes 32-bit integer multiply at reduced
+rate; Apple does not.
+
+This also corrects the framing used above and in `GPU_PLAN.md`: comparing the
+observed gap against the "raw fp32 ratio" was the wrong basis, because the kernel
+that matters is an *integer* MAC loop.
+
+**It suggests one Intel-specific trade, and it is a real one.** The sweep's dot
+product only *ranks* candidates -- `pg_rice` re-derives the winner's residual
+exactly -- so pricing it in fp32 would cost compression, never losslessness,
+exactly like the fp32 analysis stages. On the full kernel the arithmetic is
+partly hidden behind the fold, so the ceiling is roughly 484 -> ~340 ms of sweep
+(~1.15x overall on that device), against an unmeasured size cost from mis-ranking.
+That is a much better lead than the width rewrite, and it is the opposite
+conclusion from the FP32RANK note above -- which was measured on Apple, where the
+arithmetic is not the bottleneck and int32 is free. Per-device, not universal.
+
+**Conclusion: do not build the width-agnostic bit-plane mapping.** Three
+independent measurements say it addresses nothing -- the state it would
+redistribute is width-invariant, cutting that state 40% for real buys 2%, and the
+cross-lane work it would make cheaper is not where the device's disadvantage
+lies. It remains a large, delicate change to a kernel that is a cost-model
+contract. If Intel throughput is ever worth chasing, profile a *per-primitive*
+microbenchmark (int32 MAC, load, ballot) against the M4 first and aim at whatever
+that says, because the kernel-level ablation has now been exhausted.
 
 ### What the Arc offers that Apple does not, and whether any of it helps
 

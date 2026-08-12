@@ -104,12 +104,14 @@ if(FLACOUT_VULKAN)
         string(SUBSTRING "${pg}" 1 -1 _rest)
         string(TOUPPER "${_first}" _first)
         set(_sym "kPg${_first}${_rest}Spv")
+        # FLACOUT_PG_DEFS lets an ablation pass -D flags to every pg kernel
+        # without editing the shader (e.g. -DNACC=4 for the sweep's accumulators).
         if(FLACOUT_GLSLC)
-            set(_cmd ${FLACOUT_GLSLC} -O --target-env=vulkan1.1
+            set(_cmd ${FLACOUT_GLSLC} -O --target-env=vulkan1.1 ${FLACOUT_PG_DEFS}
                      -fshader-stage=compute "${_src}" -o "${_spv}")
         else()
-            set(_cmd ${FLACOUT_GLSLANG} -V --target-env vulkan1.1 -S comp
-                     "${_src}" -o "${_spv}")
+            set(_cmd ${FLACOUT_GLSLANG} -V --target-env vulkan1.1 ${FLACOUT_PG_DEFS}
+                     -S comp "${_src}" -o "${_spv}")
         endif()
         add_custom_command(
             OUTPUT "${_hdr}"

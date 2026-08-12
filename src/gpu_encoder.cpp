@@ -1344,26 +1344,34 @@ PureGpuEncoder::PureGpuEncoder(uint32_t channels, uint32_t bps,
     m_impl->bps   = bps;
     m_impl->srate = sample_rate;
     m_impl->cfg   = cfg;
-    // The six dense tapers of the CPU's estimated-DP shortlist (which is those
-    // six plus the partial/punchout pair at each offset).
+    // The CPU's estimated-DP shortlist, all ten of it: six dense tapers plus the
+    // partial/punchout pair at each offset.
     //
-    // Windows are worth more than orders per unit of *device* time, so the old
-    // four-window, eight-order default was off the frontier in both directions.
-    // MLKDream, total device time from FLACOUT_PG_PROFILE:
+    // Windows are worth much more than orders here, and the frontier is flat in
+    // orders. Measured on a real album track at 3 orders, each step adding two
+    // windows: 6->8 is -0.081%, 8->10 is -0.052%, 10->12 is -0.002%, 12->16 is
+    // -0.004%. **Ten is the knee**, and standard shapes past the shortlist
+    // (blackman, hamming, bartlett, nuttall, flattop, connes) contribute nothing
+    // -- the same conclusion the CPU shortlist reached independently.
     //
-    //   4w x 4o   107.3 ms   28032077
-    //   4w x 8o   127.2 ms   28027341   <- the old default
-    //   6w x 3o   109.4 ms   28008023   <- faster AND smaller than 4w x 8o
-    //   10w x 3o  140.3 ms   28003888
+    // A window costs ~9-10% of device time: every analysis stage scales with the
+    // count (autoc 43.8->59.6 ms, levinson 15.4->24.4, sweep 63.9->95.7 from 6 to
+    // 10) and only pg_rice, which prices the winner alone, does not. Below ~6 the
+    // cost is invisible in wall clock, hidden by process startup and decode.
     //
-    // Beware measuring this on sweep time alone: the autocorrelation also scales
-    // with window count (14 -> 30 ms from 4 to 10 windows), and a first pass at
-    // this frontier picked 10 windows on sweep time and made the encoder *slower*
-    // overall.
+    // Album corpus, 188 tracks, this default (10x2) against the old 6x3:
+    // **-0.1372%, every one of the 188 tracks smaller**, 20.20 -> 21.08 s. It
+    // holds across stereo, mono (Shovel Knight, 48 tracks, -0.115%) and 24-bit
+    // (Parklands, -0.136%) -- so s24_2s growing 0.5% at two orders was a
+    // small-fixture artifact, not a bit-depth effect.
     if (m_impl->cfg.windows.empty())
         m_impl->cfg.windows = {WindowType::TUKEY_050, WindowType::HANN,
                                WindowType::WELCH,     WindowType::RECTANGULAR,
-                               WindowType::TUKEY_005, WindowType::TUKEY_020};
+                               WindowType::TUKEY_005, WindowType::TUKEY_020,
+                               WindowType::PARTIAL_TUKEY_2_033,
+                               WindowType::PARTIAL_TUKEY_2_067,
+                               WindowType::PUNCHOUT_TUKEY_2_033,
+                               WindowType::PUNCHOUT_TUKEY_2_067};
     if (!m_impl->init()) m_impl->ok = false;
 }
 

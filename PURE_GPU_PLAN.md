@@ -665,6 +665,61 @@ Faster everywhere and smaller on all real music; the two synthetic fixtures pay
 for the shallower order search and want `--pg-orders 8` back. Against the first
 working commit this is **2.6-2.8x** on the long fixtures.
 
+## Inside the sweep: it was the dependency chain, not the fold
+
+The fold was the suspected bottleneck. It is not, and ablation said so before any
+of it was restructured. Deliberately-wrong builds, timing only, MLKDream sweep:
+
+| build | sweep |
+|---|---|
+| baseline | 43.8 ms |
+| no LPC dot product | 24.0 ms |
+| no bit-plane ballots, no partition fold | 22.1 ms |
+
+So ~45% dot product, ~50% ballots+fold. Splitting the second further with the
+`--pg-pcap` sweep (pcap 4 → 2 costs 12% of the sweep) puts the **fold at only
+~15%** — about 7% of device time, and already exposed as a knob. Re-tuning it on
+the current default confirms it is well placed: pcap 4 → 3 buys 3% of device time
+for +0.005% size, 8 costs 44% more time for -0.03%.
+
+**Three things measured as exactly nothing**, and each looked like the answer:
+
+- **Coefficients in shared memory.** `sweep.comp` rejected a *private* array here
+  (32 registers at SIMD32, a quarter of the budget), but shared memory is 128
+  bytes per subgroup and had never been tried. 0.0436 s against a 0.0431-0.0438 s
+  baseline. The hardware broadcast of a subgroup-uniform load really is free.
+- **Removing all but one sample load** from the tap loop: 0.0411 s against
+  0.0412 s. The samples are L1-resident and coalesced; the loads are free.
+- **Removing the multiplies** but keeping the loads: no gain either.
+
+Which is the whole finding. The tap loop costs 45% of the kernel while neither its
+loads nor its multiplies cost anything, so what it costs is **latency**:
+`sum += qc[j] * s[i-1-j]` serialises `ord` additions on one accumulator with no
+instruction-level parallelism to hide the chain.
+
+Integer addition is associative, and the narrow path's bound already rules out
+overflow, so regrouping into independent accumulators is **bit-exact rather than a
+trade** — verified byte-identical on six fixtures:
+
+| accumulators | sweep |
+|---|---|
+| 1 (chain) | 41.2 ms |
+| 4 | 34.5 ms |
+| **8** | **32.8 ms** |
+
+The wide (int64) path keeps four: an int64 accumulator costs two registers, and
+eight of them spilled. **`pg_rice` was left alone entirely** — the same change
+made it 2x slower (5.5 → 10.7 ms), because that kernel already carries five
+NLEV-deep arrays plus a 4 KB shared table and has no registers to spare. Same
+transformation, opposite sign, one kernel apart.
+
+| fixture | `-P` | before | CPU default | speedup |
+|---|---|---|---|---|
+| music_20s | 0.064 s | 0.065 s | 0.198 s | 3.08x |
+| MLKDream | 0.151 s | 0.164 s | 1.477 s | **9.79x** |
+| master mix | 0.141 s | 0.145 s | 0.997 s | 7.05x |
+| syn3m_mix | 0.140 s | 0.144 s | 0.940 s | 6.73x |
+
 ## Block size: the cap was worth raising, a device-side DP is not
 
 The residual gap after the double-float fix was ~3.9%, of which the fixed

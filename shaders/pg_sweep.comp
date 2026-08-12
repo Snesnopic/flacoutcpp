@@ -190,17 +190,52 @@ void main() {
 
         uint u = 0u;
         if (act) {
+            // Eight independent accumulators, not one.
+            //
+            // Ablation said the tap loop costs ~45% of this kernel, but neither
+            // its loads nor its multiplies account for that: removing all but one
+            // sample load changed nothing (the samples are L1-resident and
+            // coalesced), and removing the multiplies changed nothing either.
+            // What it is, is the *dependency chain* -- `sum +=` serialises `ord`
+            // additions on the accumulator's latency with no instruction-level
+            // parallelism to hide it.
+            //
+            // Integer addition is associative and the narrow path's bound already
+            // guarantees no overflow, so regrouping is bit-exact rather than a
+            // trade. Verified byte-identical.
             int r;
+            const int b4 = base + 4;
+            const int si = off + i - 1;
             if (narrow) {
-                int sum = 0;
-                for (int j = 0; j < ord; ++j)
-                    sum += cand[base + 4 + j] * samples[off + i - 1 - j];
-                r = samples[off + i] - (sum >> shift);
+                int s0=0, s1=0, s2=0, s3=0, s4=0, s5=0, s6=0, s7=0;
+                int j = 0;
+                for (; j + 8 <= ord; j += 8) {
+                    s0 += cand[b4+j  ] * samples[si-j  ];
+                    s1 += cand[b4+j+1] * samples[si-j-1];
+                    s2 += cand[b4+j+2] * samples[si-j-2];
+                    s3 += cand[b4+j+3] * samples[si-j-3];
+                    s4 += cand[b4+j+4] * samples[si-j-4];
+                    s5 += cand[b4+j+5] * samples[si-j-5];
+                    s6 += cand[b4+j+6] * samples[si-j-6];
+                    s7 += cand[b4+j+7] * samples[si-j-7];
+                }
+                for (; j < ord; ++j) s0 += cand[b4 + j] * samples[si - j];
+                r = samples[off + i]
+                  - ((((s0+s1)+(s2+s3)) + ((s4+s5)+(s6+s7))) >> shift);
             } else {
-                int64_t sum = 0L;
-                for (int j = 0; j < ord; ++j)
-                    sum += int64_t(cand[base + 4 + j]) * int64_t(samples[off + i - 1 - j]);
-                r = samples[off + i] - int(sum >> shift);
+                // The wide path keeps four: int64 doubles the register cost of
+                // each accumulator, and eight of them spilled.
+                int64_t s0 = 0L, s1 = 0L, s2 = 0L, s3 = 0L;
+                int j = 0;
+                for (; j + 4 <= ord; j += 4) {
+                    s0 += int64_t(cand[b4 + j    ]) * int64_t(samples[si - j    ]);
+                    s1 += int64_t(cand[b4 + j + 1]) * int64_t(samples[si - j - 1]);
+                    s2 += int64_t(cand[b4 + j + 2]) * int64_t(samples[si - j - 2]);
+                    s3 += int64_t(cand[b4 + j + 3]) * int64_t(samples[si - j - 3]);
+                }
+                for (; j < ord; ++j)
+                    s0 += int64_t(cand[b4 + j]) * int64_t(samples[si - j]);
+                r = samples[off + i] - int((((s0 + s1) + (s2 + s3)) >> shift));
             }
             u = (uint(r) << 1) ^ uint(r >> 31);       // zigzag
         }

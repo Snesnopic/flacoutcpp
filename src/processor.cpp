@@ -532,24 +532,6 @@ bool Processor::process_pure_gpu(std::vector<std::vector<uint8_t>>& extra_blocks
         return false;
     }
 
-    PureGpuEncoder::Config gcfg;
-    gcfg.block_size       = m_config.pg_block_size;
-    gcfg.windows          = m_config.windows;
-    gcfg.blocks_per_chunk = m_config.pg_blocks_per_chunk;
-    gcfg.orders           = m_config.pg_orders;
-    gcfg.partition_cap    = m_config.pg_partition_cap;
-    gcfg.verbose          = m_config.verbose;
-    if (!m_config.pg_precisions.empty()) gcfg.precisions = m_config.pg_precisions;
-
-    PureGpuEncoder enc(m_channels, m_bps, m_sample_rate, gcfg);
-    if (!enc.available()) {
-        FLAC__stream_decoder_delete(decoder);
-        std::cerr << "Error: -P unavailable: " << enc.why() << "\n";
-        return false;
-    }
-    if (m_config.verbose)
-        std::cout << "Pure GPU: " << enc.why() << "\n";
-
     // ---- preallocate, then decode on a background thread ---------------------
     m_pcm_data.assign(m_channels, std::vector<int32_t>());
     for (auto& ch : m_pcm_data) ch.resize((size_t)m_total_samples);
@@ -629,6 +611,28 @@ bool Processor::process_pure_gpu(std::vector<std::vector<uint8_t>>& extra_blocks
         if (md5_thread.joinable()) md5_thread.join();
         FLAC__stream_decoder_delete(decoder);
     };
+
+    // Vulkan comes up *after* the decode is already running. Instance creation is
+    // ~17 ms on MoltenVK and cannot be cached (the pipeline cache handles the
+    // other ~10 ms), but nothing about it depends on the audio -- so it belongs
+    // beside the decode rather than in front of it.
+    PureGpuEncoder::Config gcfg;
+    gcfg.block_size       = m_config.pg_block_size;
+    gcfg.windows          = m_config.windows;
+    gcfg.blocks_per_chunk = m_config.pg_blocks_per_chunk;
+    gcfg.orders           = m_config.pg_orders;
+    gcfg.partition_cap    = m_config.pg_partition_cap;
+    gcfg.verbose          = m_config.verbose;
+    if (!m_config.pg_precisions.empty()) gcfg.precisions = m_config.pg_precisions;
+
+    PureGpuEncoder enc(m_channels, m_bps, m_sample_rate, gcfg);
+    if (!enc.available()) {
+        finish_decode();
+        std::cerr << "Error: -P unavailable: " << enc.why() << "\n";
+        return false;
+    }
+    if (m_config.verbose)
+        std::cout << "Pure GPU: " << enc.why() << "\n";
 
     const std::string tmp_output = m_output + ".partial";
     std::fstream out(tmp_output,

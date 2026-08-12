@@ -419,11 +419,51 @@ master mix, so the device is the bulk of `-P`).
 
 | fixture | `-P` wall | CPU default | speedup | size |
 |---|---|---|---|---|
-| music_10s | 0.068 s | 0.133 s | 1.96x | +0.40% |
-| music_20s | 0.076 s | 0.197 s | 2.58x | +0.14% |
-| MLKDream | 0.237 s | 1.458 s | **6.15x** | +1.12% |
-| master mix | 0.170 s | 0.984 s | 5.80x | +0.99% |
-| syn3m_mix | 0.177 s | 0.933 s | 5.27x | +7.62% |
+| short (<1024 samples) | 0.038 s | 0.021 s | **0.57x** | — |
+| micro | 0.048 s | 0.074 s | 1.54x | — |
+| music_3s | 0.051 s | 0.092 s | 1.81x | +0.83% |
+| music_10s | 0.062 s | 0.136 s | 2.18x | +0.40% |
+| music_20s | 0.063 s | 0.202 s | 3.23x | +0.14% |
+| MLKDream | 0.211 s | 1.473 s | **6.97x** | +1.12% |
+| master mix | 0.154 s | 0.995 s | 6.46x | +0.99% |
+
+**`-P` loses on very short inputs and that is structural.** A ~16 ms fixed cost
+cannot be amortised over a 20 ms file, so the CPU path wins below roughly a
+second of audio. Left as-is rather than papered over with a silent fallback: `-P`
+means the encode ran on the device, and quietly not doing that would make the
+flag untrustworthy. It is a throughput tool.
+
+### Startup latency: cache what you can, overlap the rest
+
+Fixed cost was ~26 ms, which is ~37% of a 10-second file's wall clock — the
+reason short inputs stalled at ~2x while long ones reached 6x. Measured with
+`FLACOUT_PG_INITTIME=1` rather than guessed at:
+
+| phase | before | after |
+|---|---|---|
+| `vkCreateInstance` (loader + MoltenVK) | 13.8 ms | 12.3 ms |
+| enumerate + `vkCreateDevice` | 1.7 ms | 1.5 ms |
+| **12 compute pipelines** | **10.5 ms** | **1.8 ms** |
+| descriptors, command pool, buffers, windows | 0.2 ms | 0.2 ms |
+
+Two fixes, because the two big terms need different ones:
+
+- **The pipeline compiles are cacheable.** A `VkPipelineCache` seeded from
+  `$XDG_CACHE_HOME/flacoutcpp/pg_pipelines.bin` (200 KB) takes 12.4 ms → 2.0 ms,
+  so only the first run on a given machine and driver pays. Safe by construction:
+  Vulkan validates the blob's header and cache entries are keyed by shader hash,
+  so a driver upgrade or an edited shader is a silent miss, not a hazard. Written
+  via a temp file and renamed so a concurrent run cannot see a partial cache.
+  `FLACOUT_PG_CACHE=-` disables it. The twelve pipelines are also created in one
+  `vkCreateComputePipelines` call rather than twelve, which lets the driver batch
+  whatever it still has to compile.
+- **Instance creation is not cacheable, but nothing about it depends on the
+  audio.** So Vulkan now comes up *after* the decode threads are already running,
+  and its ~12 ms sits beside the decode instead of in front of it.
+
+Net: master mix 0.170 → **0.154 s**, MLKDream 0.237 → **0.211 s**, music_20s
+0.076 → 0.063 s. `vkCreateInstance` is now the floor and there is nothing
+portable to do about it.
 
 ### The pipeline: one producer, two consumers
 

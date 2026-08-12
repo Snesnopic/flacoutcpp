@@ -27,7 +27,9 @@ bool PureGpuEncoder::encode(const std::vector<std::vector<int32_t>>&,
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
+#include <sys/stat.h>
 
 #include "frame_writer.hpp"
 
@@ -162,6 +164,20 @@ uint8_t samplerateCode(uint32_t sr, uint32_t& extraVal, int& extraBits) {
     return 0x0;   // fall back to STREAMINFO
 }
 
+// Where to keep the serialized pipeline cache. FLACOUT_PG_CACHE overrides it;
+// "-" disables caching entirely. Vulkan validates the blob's header (magic,
+// version, vendor/device ID, driver UUID) and ignores data it does not
+// recognise, and cache entries are keyed by shader hash, so a driver upgrade or
+// an edited shader is a silent miss rather than a hazard.
+std::string cachePath() {
+    if (const char* e = std::getenv("FLACOUT_PG_CACHE")) return std::string(e);
+    std::string base;
+    if (const char* x = std::getenv("XDG_CACHE_HOME")) base = x;
+    else if (const char* h = std::getenv("HOME")) base = std::string(h) + "/.cache";
+    else return {};
+    return base + "/flacoutcpp/pg_pipelines.bin";
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -211,6 +227,7 @@ struct PureGpuEncoder::Impl {
     VkDescriptorSetLayout dsl  = VK_NULL_HANDLE;
     VkDescriptorPool      dpool = VK_NULL_HANDLE;
     VkPipelineLayout      plo  = VK_NULL_HANDLE;
+    VkPipelineCache       pcache = VK_NULL_HANDLE;
     VkCommandPool         cpool = VK_NULL_HANDLE;
     VkCommandBuffer       cmd  = VK_NULL_HANDLE;
     VkFence               fence = VK_NULL_HANDLE;
@@ -344,6 +361,18 @@ void PureGpuEncoder::Impl::uploadWindows() {
 }
 
 bool PureGpuEncoder::Impl::init() {
+    // FLACOUT_PG_INITTIME: where startup latency goes. Fixed cost matters here
+    // out of proportion to its size -- it is ~37% of a 10-second file's wall
+    // clock, which is what caps short inputs at ~2x.
+    const bool ittime = std::getenv("FLACOUT_PG_INITTIME") != nullptr;
+    auto tmark = std::chrono::steady_clock::now();
+    auto lap = [&](const char* what) {
+        if (!ittime) return;
+        const auto now = std::chrono::steady_clock::now();
+        std::printf("  init %-22s %7.2f ms\n", what,
+                    1e3 * std::chrono::duration<double>(now - tmark).count());
+        tmark = now;
+    };
     // ---- shape -----------------------------------------------------------
     B = cfg.block_size;
     if (B % 256 != 0 || B > 4096 || B < 256) {
@@ -400,6 +429,7 @@ bool PureGpuEncoder::Impl::init() {
     if (vkCreateInstance(&ici, nullptr, &inst) != VK_SUCCESS) {
         why = "no Vulkan loader or instance creation failed"; return false;
     }
+    lap("vkCreateInstance");
 
     uint32_t nd = 0;
     vkEnumeratePhysicalDevices(inst, &nd, nullptr);
@@ -520,6 +550,7 @@ bool PureGpuEncoder::Impl::init() {
         why = std::string(props.deviceName) + ": device creation failed"; return false;
     }
     vkGetDeviceQueue(dev, qfam, 0, &queue);
+    lap("enumerate + vkCreateDevice");
 
     // ---- descriptors and pipelines ---------------------------------------
     VkDescriptorSetLayoutBinding bind[MAXBIND]{};
@@ -569,11 +600,46 @@ bool PureGpuEncoder::Impl::init() {
         why = "pipeline layout"; return false;
     }
 
+    lap("descriptors + layout");
+
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT rss{};
     rss.sType =
         VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT;
     rss.requiredSubgroupSize = 32;
 
+    // Compiling twelve kernels was 10.5 ms of a ~26 ms fixed startup cost, which
+    // is ~37% of a 10-second file's wall clock -- the reason short inputs stalled
+    // at ~2x while long ones reached 6x. Two fixes, both here:
+    //
+    //  - a VkPipelineCache seeded from disk, so only the first run on a given
+    //    machine and driver pays the compile;
+    //  - one vkCreateComputePipelines call for all twelve rather than twelve
+    //    calls, which lets the driver batch (and parallelise) the work it does
+    //    have to do on a cold cache.
+    std::vector<char> seed;
+    const std::string cpath = cachePath();
+    const bool cache_on = !cpath.empty() && cpath != "-";
+    if (cache_on) {
+        std::ifstream f(cpath, std::ios::binary | std::ios::ate);
+        if (f) {
+            const std::streamoff n = f.tellg();
+            // The header alone is 32 bytes; anything shorter cannot be valid, and
+            // a sane ceiling keeps a corrupt file from being read wholesale.
+            if (n >= 32 && n < (std::streamoff)64 * 1024 * 1024) {
+                seed.resize((size_t)n);
+                f.seekg(0);
+                if (!f.read(seed.data(), n)) seed.clear();
+            }
+        }
+    }
+    VkPipelineCacheCreateInfo pcci{};
+    pcci.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+    pcci.initialDataSize = seed.size();
+    pcci.pInitialData    = seed.empty() ? nullptr : seed.data();
+    if (vkCreatePipelineCache(dev, &pcci, nullptr, &pcache) != VK_SUCCESS)
+        pcache = VK_NULL_HANDLE;   // not fatal; just means every run compiles
+
+    std::vector<VkComputePipelineCreateInfo> cpis(S_COUNT);
     for (int s = 0; s < S_COUNT; ++s) {
         VkShaderModuleCreateInfo smci{};
         smci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
@@ -582,25 +648,58 @@ bool PureGpuEncoder::Impl::init() {
         if (vkCreateShaderModule(dev, &smci, nullptr, &mods[s]) != VK_SUCCESS) {
             why = std::string("shader module: ") + kStages[s].name; return false;
         }
-        VkComputePipelineCreateInfo cpi{};
+        auto& cpi = cpis[s];
+        cpi = VkComputePipelineCreateInfo{};
         cpi.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
         cpi.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
         cpi.stage.module = mods[s];
         cpi.stage.pName = "main";
         if (size_ctl) {
+            // One shared rss: it is read during the call and not retained.
             cpi.stage.pNext = &rss;
             cpi.stage.flags =
                 VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT_EXT;
         }
         cpi.layout = plo;
-        if (vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpi, nullptr,
-                                     &pipes[s]) != VK_SUCCESS) {
-            why = std::string(props.deviceName) + ": pipeline creation failed for "
-                + kStages[s].name;
-            return false;
+    }
+    if (vkCreateComputePipelines(dev, pcache, (uint32_t)S_COUNT, cpis.data(),
+                                 nullptr, pipes) != VK_SUCCESS) {
+        why = std::string(props.deviceName) + ": compute pipeline creation failed";
+        return false;
+    }
+
+    // Write the cache back only when the driver has something new to say.
+    if (cache_on && pcache != VK_NULL_HANDLE) {
+        size_t n = 0;
+        if (vkGetPipelineCacheData(dev, pcache, &n, nullptr) == VK_SUCCESS &&
+            n > 0 && n != seed.size()) {
+            std::vector<char> blob(n);
+            if (vkGetPipelineCacheData(dev, pcache, &n, blob.data()) == VK_SUCCESS) {
+                // Create the directory, then write via a temp and rename, so a
+                // concurrent run never observes a half-written cache.
+                const size_t slash = cpath.rfind('/');
+                if (slash != std::string::npos) {
+                    const std::string dir = cpath.substr(0, slash);
+                    for (size_t i = 1; i <= dir.size(); ++i)
+                        if (i == dir.size() || dir[i] == '/')
+                            ::mkdir(dir.substr(0, i).c_str(), 0755);
+                }
+                const std::string tmp = cpath + ".tmp";
+                std::ofstream o(tmp, std::ios::binary | std::ios::trunc);
+                if (o.write(blob.data(), (std::streamsize)n) && o.flush()) {
+                    o.close();
+                    if (std::rename(tmp.c_str(), cpath.c_str()) != 0)
+                        std::remove(tmp.c_str());
+                } else {
+                    o.close();
+                    std::remove(tmp.c_str());
+                }
+            }
         }
     }
+
+    lap("12 compute pipelines");
 
     VkCommandPoolCreateInfo cpci{};
     cpci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
@@ -623,9 +722,13 @@ bool PureGpuEncoder::Impl::init() {
         why = "fence"; return false;
     }
 
+    lap("command pool + fence");
+
     if (!allocAll()) return false;
+    lap("buffer alloc + map");
     bindSets();
     uploadWindows();
+    lap("descriptor writes + windows");
 
     why = std::string(props.deviceName) + " (subgroup 32 " +
           (size_ctl ? "pinned" : "by default") + ", shaderInt64, fp32 analysis)";
@@ -645,6 +748,7 @@ void PureGpuEncoder::Impl::destroy() {
         if (pipes[s]) vkDestroyPipeline(dev, pipes[s], nullptr);
         if (mods[s])  vkDestroyShaderModule(dev, mods[s], nullptr);
     }
+    if (pcache) vkDestroyPipelineCache(dev, pcache, nullptr);
     if (fence) vkDestroyFence(dev, fence, nullptr);
     if (cpool) vkDestroyCommandPool(dev, cpool, nullptr);
     if (plo)   vkDestroyPipelineLayout(dev, plo, nullptr);

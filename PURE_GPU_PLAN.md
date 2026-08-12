@@ -665,6 +665,89 @@ Faster everywhere and smaller on all real music; the two synthetic fixtures pay
 for the shallower order search and want `--pg-orders 8` back. Against the first
 working commit this is **2.6-2.8x** on the long fixtures.
 
+## Cross-platform: Intel Arc A380 (Mesa ANV), and a portability bug it exposed
+
+First run of `-P` on anything but Apple. Built for linux/amd64 with
+`docker/Dockerfile.amd64` (bookworm on purpose -- its glibc 2.36 runs on the test
+host's 2.42, which is the direction that works) and shipped to the Debian/Arc
+A380 host.
+
+**It works and it is lossless.** `subgroup 32 pinned, shaderInt64` via
+`VK_EXT_subgroup_size_control`, and every output decoded back on the Mac matches
+the input's audio MD5 and passes `flac -t`.
+
+**But the double-float arithmetic was silently dead there.** The autocorrelation
+came out at **3e-8 relative, not 3e-15** -- no better than plain fp32. Mesa ANV
+reassociates floating point just as MoltenVK's fast math does, so
+`MVK_CONFIG_FAST_MATH_ENABLED=0` had been solving the problem on exactly one
+platform. Because the double-float code adds rounding without adding precision
+when that happens, Intel was getting the *worse* variant.
+
+**The portable fix is the `precise` qualifier**, which emits SPIR-V
+`NoContraction` on the marked expressions. It has to cover every intermediate the
+error terms flow through -- `twoSum`, `twoProd`, `dfNorm` alone was not enough,
+because `dfMul` and `dfDiv` compute their low parts inline and those reassociated
+instead. With all of them marked:
+
+| fixture | Apple | Intel | before, Intel |
+|---|---|---|---|
+| music_10s | 1664755 | 1664758 | 1669227 |
+| MLKDream | 28008006 | 28008003 | — |
+| syn3m_tonal | 11620328 | 11623318 | 12458677 |
+| s24_2s | 298076 | 299477 | 336838 |
+
+The two platforms now agree to within 0.03% on real music and 0.5% on the
+synthetic fixtures, against 7-13% apart before. It is also a **win on Apple**
+(syn3m_tonal -0.50%, s24_2s -0.61%), and it works there with fast math forced back
+*on* -- so `precise` supersedes the MoltenVK setting, which is kept only as belt
+and braces.
+
+### Performance: the A380 is ~12x slower than an M4 Max here
+
+Device timestamps, MLKDream. The CPU side of that host was contended (jellyfin at
+289%, load 7.7) so wall clock is worthless, but the GPU was idle -- jellyfin holds
+no `/dev/dri` descriptors -- so the device numbers stand.
+
+| stage | M4 Max | Arc A380 |
+|---|---|---|
+| sweep | 43.9 ms (49%) | 491 ms (45%) |
+| autoc | 22.8 ms (26%) | 285 ms (26%) |
+| rice | 12.4 ms (14%) | 132 ms (12%) |
+| **total** | **89.4 ms** | **1087 ms** |
+
+The *shape* is portable -- the same three stages in the same proportions -- but the
+absolute speed is 12x apart, more than the ~3.5x raw fp32 ratio between the parts.
+`GPU_PLAN.md` already identified why for this device and it has not been acted on:
+pinning SIMD32 costs the A380 throughput (measured there at 1.5e5 -> 5.27e4
+candidates/s) because the kernel's five NLEV-deep arrays spill at that width, and
+`minSubgroupSize` is 8. The fix is a width-agnostic bit-plane mapping so the
+driver can choose SIMD16.
+
+### What the Arc offers that Apple does not, and whether any of it helps
+
+Queried rather than assumed:
+
+- **`VK_KHR_shader_float_controls2`** -- present. Would let the fast-math mode be
+  set per instruction rather than relying on `precise`; the `precise` fix already
+  works, so this is a fallback if a driver ever ignores `NoContraction`.
+- **`integerDotProduct4x8BitPackedSignedAccelerated = true`** (DP4a). The *only*
+  accelerated integer dot product: 8-bit, 16-bit and 32-bit are all false. The LPC
+  dot product is 15-bit coefficients times up to 25-bit samples, so using it needs
+  limb decomposition -- 6-8 DP4a ops per 4 taps against 4 plain int32 MACs -- and
+  the ablation above already showed the multiplies are not the bottleneck. **No.**
+- **`shaderFloat64 = false`.** No hardware double even on a discrete part (the
+  `true` in `vulkaninfo` is llvmpipe), so double-float emulation remains the only
+  route to precision. No shortcut.
+- **`VK_KHR_shader_subgroup_extended_types`** -- `subgroupAdd` on int64, which is
+  the primitive that was missing when the exact-int64 autocorrelation was
+  rejected. It does not fix that idea's real blocker (windowed values must stay
+  under ~24 bits, impossible at 24-bit input), but it removes one of the two.
+- **48 KB shared memory** against Apple's 32 KB -- the autocorrelation could stage
+  larger tiles, though it is tiled precisely so that it does not have to.
+- **`VK_KHR_cooperative_matrix`** -- present, but it enumerated no configurations
+  here, and the precision available to matrix engines (fp16/int8) suits neither
+  the autocorrelation nor the exact integer residual.
+
 ## How to profile this: use timestamp queries, not serialised submits
 
 `FLACOUT_PG_PROFILE=1` originally fenced after every stage. That is easy and it

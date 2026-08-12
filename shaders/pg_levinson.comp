@@ -69,47 +69,59 @@ layout(push_constant) uniform PC {
 // it were broken the tonal fixtures would not move.
 // ---------------------------------------------------------------------------
 
-vec2 twoSum(float a, float b) {
-    const float s  = a + b;
-    const float bb = s - a;
-    return vec2(s, (a - (s - bb)) + (b - bb));
+// `precise` emits SPIR-V NoContraction, which forbids the compiler fusing and
+// reassociating these expressions. Without it the error terms these two functions
+// exist to compute are simply optimised away -- measured on Mesa ANV (Intel Arc),
+// where the autocorrelation came out at 3e-8 instead of 3e-15, i.e. no better than
+// plain fp32. Apple needed MVK_CONFIG_FAST_MATH_ENABLED=0 for the same reason;
+// this is the portable form of that fix.
+precise vec2 twoSum(float a, float b) {
+    precise float s  = a + b;
+    precise float bb = s - a;
+    precise float e  = (a - (s - bb)) + (b - bb);
+    return vec2(s, e);
 }
 
-vec2 twoProd(float a, float b) {
-    const float p = a * b;
-    return vec2(p, fma(a, b, -p));
+precise vec2 twoProd(float a, float b) {
+    precise float p = a * b;
+    precise float e = fma(a, b, -p);
+    return vec2(p, e);
 }
 
-vec2 dfNorm(float hi, float lo) {
-    const float t = hi + lo;
-    return vec2(t, lo - (t - hi));
+precise vec2 dfNorm(float hi, float lo) {
+    precise float t = hi + lo;
+    precise float e = lo - (t - hi);
+    return vec2(t, e);
 }
 
-vec2 dfAdd(vec2 a, vec2 b) {
-    const vec2 s = twoSum(a.x, b.x);
-    return dfNorm(s.x, s.y + a.y + b.y);
+precise vec2 dfAdd(vec2 a, vec2 b) {
+    precise vec2  s  = twoSum(a.x, b.x);
+    precise float lo = s.y + a.y + b.y;
+    return dfNorm(s.x, lo);
 }
 
 vec2 dfNeg(vec2 a) { return vec2(-a.x, -a.y); }
 
-vec2 dfMul(vec2 a, vec2 b) {
-    const vec2 p = twoProd(a.x, b.x);
-    return dfNorm(p.x, p.y + (a.x * b.y + a.y * b.x));
+precise vec2 dfMul(vec2 a, vec2 b) {
+    precise vec2  p  = twoProd(a.x, b.x);
+    precise float lo = p.y + (a.x * b.y + a.y * b.x);
+    return dfNorm(p.x, lo);
 }
 
-vec2 dfDiv(vec2 a, vec2 b) {
-    const float q1 = a.x / b.x;
-    const vec2  r1 = dfAdd(a, dfNeg(dfMul(vec2(q1, 0.0), b)));
-    const float q2 = r1.x / b.x;
-    const vec2  r2 = dfAdd(r1, dfNeg(dfMul(vec2(q2, 0.0), b)));
-    const float q3 = r2.x / b.x;
-    const vec2  q  = twoSum(q1, q2);
-    return dfNorm(q.x, q.y + q3);
+precise vec2 dfDiv(vec2 a, vec2 b) {
+    precise float q1 = a.x / b.x;
+    precise vec2  r1 = dfAdd(a, dfNeg(dfMul(vec2(q1, 0.0), b)));
+    precise float q2 = r1.x / b.x;
+    precise vec2  r2 = dfAdd(r1, dfNeg(dfMul(vec2(q2, 0.0), b)));
+    precise float q3 = r2.x / b.x;
+    precise vec2  q  = twoSum(q1, q2);
+    precise float lo = q.y + q3;
+    return dfNorm(q.x, lo);
 }
 
 vec2 dfSubgroupAdd(vec2 v) {
     for (uint s = 1u; s < 32u; s <<= 1) {
-        const vec2 o = vec2(subgroupShuffleXor(v.x, s), subgroupShuffleXor(v.y, s));
+        precise vec2 o = vec2(subgroupShuffleXor(v.x, s), subgroupShuffleXor(v.y, s));
         v = dfAdd(v, o);
     }
     return v;

@@ -369,10 +369,12 @@ void PureGpuEncoder::Impl::uploadWindows() {
 }
 
 bool PureGpuEncoder::Impl::init() {
-    // MoltenVK compiles Metal with fast math by default, which reassociates
-    // floating point and therefore *deletes* the error terms the double-float
-    // arithmetic in pg_autoc/pg_levinson is built from: `fma(a, b, -a*b)` folds
-    // to zero and the wider format silently degrades to plain fp32.
+    // Belt and braces. The primary defence is the `precise` qualifier in
+    // pg_autoc/pg_levinson, which emits SPIR-V NoContraction and works on both
+    // MoltenVK and Mesa; this setting predates it and is kept because it costs
+    // nothing. Without either, a driver that reassociates floating point *deletes*
+    // the error terms double-float is built from: `fma(a, b, -a*b)` folds to zero
+    // and the wider format silently degrades to plain fp32.
     //
     // Measured on syn3m_tonal, autocorrelation relative error against a host
     // reference that replicates the device's fp32 windowing exactly:

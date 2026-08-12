@@ -1,0 +1,45 @@
+# Cross-build toolchain for linux/amd64, used to test the Vulkan backends on a
+# machine with a discrete GPU. GPU_PLAN.md described this as an ad-hoc `docker
+# run` against "<image with cmake g++ libvulkan-dev glslang-tools ccache>"; this
+# pins it so the build is reproducible.
+#
+#   docker build --platform linux/amd64 -f docker/Dockerfile.amd64 -t flacout-amd64 .
+#   docker run --rm --platform linux/amd64 -v "$PWD":/src:ro \
+#       -v /tmp/amd64-build:/build -v /tmp/amd64-ccache:/ccache flacout-amd64
+#
+# An earlier session built this same image from a scratchpad file, which is why it
+# was not in the tree: scratchpads do not survive. Committed now.
+#
+# **bookworm on purpose.** Its glibc is 2.36 and the test host's is 2.42, and that
+# is the direction that works -- a binary built against an older glibc runs on a
+# newer one, never the reverse. Do not "modernise" this to trixie without
+# checking the target's glibc first.
+#
+# SPIR-V is embedded into the executable by cmake/embed_spv.cmake, so no shader
+# file has to travel with the binary and none can get out of sync with it.
+#
+# find_package(Vulkan) reports `glslc missing` here, which is fine: CMake falls
+# back to glslangValidator from glslang-tools, which is what glslang-tools
+# provides and what the build is written to accept.
+FROM debian:bookworm-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        ccache \
+        cmake \
+        git \
+        glslang-tools \
+        libvulkan-dev \
+        make \
+    && rm -rf /var/lib/apt/lists/*
+
+# Emulated amd64 on an Apple host is slow enough that a warm ccache is the
+# difference between a coffee and a re-read of libFLAC.
+ENV CCACHE_DIR=/ccache
+
+# The source is mounted read-only and the build tree is a separate volume, so the
+# host's own build directories are never touched.
+WORKDIR /build
+CMD ["sh", "-c", "cmake -S /src -B /build -DCMAKE_BUILD_TYPE=Release -DFLACOUT_VULKAN=ON -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache && cmake --build /build -j$(nproc)"]

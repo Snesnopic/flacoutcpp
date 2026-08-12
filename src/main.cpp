@@ -90,8 +90,11 @@ static void print_usage(const char* prog) {
         << "                       -c/-p/-L/-e/-E/-Q/-b/-a. MD5 stays on a host\n"
         << "                       thread (it cannot be parallelized) and overlaps\n"
         << "                       the encode, so it is free.\n"
-        << "      --pg-block N       Frame size for -P: multiple of 256, <= 4096\n"
-        << "                       (default 4096).\n"
+        << "      --pg-block N       Frame size for -P: multiple of 256, <= 16384\n"
+        << "                       (default 4096, which measured best on real\n"
+        << "                       music). Stationary content wants more: on a\n"
+        << "                       synthetic tonal mix 16384 is -1.9%, while on\n"
+        << "                       real music it is +0.4%.\n"
         << "      --pg-prec L        Comma-separated LPC precisions to sweep\n"
         << "                       (1-4 of them, each 5-15; default 15).\n"
         << "      --pg-orders N      LPC orders swept per (block, signal, window)\n"
@@ -344,8 +347,8 @@ int main(int argc, char* argv[]) {
                 return EXIT_FAILURE;
             }
             if (cfg.pg_block_size % 256 != 0 || cfg.pg_block_size < 256 ||
-                cfg.pg_block_size > 4096) {
-                std::cerr << "Error: --pg-block must be a multiple of 256 in [256, 4096].\n";
+                cfg.pg_block_size > 16384) {
+                std::cerr << "Error: --pg-block must be a multiple of 256 in [256, 16384].\n";
                 return EXIT_FAILURE;
             }
 

@@ -397,8 +397,11 @@ bool PureGpuEncoder::Impl::init() {
     };
     // ---- shape -----------------------------------------------------------
     B = cfg.block_size;
-    if (B % 256 != 0 || B > 4096 || B < 256) {
-        why = "block size must be a multiple of 256 in [256, 4096]";
+    // 256 keeps pg_pack's per-lane chunk (B/256) no larger than the smallest Rice
+    // partition; 16384 is the largest size FLAC's 4-bit block-size code names
+    // directly and the largest the CPU's DP ladder uses.
+    if (B % 256 != 0 || B > 16384 || B < 256) {
+        why = "block size must be a multiple of 256 in [256, 16384]";
         return false;
     }
     if (nch < 1 || nch > 2) { why = "pure-GPU path supports 1 or 2 channels"; return false; }
@@ -415,6 +418,11 @@ bool PureGpuEncoder::Impl::init() {
     lpcSlots = nwin * MAXO * nprec;
     ncand    = lpcSlots + NFIXED;
     maxBlk   = std::max(1u, std::min(cfg.blocks_per_chunk, 1024u));
+    // Bound a chunk by samples, not frames, so a large block size does not
+    // quietly multiply every buffer. ~1M samples per channel-signal keeps the
+    // working set where it was measured.
+    const uint32_t budget = std::max(1u, 1048576u / B);
+    maxBlk = std::max(1u, std::min(maxBlk, budget));
     if (const char* r = std::getenv("FLACOUT_PG_RIDGE")) ridge = (float)atof(r);
     norders = (int)std::max(1u, std::min(cfg.orders, 32u));
     profile = std::getenv("FLACOUT_PG_PROFILE") != nullptr;

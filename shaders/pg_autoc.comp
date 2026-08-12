@@ -26,8 +26,14 @@
 //    Error grows with the depth of the tree (~log B), not with B.
 
 #define LOCAL 256
-#define MAXB  4096
 #define NLAG  33
+// The block is walked in tiles rather than staged whole, so the block size is not
+// bounded by shared memory. A tile carries a NLAG-1 halo because lag l needs
+// x[i+l], and the halo is why each sample is read ~1.016 times rather than once.
+// 4096 was the old ceiling (16 KB of floats); FLAC's real ceiling is 65535 and
+// the DP-relevant sizes go to 16384.
+#define TILE  2048
+#define SHMEM (TILE + NLAG - 1)
 
 layout(local_size_x = LOCAL) in;
 
@@ -107,7 +113,7 @@ vec2 dfDiv(vec2 a, vec2 b) {
     return dfNorm(q.x, q.y + q3);
 }
 
-shared float wnd[MAXB];
+shared float wnd[SHMEM];
 shared vec2  part[(LOCAL / 32) * NLAG];
 
 // Butterfly all-reduce over a hi/lo pair. subgroupAdd cannot be used: the two
@@ -129,22 +135,27 @@ void main() {
 
     const int src = (sgi * pc.nblk + blk) * B;
 
-    for (int i = t; i < B; i += LOCAL)
-        wnd[i] = float(sig[src + i]) * pc.scale * win[w * B + i];
-    barrier();
-
     // The products are made exact by twoProd and the accumulation is exact to
     // ~48 bits, so what reaches Levinson is the autocorrelation of the fp32
     // windowed block rather than an approximation of it.
     vec2 acc[NLAG];
     for (int l = 0; l < NLAG; ++l) acc[l] = vec2(0.0);
 
-    for (int i = t; i < B; i += LOCAL) {
-        const float x = wnd[i];
-        for (int l = 0; l < NLAG; ++l) {
-            const int j = i + l;
-            if (j < B) acc[l] = dfAdd(acc[l], twoProd(x, wnd[j]));
+    for (int t0 = 0; t0 < B; t0 += TILE) {
+        const int have = min(SHMEM, B - t0);
+        for (int i = t; i < have; i += LOCAL)
+            wnd[i] = float(sig[src + t0 + i]) * pc.scale * win[w * B + t0 + i];
+        barrier();
+
+        const int lim = min(TILE, B - t0);
+        for (int i = t; i < lim; i += LOCAL) {
+            const float x = wnd[i];
+            for (int l = 0; l < NLAG; ++l)
+                if (t0 + i + l < B)
+                    acc[l] = dfAdd(acc[l], twoProd(x, wnd[i + l]));
         }
+        // Required before the next tile overwrites the staging area.
+        barrier();
     }
 
     const uint sgid = gl_SubgroupID;

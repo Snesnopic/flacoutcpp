@@ -591,6 +591,72 @@ arithmetic is nearly free. Device total 91.6 → 104.4 ms; master mix wall clock
 better than anything on the CPU's own frontier, where the whole estimated-DP dial
 spans ~0.1% for 6.4x.
 
+## Block size: the cap was worth raising, a device-side DP is not
+
+The residual gap after the double-float fix was ~3.9%, of which the fixed
+partition looked like ~1.9%. Measured before building anything, and the numbers
+said something different from what was expected.
+
+**What a variable partition is actually worth.** CPU, fixed 4096 against its own
+DP ladder — and note CLAUDE.md trap 10 forbids the master mix here, since its 188
+artificial splices flatter anything that prices block boundaries:
+
+| fixture | fixed 4096 | variable DP | prize |
+|---|---|---|---|
+| music_10s | 1658877 | 1661262 | **-0.14%** |
+| music_20s | 3418654 | 3422229 | **-0.10%** |
+| album track | 26582623 | 26540185 | +0.16% |
+| MLKDream | 27879091 | 27717435 | +0.58% |
+| syn3m_mix | 14041475 | 13768845 | +1.94% |
+
+On two real fixtures the CPU's *estimated* variable DP is **worse than just using
+4096**, which is consistent with the 0.65% partition regret CLAUDE.md documents
+for the estimator. Held at exact DP instead (`-e -c 8 -L 1`, fixed vs ladder) the
+honest ceiling is **0.30% (music_10s) and 0.38% (music_20s)**.
+
+**And a fixed size cannot capture it.** Sweeping the CPU across fixed sizes:
+
+| fixture | b4096 | b8192 | b16384 | variable |
+|---|---|---|---|---|
+| music_10s | **1658877** | 1661637 | 1665603 | 1661262 |
+| MLKDream | 27879091 | 27906511 | 27989814 | **27717435** |
+| syn3m_mix | 14041475 | 13861552 | **13770499** | 13768845 |
+
+So syn3m_mix's entire 1.9% is just "use 16384", while MLKDream's 0.58% needs a
+genuine *mixture* — its DP picks 1024 (1160 frames), 2048 (1925), 4096 (1447),
+8192 (516) and 16384 (396).
+
+**Conclusion, and it is a decision not to build.** A device-side DP over
+{4096, 8192, 16384} on a 4096 grid costs **~7x the analysis work** — the spans do
+not share windows or autocorrelations, so work is `sum over sizes of
+total_samples * S/step`. Seven times the analysis for a measured ceiling of
+0.30-0.58% on real music would make `-P` slower than the CPU path it is currently
+6x faster than. The full `{1024..16384}` ladder the CPU uses is 31x. Not worth
+it, and this is the number to re-check before anyone tries.
+
+**What was worth doing** is removing the arbitrary 4096 cap, which existed only
+because `pg_autoc` staged the whole windowed block in 16 KB of shared memory. It
+now walks the block in 2048-sample tiles with a 32-sample halo (lag l needs
+x[i+l]), so each sample is read ~1.016 times and any size up to 16384 works.
+Verified output-neutral at 4096 on four fixtures, and lossless at 256, 1024,
+4096, 8192 and 16384 across all 18.
+
+`-P` sizes with the cap raised:
+
+| fixture | 4096 | 8192 | 16384 |
+|---|---|---|---|
+| music_10s | **1664955** | 1679087 | 1706676 |
+| MLKDream | 28027341 | **27998911** | 28061945 |
+| syn3m_mix | 14594422 | 14438215 | **14342723** |
+
+Default stays 4096 — it is best on real music, and 16384 costs +0.4% there. It
+costs ~10-15% more time as well, since chunk buffers are bounded by samples
+rather than frames.
+
+Note what the syn3m_mix column says about the *remaining* gap: at 4096 it is
++3.9% against the CPU and at 16384 it is +4.2%. The gap is flat in block size, so
+what is left is search depth and analysis, not the partition.
+
 ## Build order
 
 Each step ends somewhere testable. Do not skip to step 4.

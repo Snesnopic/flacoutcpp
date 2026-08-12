@@ -81,47 +81,67 @@ layout(push_constant) uniform PC {
 // where the autocorrelation came out at 3e-8 instead of 3e-15, i.e. no better than
 // plain fp32. Apple needed MVK_CONFIG_FAST_MATH_ENABLED=0 for the same reason;
 // this is the portable form of that fix.
-precise vec2 twoSum(float a, float b) {
-    precise float s  = a + b;
-    precise float bb = s - a;
-    precise float e  = (a - (s - bb)) + (b - bb);
+//
+// **It is also expensive, and only where it is redundant does it pay to drop it.**
+// On a driver that already leaves fp32 alone (Apple, with the MoltenVK fast-math
+// knob off) NoContraction buys no accuracy and costs 5x in this kernel:
+//
+//   master mix, device timestamps    autoc 173.8 ms -> 33.8 ms, wall 0.260 -> 0.120 s
+//   MLKDream                         autoc 110   ms -> 15.0 ms, wall 0.220 -> 0.130 s
+//
+// with **byte-identical output** on both, which is what says the two variants are
+// the same computation there rather than a size/speed trade. So this file is
+// compiled twice -- once as-is, once with PG_NO_PRECISE -- and the host picks
+// between them by *probing the driver* (shaders/pg_probe.comp) rather than by
+// recognising it. A driver that reassociates gets the safe variant; one that does
+// not gets the fast one. See PureGpuEncoder::Impl::probeDoubleFloat.
+#ifdef PG_NO_PRECISE
+#define PRE
+#else
+#define PRE precise
+#endif
+
+PRE vec2 twoSum(float a, float b) {
+    PRE float s  = a + b;
+    PRE float bb = s - a;
+    PRE float e  = (a - (s - bb)) + (b - bb);
     return vec2(s, e);
 }
 
-precise vec2 twoProd(float a, float b) {
-    precise float p = a * b;
-    precise float e = fma(a, b, -p);
+PRE vec2 twoProd(float a, float b) {
+    PRE float p = a * b;
+    PRE float e = fma(a, b, -p);
     return vec2(p, e);
 }
 
-precise vec2 dfNorm(float hi, float lo) {
-    precise float t = hi + lo;
-    precise float e = lo - (t - hi);
+PRE vec2 dfNorm(float hi, float lo) {
+    PRE float t = hi + lo;
+    PRE float e = lo - (t - hi);
     return vec2(t, e);
 }
 
-precise vec2 dfAdd(vec2 a, vec2 b) {
-    precise vec2  s  = twoSum(a.x, b.x);
-    precise float lo = s.y + a.y + b.y;
+PRE vec2 dfAdd(vec2 a, vec2 b) {
+    PRE vec2  s  = twoSum(a.x, b.x);
+    PRE float lo = s.y + a.y + b.y;
     return dfNorm(s.x, lo);
 }
 
 vec2 dfNeg(vec2 a) { return vec2(-a.x, -a.y); }
 
-precise vec2 dfMul(vec2 a, vec2 b) {
-    precise vec2  p  = twoProd(a.x, b.x);
-    precise float lo = p.y + (a.x * b.y + a.y * b.x);
+PRE vec2 dfMul(vec2 a, vec2 b) {
+    PRE vec2  p  = twoProd(a.x, b.x);
+    PRE float lo = p.y + (a.x * b.y + a.y * b.x);
     return dfNorm(p.x, lo);
 }
 
-precise vec2 dfDiv(vec2 a, vec2 b) {
-    precise float q1 = a.x / b.x;
-    precise vec2  r1 = dfAdd(a, dfNeg(dfMul(vec2(q1, 0.0), b)));
-    precise float q2 = r1.x / b.x;
-    precise vec2  r2 = dfAdd(r1, dfNeg(dfMul(vec2(q2, 0.0), b)));
-    precise float q3 = r2.x / b.x;
-    precise vec2  q  = twoSum(q1, q2);
-    precise float lo = q.y + q3;
+PRE vec2 dfDiv(vec2 a, vec2 b) {
+    PRE float q1 = a.x / b.x;
+    PRE vec2  r1 = dfAdd(a, dfNeg(dfMul(vec2(q1, 0.0), b)));
+    PRE float q2 = r1.x / b.x;
+    PRE vec2  r2 = dfAdd(r1, dfNeg(dfMul(vec2(q2, 0.0), b)));
+    PRE float q3 = r2.x / b.x;
+    PRE vec2  q  = twoSum(q1, q2);
+    PRE float lo = q.y + q3;
     return dfNorm(q.x, lo);
 }
 
@@ -132,7 +152,7 @@ shared vec2  part[(LOCAL / 32) * NLAG];
 // halves have to be combined together, not independently.
 vec2 dfSubgroupAdd(vec2 v) {
     for (uint s = 1u; s < 32u; s <<= 1) {
-        precise vec2 o = vec2(subgroupShuffleXor(v.x, s), subgroupShuffleXor(v.y, s));
+        PRE vec2 o = vec2(subgroupShuffleXor(v.x, s), subgroupShuffleXor(v.y, s));
         v = dfAdd(v, o);
     }
     return v;

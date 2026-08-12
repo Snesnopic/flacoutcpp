@@ -45,6 +45,8 @@ bool PureGpuEncoder::encode(const std::vector<std::vector<int32_t>>&,
 #include "pg_frame_spv.h"
 #include "pg_pack_spv.h"
 #include "pg_crc_spv.h"
+#include "pg_probe_spv.h"
+#include "pg_autoc_fast_spv.h"
 
 namespace flacoutcpp {
 
@@ -96,11 +98,26 @@ const StageDef kStages[S_COUNT] = {
     {"crc",      kPgCrcSpv,      sizeof(kPgCrcSpv),      2, {B_FINFO, B_OUT}},
 };
 
+// Extra pipelines that are not pipeline *stages*: the init-time fp32 probe and
+// the alternative build of pg_autoc it chooses between.
+enum Extra { X_PROBE = 0, X_AUTOC_FAST, X_COUNT };
+
+// Two chunk slots, so the host's work on one chunk overlaps the device's work on
+// the other. Only the buffers the *host* touches are duplicated -- it stages PCM
+// for chunk i while the device runs chunk i-1, and writes chunk i-1's output
+// while the device runs chunk i. Everything in between is intermediate state that
+// only one chunk is ever using, because a chunk is not submitted until the
+// previous one's fence has signalled.
+constexpr int NSLOT = 2;
+
 struct Buffer {
     VkBuffer       buf  = VK_NULL_HANDLE;
     VkDeviceMemory mem  = VK_NULL_HANDLE;
     void*          map  = nullptr;
     VkDeviceSize   size = 0;
+    /// False for the second slot's view of a buffer that is not duplicated: the
+    /// handle is shared with slot 0 and must not be destroyed twice.
+    bool           owns = true;
 };
 
 // FLAC's 4-bit block-size code, plus the trailing field for sizes it cannot
@@ -237,14 +254,25 @@ struct PureGpuEncoder::Impl {
     double                ts_period = 1.0;   // ns per tick
     bool                  ts_ok = false;
     VkCommandPool         cpool = VK_NULL_HANDLE;
-    VkCommandBuffer       cmd  = VK_NULL_HANDLE;
-    VkFence               fence = VK_NULL_HANDLE;
+    VkCommandBuffer       cmd[NSLOT]{};
+    VkFence               fence[NSLOT]{};
 
-    VkShaderModule  mods[S_COUNT]{};
-    VkPipeline      pipes[S_COUNT]{};
-    VkDescriptorSet dsets[S_COUNT]{};
+    VkShaderModule  mods[S_COUNT + X_COUNT]{};
+    VkPipeline      pipes[S_COUNT + X_COUNT]{};
+    VkDescriptorSet dsets[NSLOT][S_COUNT]{};
+    VkDescriptorSet probe_set = VK_NULL_HANDLE;
+    /// Set by the probe: true when this driver preserves the double-float error
+    /// terms without NoContraction, i.e. the fast pg_autoc build is exact here.
+    bool            df_native = false;
+    /// The `precise` build of pg_autoc, kept so destroy() can undo the aliasing
+    /// the probe may have done to pipes[S_AUTOC].
+    VkPipeline      autoc_safe = VK_NULL_HANDLE;
+    /// Off while profiling: the serialised-submit mode fences inside the
+    /// recording, and the timestamp pool is single, so neither survives two
+    /// chunks being in flight. Profiling runs are for shares, not wall clock.
+    bool            pipelined = true;
 
-    Buffer bufs[B_COUNT];
+    Buffer bufs[NSLOT][B_COUNT];
 
     bool init();
     void destroy();
@@ -253,9 +281,14 @@ struct PureGpuEncoder::Impl {
     bool allocAll();
     void bindSets();
     void uploadWindows();
-    bool runChunk(const std::vector<std::vector<int32_t>>& pcm,
-                  uint64_t firstSample, uint32_t nblkThis,
-                  uint32_t* outBytes);
+    bool probeDoubleFloat();
+    /// Copy this chunk's PCM into slot `sl`. Host-side and independent of the
+    /// device, which is the whole point of having two slots.
+    void stagePcm(int sl, const std::vector<std::vector<int32_t>>& pcm,
+                  uint64_t firstSample, uint32_t chunkLen);
+    bool submitChunk(int sl, uint64_t firstSample, uint32_t nblkThis);
+    bool finishChunk(int sl, uint64_t firstSample, uint32_t nblkThis,
+                     uint32_t* outBytes);
 };
 
 uint32_t PureGpuEncoder::Impl::findMem(uint32_t bits, VkMemoryPropertyFlags want) const {
@@ -321,22 +354,40 @@ bool PureGpuEncoder::Impl::allocAll() {
         {B_RES,   nb * nsub * B * 4},
         {B_SFP,   nb * nsub * SFP_STRIDE * 4},
         {B_FINFO, nb * FINFO_STRIDE * 4},
-        {B_TOTAL, 16},
+        {B_TOTAL, 64},   // pg_layout uses [0]; the init-time fp32 probe uses [0..4]
         {B_ERR,   solv * NLAG * 4},
         {B_OUT,   outN},
     };
     uint64_t total = 0;
     for (auto& w : want) {
-        if (!alloc(bufs[w.id], w.bytes)) { why = "device buffer allocation failed"; return false; }
+        if (!alloc(bufs[0][w.id], w.bytes)) { why = "device buffer allocation failed"; return false; }
         total += w.bytes;
+    }
+    // Slot 1 shares every buffer except the two the host touches while the device
+    // is running: it stages PCM into one slot while the other is being read, and
+    // reads packed output out of one while the other is being written.
+    for (int i = 0; i < B_COUNT; ++i) {
+        bufs[1][i] = bufs[0][i];
+        bufs[1][i].owns = false;
+    }
+    if (pipelined) {
+        for (int id : {B_PCM, B_OUT}) {
+            bufs[1][id] = Buffer{};
+            if (!alloc(bufs[1][id], bufs[0][id].size)) {
+                why = "device buffer allocation failed"; return false;
+            }
+            total += bufs[0][id].size;
+        }
     }
     if (cfg.verbose)
         std::cout << "Pure GPU: " << (total >> 20) << " MB device buffers for "
-                  << maxBlk << "-frame chunks\n";
+                  << maxBlk << "-frame chunks"
+                  << (pipelined ? " (2 slots)" : "") << "\n";
     return true;
 }
 
 void PureGpuEncoder::Impl::bindSets() {
+    for (int sl = 0; sl < NSLOT; ++sl)
     for (int s = 0; s < S_COUNT; ++s) {
         VkDescriptorBufferInfo dbi[MAXBIND]{};
         VkWriteDescriptorSet   wr[MAXBIND]{};
@@ -346,10 +397,10 @@ void PureGpuEncoder::Impl::bindSets() {
             // unbound-but-declared binding is undefined behaviour even when the
             // shader never reads it.
             const int b = (i < kStages[s].nbind) ? kStages[s].bind[i] : B_TOTAL;
-            dbi[i].buffer = bufs[b].buf;
+            dbi[i].buffer = bufs[sl][b].buf;
             dbi[i].range  = VK_WHOLE_SIZE;
             wr[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            wr[i].dstSet = dsets[s];
+            wr[i].dstSet = dsets[sl][s];
             wr[i].dstBinding = (uint32_t)i;
             wr[i].descriptorCount = 1;
             wr[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -357,11 +408,68 @@ void PureGpuEncoder::Impl::bindSets() {
         }
         vkUpdateDescriptorSets(dev, MAXBIND, wr, 0, nullptr);
     }
+    // The probe reads and writes one small buffer; every binding points at it.
+    VkDescriptorBufferInfo pdbi[MAXBIND]{};
+    VkWriteDescriptorSet   pwr[MAXBIND]{};
+    for (int i = 0; i < MAXBIND; ++i) {
+        pdbi[i].buffer = bufs[0][B_TOTAL].buf;
+        pdbi[i].range  = VK_WHOLE_SIZE;
+        pwr[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        pwr[i].dstSet = probe_set;
+        pwr[i].dstBinding = (uint32_t)i;
+        pwr[i].descriptorCount = 1;
+        pwr[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        pwr[i].pBufferInfo = &pdbi[i];
+    }
+    vkUpdateDescriptorSets(dev, MAXBIND, pwr, 0, nullptr);
+}
+
+// Ask the device whether it preserves the error terms the double-float
+// arithmetic is made of, by running the fast variant's own expressions on values
+// whose exact results are known to be inexact in fp32. A driver that
+// reassociates folds both error terms to zero and needs the `precise` build;
+// one that does not gets the 5x-cheaper build for identical output.
+//
+// This is a question about the *compiler*, not the vendor, which is why it is
+// asked rather than looked up: MoltenVK answers differently depending on
+// MVK_CONFIG_FAST_MATH_ENABLED, including when a user sets it by hand.
+bool PureGpuEncoder::Impl::probeDoubleFloat() {
+    uint32_t* d = (uint32_t*)bufs[0][B_TOTAL].map;
+    const float pa = 1.4142135f, pb = 1.7320508f;   // product needs > 24 bits
+    const float sa = 1.0f,       sb = 1e-8f;        // sum loses sb entirely
+    std::memcpy(&d[0], &pa, 4);
+    std::memcpy(&d[1], &pb, 4);
+    std::memcpy(&d[2], &sa, 4);
+    std::memcpy(&d[3], &sb, 4);
+    d[4] = 1u;   // "needs precise" unless the probe says otherwise
+
+    VkCommandBufferBeginInfo bi{};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkResetCommandBuffer(cmd[0], 0);
+    vkBeginCommandBuffer(cmd[0], &bi);
+    vkCmdBindPipeline(cmd[0], VK_PIPELINE_BIND_POINT_COMPUTE, pipes[S_COUNT + X_PROBE]);
+    vkCmdBindDescriptorSets(cmd[0], VK_PIPELINE_BIND_POINT_COMPUTE, plo, 0, 1,
+                            &probe_set, 0, nullptr);
+    vkCmdDispatch(cmd[0], 1, 1, 1);
+    vkEndCommandBuffer(cmd[0]);
+
+    VkSubmitInfo si{};
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd[0];
+    vkResetFences(dev, 1, &fence[0]);
+    if (vkQueueSubmit(queue, 1, &si, fence[0]) != VK_SUCCESS) return false;
+    if (vkWaitForFences(dev, 1, &fence[0], VK_TRUE, UINT64_MAX) != VK_SUCCESS) return false;
+
+    df_native = (d[4] == 0u);
+    d[0] = d[1] = d[2] = d[3] = d[4] = 0u;   // pg_layout owns d[0] from here
+    return true;
 }
 
 void PureGpuEncoder::Impl::uploadWindows() {
     std::vector<double> tmp(B);
-    float* dst = (float*)bufs[B_WIN].map;
+    float* dst = (float*)bufs[0][B_WIN].map;
     for (int w = 0; w < nwin; ++w) {
         window_coefficients(cfg.windows[w], B, tmp.data());
         for (uint32_t i = 0; i < B; ++i) dst[w * B + i] = (float)tmp[i];
@@ -436,6 +544,12 @@ bool PureGpuEncoder::Impl::init() {
     if (const char* r = std::getenv("FLACOUT_PG_RIDGE")) ridge = (float)atof(r);
     norders = (int)std::max(1u, std::min(cfg.orders, 32u));
     profile = std::getenv("FLACOUT_PG_PROFILE") != nullptr;
+    // Two chunks in flight and a per-stage fence (or a single timestamp pool)
+    // cannot both be true, and profiling is the one that has to win: its numbers
+    // are read as shares of device time, not as wall clock.
+    // FLACOUT_PG_NOPIPE=1 puts the host back in the device's way, which is how
+    // the two-slot change is measured rather than asserted.
+    pipelined = !profile && std::getenv("FLACOUT_PG_NOPIPE") == nullptr;
     pcap = (int)std::max(1u, std::min(cfg.partition_cap, 8u));
     if (const char* c = std::getenv("FLACOUT_PG_PCAP"))
         pcap = std::max(1, std::min(8, atoi(c)));
@@ -607,22 +721,25 @@ bool PureGpuEncoder::Impl::init() {
     if (vkCreateDescriptorSetLayout(dev, &dslci, nullptr, &dsl) != VK_SUCCESS) {
         why = "descriptor set layout"; return false;
     }
-    VkDescriptorPoolSize psz{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, MAXBIND * S_COUNT};
+    const uint32_t nsets = NSLOT * S_COUNT + 1;   // +1 for the fp32 probe
+    VkDescriptorPoolSize psz{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, MAXBIND * nsets};
     VkDescriptorPoolCreateInfo dpci{};
     dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    dpci.maxSets = S_COUNT;
+    dpci.maxSets = nsets;
     dpci.poolSizeCount = 1;
     dpci.pPoolSizes = &psz;
     if (vkCreateDescriptorPool(dev, &dpci, nullptr, &dpool) != VK_SUCCESS) {
         why = "descriptor pool"; return false;
     }
-    for (int s = 0; s < S_COUNT; ++s) {
+    for (uint32_t i = 0; i < nsets; ++i) {
         VkDescriptorSetAllocateInfo dsai{};
         dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
         dsai.descriptorPool = dpool;
         dsai.descriptorSetCount = 1;
         dsai.pSetLayouts = &dsl;
-        if (vkAllocateDescriptorSets(dev, &dsai, &dsets[s]) != VK_SUCCESS) {
+        VkDescriptorSet* dst = (i < NSLOT * S_COUNT)
+            ? &dsets[i / S_COUNT][i % S_COUNT] : &probe_set;
+        if (vkAllocateDescriptorSets(dev, &dsai, dst) != VK_SUCCESS) {
             why = "descriptor set"; return false;
         }
     }
@@ -679,14 +796,24 @@ bool PureGpuEncoder::Impl::init() {
     if (vkCreatePipelineCache(dev, &pcci, nullptr, &pcache) != VK_SUCCESS)
         pcache = VK_NULL_HANDLE;   // not fatal; just means every run compiles
 
-    std::vector<VkComputePipelineCreateInfo> cpis(S_COUNT);
-    for (int s = 0; s < S_COUNT; ++s) {
+    // The two extras ride along in the same batched create: the probe, and the
+    // NoContraction-free build of pg_autoc that the probe may select.
+    struct { const char* name; const uint32_t* spv; size_t bytes; } extra[X_COUNT] = {
+        {"probe",      kPgProbeSpv,     sizeof(kPgProbeSpv)},
+        {"autoc-fast", kPgAutocFastSpv, sizeof(kPgAutocFastSpv)},
+    };
+    std::vector<VkComputePipelineCreateInfo> cpis(S_COUNT + X_COUNT);
+    for (int s = 0; s < S_COUNT + X_COUNT; ++s) {
+        const bool is_extra = s >= S_COUNT;
+        const char*     nm  = is_extra ? extra[s - S_COUNT].name  : kStages[s].name;
+        const uint32_t* sp  = is_extra ? extra[s - S_COUNT].spv   : kStages[s].spv;
+        const size_t    nby = is_extra ? extra[s - S_COUNT].bytes : kStages[s].spvBytes;
         VkShaderModuleCreateInfo smci{};
         smci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-        smci.codeSize = kStages[s].spvBytes;
-        smci.pCode    = kStages[s].spv;
+        smci.codeSize = nby;
+        smci.pCode    = sp;
         if (vkCreateShaderModule(dev, &smci, nullptr, &mods[s]) != VK_SUCCESS) {
-            why = std::string("shader module: ") + kStages[s].name; return false;
+            why = std::string("shader module: ") + nm; return false;
         }
         auto& cpi = cpis[s];
         cpi = VkComputePipelineCreateInfo{};
@@ -703,8 +830,8 @@ bool PureGpuEncoder::Impl::init() {
         }
         cpi.layout = plo;
     }
-    if (vkCreateComputePipelines(dev, pcache, (uint32_t)S_COUNT, cpis.data(),
-                                 nullptr, pipes) != VK_SUCCESS) {
+    if (vkCreateComputePipelines(dev, pcache, (uint32_t)(S_COUNT + X_COUNT),
+                                 cpis.data(), nullptr, pipes) != VK_SUCCESS) {
         why = std::string(props.deviceName) + ": compute pipeline creation failed";
         return false;
     }
@@ -739,7 +866,9 @@ bool PureGpuEncoder::Impl::init() {
         }
     }
 
-    lap("12 compute pipelines");
+    autoc_safe = pipes[S_AUTOC];
+
+    lap("14 compute pipelines");
 
     VkCommandPoolCreateInfo cpci{};
     cpci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
@@ -752,15 +881,16 @@ bool PureGpuEncoder::Impl::init() {
     cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     cbai.commandPool = cpool;
     cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cbai.commandBufferCount = 1;
-    if (vkAllocateCommandBuffers(dev, &cbai, &cmd) != VK_SUCCESS) {
+    cbai.commandBufferCount = NSLOT;
+    if (vkAllocateCommandBuffers(dev, &cbai, cmd) != VK_SUCCESS) {
         why = "command buffer"; return false;
     }
     VkFenceCreateInfo fci{};
     fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-    if (vkCreateFence(dev, &fci, nullptr, &fence) != VK_SUCCESS) {
-        why = "fence"; return false;
-    }
+    for (int i = 0; i < NSLOT; ++i)
+        if (vkCreateFence(dev, &fci, nullptr, &fence[i]) != VK_SUCCESS) {
+            why = "fence"; return false;
+        }
 
     // Timestamp queries need the queue family to support them (timestampValidBits
     // != 0) and a nonzero period to convert ticks to nanoseconds.
@@ -787,8 +917,16 @@ bool PureGpuEncoder::Impl::init() {
     uploadWindows();
     lap("descriptor writes + windows");
 
+    // Ask the driver whether the cheap pg_autoc is exact here, and bind whichever
+    // build the answer calls for. A probe failure leaves df_native false, i.e.
+    // the safe variant -- the same choice as before this existed.
+    probeDoubleFloat();
+    if (df_native) pipes[S_AUTOC] = pipes[S_COUNT + X_AUTOC_FAST];
+    lap("fp32 probe");
+
     why = std::string(props.deviceName) + " (subgroup 32 " +
-          (size_ctl ? "pinned" : "by default") + ", shaderInt64, fp32 analysis)";
+          (size_ctl ? "pinned" : "by default") + ", shaderInt64, fp32 analysis, " +
+          (df_native ? "df native" : "df via NoContraction") + ")";
     ok = true;
     return true;
 }
@@ -796,18 +934,25 @@ bool PureGpuEncoder::Impl::init() {
 void PureGpuEncoder::Impl::destroy() {
     if (dev == VK_NULL_HANDLE) { if (inst) vkDestroyInstance(inst, nullptr); return; }
     vkDeviceWaitIdle(dev);
-    for (int i = 0; i < B_COUNT; ++i) {
-        if (bufs[i].map) vkUnmapMemory(dev, bufs[i].mem);
-        if (bufs[i].buf) vkDestroyBuffer(dev, bufs[i].buf, nullptr);
-        if (bufs[i].mem) vkFreeMemory(dev, bufs[i].mem, nullptr);
-    }
-    for (int s = 0; s < S_COUNT; ++s) {
+    for (int sl = 0; sl < NSLOT; ++sl)
+        for (int i = 0; i < B_COUNT; ++i) {
+            // Slot 1 mostly holds non-owning copies of slot 0's handles.
+            if (!bufs[sl][i].owns) continue;
+            if (bufs[sl][i].map) vkUnmapMemory(dev, bufs[sl][i].mem);
+            if (bufs[sl][i].buf) vkDestroyBuffer(dev, bufs[sl][i].buf, nullptr);
+            if (bufs[sl][i].mem) vkFreeMemory(dev, bufs[sl][i].mem, nullptr);
+        }
+    // The probe may have aliased pipes[S_AUTOC] onto the fast build; put the
+    // original handle back so neither is destroyed twice or leaked.
+    if (autoc_safe) pipes[S_AUTOC] = autoc_safe;
+    for (int s = 0; s < S_COUNT + X_COUNT; ++s) {
         if (pipes[s]) vkDestroyPipeline(dev, pipes[s], nullptr);
         if (mods[s])  vkDestroyShaderModule(dev, mods[s], nullptr);
     }
     if (qpool)  vkDestroyQueryPool(dev, qpool, nullptr);
     if (pcache) vkDestroyPipelineCache(dev, pcache, nullptr);
-    if (fence) vkDestroyFence(dev, fence, nullptr);
+    for (int i = 0; i < NSLOT; ++i)
+        if (fence[i]) vkDestroyFence(dev, fence[i], nullptr);
     if (cpool) vkDestroyCommandPool(dev, cpool, nullptr);
     if (plo)   vkDestroyPipelineLayout(dev, plo, nullptr);
     if (dpool) vkDestroyDescriptorPool(dev, dpool, nullptr);
@@ -837,20 +982,23 @@ inline uint32_t ceilDiv(uint64_t a, uint64_t b) { return (uint32_t)((a + b - 1) 
 
 } // namespace
 
-bool PureGpuEncoder::Impl::runChunk(
-    const std::vector<std::vector<int32_t>>& pcm,
-    uint64_t firstSample, uint32_t nblkThis, uint32_t* outBytes)
+void PureGpuEncoder::Impl::stagePcm(
+    int sl, const std::vector<std::vector<int32_t>>& pcm,
+    uint64_t firstSample, uint32_t chunkLen)
+{
+    int32_t* dst = (int32_t*)bufs[sl][B_PCM].map;
+    for (uint32_t c = 0; c < nch; ++c)
+        std::memcpy(dst + (size_t)c * chunkLen,
+                    pcm[c].data() + firstSample,
+                    (size_t)chunkLen * sizeof(int32_t));
+}
+
+// Record and submit one chunk. Nothing here waits: the caller does host work --
+// staging the next chunk, writing the last one's bytes -- while this runs.
+bool PureGpuEncoder::Impl::submitChunk(int sl, uint64_t firstSample,
+                                       uint32_t nblkThis)
 {
     const uint32_t chunkLen = nblkThis * B;
-
-    // ---- upload PCM (planar) ---------------------------------------------
-    {
-        int32_t* dst = (int32_t*)bufs[B_PCM].map;
-        for (uint32_t c = 0; c < nch; ++c)
-            std::memcpy(dst + (size_t)c * chunkLen,
-                        pcm[c].data() + firstSample,
-                        (size_t)chunkLen * sizeof(int32_t));
-    }
 
     uint32_t bsExtraVal, srExtraVal; int bsExtraBits, srExtraBits;
     const uint8_t bsCode = blocksizeCode(B, bsExtraVal, bsExtraBits);
@@ -863,20 +1011,20 @@ bool PureGpuEncoder::Impl::runChunk(
     VkCommandBufferBeginInfo bi{};
     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkResetCommandBuffer(cmd, 0);
-    vkBeginCommandBuffer(cmd, &bi);
+    vkResetCommandBuffer(cmd[sl], 0);
+    vkBeginCommandBuffer(cmd[sl], &bi);
 
     int tsIdx = 0;
     if (ts_ok) {
-        vkCmdResetQueryPool(cmd, qpool, 0, S_COUNT + 1);
-        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+        vkCmdResetQueryPool(cmd[sl], qpool, 0, S_COUNT + 1);
+        vkCmdWriteTimestamp(cmd[sl], VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                             qpool, (uint32_t)tsIdx++);
     }
 
     // The packer ORs bits into this buffer, so it has to start at zero -- which
     // is also what makes a unary run's zeros free.
-    vkCmdFillBuffer(cmd, bufs[B_OUT].buf, 0, VK_WHOLE_SIZE, 0);
-    barrier(cmd);
+    vkCmdFillBuffer(cmd[sl], bufs[sl][B_OUT].buf, 0, VK_WHOLE_SIZE, 0);
+    barrier(cmd[sl]);
 
     // FLACOUT_PG_PROFILE: submit each stage on its own and fence-wait, so the
     // per-stage cost is visible. It serialises the queue and adds a submit per
@@ -884,37 +1032,37 @@ bool PureGpuEncoder::Impl::runChunk(
     // and never quote a speed number from a profiling run (CLAUDE.md trap 4).
     auto go = [&](int stage, const void* push, size_t pushSize,
                   uint32_t gx, uint32_t gy = 1, uint32_t gz = 1) {
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipes[stage]);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, plo, 0, 1,
-                                &dsets[stage], 0, nullptr);
-        vkCmdPushConstants(cmd, plo, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+        vkCmdBindPipeline(cmd[sl], VK_PIPELINE_BIND_POINT_COMPUTE, pipes[stage]);
+        vkCmdBindDescriptorSets(cmd[sl], VK_PIPELINE_BIND_POINT_COMPUTE, plo, 0, 1,
+                                &dsets[sl][stage], 0, nullptr);
+        vkCmdPushConstants(cmd[sl], plo, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                            (uint32_t)pushSize, push);
-        vkCmdDispatch(cmd, gx, gy, gz);
-        barrier(cmd);
+        vkCmdDispatch(cmd[sl], gx, gy, gz);
+        barrier(cmd[sl]);
         if (ts_ok) {
             // After the barrier, so the mark lands once this stage's writes are
             // visible -- i.e. it measures the stage, not the launch.
-            vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+            vkCmdWriteTimestamp(cmd[sl], VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                                 qpool, (uint32_t)tsIdx++);
             return;
         }
         if (!profile) return;
-        vkEndCommandBuffer(cmd);
+        vkEndCommandBuffer(cmd[sl]);
         VkSubmitInfo si{};
         si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
         si.commandBufferCount = 1;
-        si.pCommandBuffers = &cmd;
+        si.pCommandBuffers = &cmd[sl];
         const auto t0 = std::chrono::steady_clock::now();
-        vkResetFences(dev, 1, &fence);
-        vkQueueSubmit(queue, 1, &si, fence);
-        vkWaitForFences(dev, 1, &fence, VK_TRUE, UINT64_MAX);
+        vkResetFences(dev, 1, &fence[sl]);
+        vkQueueSubmit(queue, 1, &si, fence[sl]);
+        vkWaitForFences(dev, 1, &fence[sl], VK_TRUE, UINT64_MAX);
         stage_secs[stage] +=
             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         VkCommandBufferBeginInfo rb{};
         rb.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         rb.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        vkResetCommandBuffer(cmd, 0);
-        vkBeginCommandBuffer(cmd, &rb);
+        vkResetCommandBuffer(cmd[sl], 0);
+        vkBeginCommandBuffer(cmd[sl], &rb);
     };
 
     { struct { int32_t nblk, bsize, nch, chunkLen; } p{
@@ -976,39 +1124,49 @@ bool PureGpuEncoder::Impl::runChunk(
     { struct { int32_t nframe; } p{ (int32_t)nblkThis };
       go(S_CRC, &p, sizeof p, nblkThis); }
 
-    vkEndCommandBuffer(cmd);
+    vkEndCommandBuffer(cmd[sl]);
 
     VkSubmitInfo si{};
     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     si.commandBufferCount = 1;
-    si.pCommandBuffers = &cmd;
-    vkResetFences(dev, 1, &fence);
-    if (vkQueueSubmit(queue, 1, &si, fence) != VK_SUCCESS) return false;
-    if (vkWaitForFences(dev, 1, &fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) return false;
+    si.pCommandBuffers = &cmd[sl];
+    vkResetFences(dev, 1, &fence[sl]);
+    if (vkQueueSubmit(queue, 1, &si, fence[sl]) != VK_SUCCESS) return false;
+    return true;
+}
+
+// Wait for a submitted chunk and read back what the host needs from it: the
+// encoded byte count, the per-stage timestamps, and (rarely) the debug dump.
+// Everything read here is small and read *before* the next chunk is submitted,
+// which is what lets the two slots share every intermediate buffer.
+bool PureGpuEncoder::Impl::finishChunk(int sl, uint64_t firstSample,
+                                       uint32_t nblkThis, uint32_t* outBytes)
+{
+    if (vkWaitForFences(dev, 1, &fence[sl], VK_TRUE, UINT64_MAX) != VK_SUCCESS) return false;
 
     if (ts_ok) {
         uint64_t ts[S_COUNT + 1] = {};
-        if (vkGetQueryPoolResults(dev, qpool, 0, (uint32_t)tsIdx, sizeof(ts), ts,
+        if (vkGetQueryPoolResults(dev, qpool, 0, (uint32_t)(S_COUNT + 1), sizeof(ts), ts,
                                   sizeof(uint64_t),
                                   VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT)
             == VK_SUCCESS) {
-            for (int st = 0; st + 1 < tsIdx; ++st)
+            for (int st = 0; st < S_COUNT; ++st)
                 stage_secs[st] += (double)(ts[st + 1] - ts[st]) * ts_period * 1e-9;
         }
     }
 
-    *outBytes = ((const uint32_t*)bufs[B_TOTAL].map)[0];
-    if ((VkDeviceSize)*outBytes > bufs[B_OUT].size) return false;
+    *outBytes = ((const uint32_t*)bufs[sl][B_TOTAL].map)[0];
+    if ((VkDeviceSize)*outBytes > bufs[sl][B_OUT].size) return false;
 
     // FLACOUT_PG_DEBUG: dump the first solve's analysis chain next to a
     // double-precision host reference. This exists to split "the analysis is
     // numerically wrong" from "the analysis is fine and something downstream
     // mis-prices it", which is the one distinction the output size cannot make.
     if (std::getenv("FLACOUT_PG_DEBUG") && firstSample == 0) {
-        const float* ac = (const float*)bufs[B_AUTOC].map;
-        const float* lp = (const float*)bufs[B_LPCF].map;
-        const int32_t* sg = (const int32_t*)bufs[B_SIG].map;
-        const uint32_t* mt = (const uint32_t*)bufs[B_META].map;
+        const float* ac = (const float*)bufs[sl][B_AUTOC].map;
+        const float* lp = (const float*)bufs[sl][B_LPCF].map;
+        const int32_t* sg = (const int32_t*)bufs[sl][B_SIG].map;
+        const uint32_t* mt = (const uint32_t*)bufs[sl][B_META].map;
 
         std::vector<double> wc(B), wd(B);
         window_coefficients(cfg.windows[0], B, wc.data());
@@ -1032,7 +1190,7 @@ bool PureGpuEncoder::Impl::runChunk(
         // Where does the recursion's residual energy go? For tonal content the
         // prediction gain is enormous, so err[ord] collapses -- and once it is
         // near fp32's floor relative to err[0], k = lambda/e is noise.
-        const float* er = (const float*)bufs[B_ERR].map;
+        const float* er = (const float*)bufs[sl][B_ERR].map;
         const float* ac_dev = ac;
         std::cout << "  err[ord]/err[0], device:\n   ";
         for (int o = 0; o <= 32; ++o) {
@@ -1097,8 +1255,8 @@ bool PureGpuEncoder::Impl::runChunk(
         // where the CPU chose LPC every time, and every solve reaches order 32,
         // so the LPC candidates exist and are simply losing.
         {
-            const int32_t* cdx = (const int32_t*)bufs[B_CAND].map;
-            const uint32_t* ctx = (const uint32_t*)bufs[B_COST].map;
+            const int32_t* cdx = (const int32_t*)bufs[sl][B_CAND].map;
+            const uint32_t* ctx = (const uint32_t*)bufs[sl][B_COST].map;
             for (int blk = 0; blk < (int)nblkThis && nsig == 4; ++blk) {
                 const int bs = 3 * (int)nblkThis + blk;
                 uint32_t best = UINT32_MAX; int bslot = -1;
@@ -1141,9 +1299,9 @@ bool PureGpuEncoder::Impl::runChunk(
             }
         }
 
-        const int32_t* cd = (const int32_t*)bufs[B_CAND].map;
-        const uint32_t* ct = (const uint32_t*)bufs[B_COST].map;
-        const int32_t* pl = (const int32_t*)bufs[B_PLAN].map;
+        const int32_t* cd = (const int32_t*)bufs[sl][B_CAND].map;
+        const uint32_t* ct = (const uint32_t*)bufs[sl][B_COST].map;
+        const int32_t* pl = (const int32_t*)bufs[sl][B_PLAN].map;
         std::cout << "  plan[0]: mode=" << pl[0] << " sig=" << pl[1] << "," << pl[2]
                   << " slot=" << pl[3] << "," << pl[4]
                   << " bits=" << pl[5] << "," << pl[6] << "\n";
@@ -1230,29 +1388,68 @@ bool PureGpuEncoder::encode(const std::vector<std::vector<int32_t>>& pcm,
 
     const auto t0 = std::chrono::steady_clock::now();
 
-    for (uint64_t done = 0; done < nfull; ) {
-        const uint32_t n = (uint32_t)std::min<uint64_t>(I.maxBlk, nfull - done);
-        // Block only on the samples this chunk needs. With a streaming producer
-        // this is what overlaps decode with encode; with a fully-decoded buffer
-        // it returns immediately.
-        if (wait && !wait((done + n) * I.B)) return false;
+    // Two slots, one chunk on the device at a time. The order below is what
+    // hides the host: stage chunk i's PCM *while* chunk i-1 is running, then wait
+    // for i-1, submit i immediately, and only then write i-1's bytes to the file
+    // -- so the ~8 MB memcpy and the ~2 MB write both land in the device's
+    // shadow. Waiting before submitting is deliberate: it keeps every
+    // intermediate buffer single-slot, since no two chunks ever execute at once.
+    //
+    // Measured on the master mix: encode phase 109 ms against 86 ms of device
+    // time before this, i.e. ~21% of the phase was the device standing idle.
+    struct Pending {
+        bool     live  = false;
+        int      sl    = 0;
+        uint32_t n     = 0;
+        uint64_t first = 0;
         uint32_t bytes = 0;
-        if (!I.runChunk(pcm, done * I.B, n, &bytes)) return false;
+    };
+    Pending pend;
 
-        const uint32_t* fi = (const uint32_t*)I.bufs[B_FINFO].map;
-        for (uint32_t f = 0; f < n; ++f) {
+    // Wait for a chunk and take everything the host needs out of it. Must happen
+    // before the next chunk is submitted: B_TOTAL and B_FINFO are shared between
+    // the slots, since only B_PCM and B_OUT are ever live on both sides at once.
+    auto collect = [&](Pending& p) -> bool {
+        if (!I.finishChunk(p.sl, p.first, p.n, &p.bytes)) return false;
+        const uint32_t* fi = (const uint32_t*)I.bufs[p.sl][B_FINFO].map;
+        for (uint32_t f = 0; f < p.n; ++f) {
             const uint32_t fb = fi[f * FINFO_STRIDE + 1];
             st.min_frame = std::min(st.min_frame, fb);
             st.max_frame = std::max(st.max_frame, fb);
         }
         st.min_block = std::min(st.min_block, I.B);
         st.max_block = std::max(st.max_block, I.B);
-        st.frames += n;
-        st.bytes  += bytes;
+        st.frames += p.n;
+        st.bytes  += p.bytes;
+        return true;
+    };
+    // The write, kept separate so it can land *after* the next submit.
+    auto emit = [&](Pending& p) -> bool {
+        p.live = false;
+        return sink((const uint8_t*)I.bufs[p.sl][B_OUT].map, p.bytes);
+    };
 
-        if (!sink((const uint8_t*)I.bufs[B_OUT].map, bytes)) return false;
+    int slot = 0;
+    for (uint64_t done = 0; done < nfull; ) {
+        const uint32_t n = (uint32_t)std::min<uint64_t>(I.maxBlk, nfull - done);
+        // Block only on the samples this chunk needs. With a streaming producer
+        // this is what overlaps decode with encode; with a fully-decoded buffer
+        // it returns immediately.
+        if (wait && !wait((done + n) * I.B)) return false;
+
+        I.stagePcm(slot, pcm, done * I.B, n * I.B);   // beside the running chunk
+        if (pend.live && !collect(pend)) return false;
+        if (!I.submitChunk(slot, done * I.B, n)) return false;
+        if (pend.live && !emit(pend)) return false;   // beside the chunk just sent
+
+        pend = Pending{true, slot, n, done * I.B, 0};
+        if (!I.pipelined) {
+            if (!collect(pend) || !emit(pend)) return false;
+        }
+        slot ^= I.pipelined ? 1 : 0;
         done += n;
     }
+    if (pend.live && (!collect(pend) || !emit(pend))) return false;
 
     // The stream tail -- fewer than block_size samples -- is emitted as one
     // VERBATIM frame on the host. It is the only frame the host builds, and the

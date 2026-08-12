@@ -979,6 +979,92 @@ Note what the syn3m_mix column says about the *remaining* gap: at 4096 it is
 +3.9% against the CPU and at 16384 it is +4.2%. The gap is flat in block size, so
 what is left is search depth and analysis, not the partition.
 
+## `precise` is a portability fix that must not be paid for twice (2.2x)
+
+The `precise` qualifiers that made the double-float math survive Mesa ANV cost
+**5x in `pg_autoc` on Apple, for byte-identical output**. The regression shipped
+because that commit re-quoted the M4 Max stage table above instead of
+re-measuring it — and it is the largest single number in this document's history,
+so treat every stage table here as pinned to the commit that produced it.
+
+Measured, device timestamps, before and after compiling the qualifiers out:
+
+| fixture | autoc | device total | wall | bytes |
+|---|---|---|---|---|
+| master mix | 173.8 → **33.8 ms** | 213 → 86 ms | 0.260 → 0.120 s | identical |
+| MLKDream | 110 → **15.0 ms** | 161 → 65 ms | 0.220 → 0.130 s | identical |
+
+The output is byte-identical on Apple, which is what says the two builds are the
+same computation there rather than a size/speed trade — and it also rules out the
+failure-1 trap below, where a cheaper analysis silently hands the sweep more work.
+
+**The split between the two kernels is not symmetric, and only one of them is
+worth the money.** `precise` in `pg_levinson` costs ~8 ms on the master mix and is
+worth keeping (without it: s24_2s +0.6%, syn3m_tonal +0.05%, master mix +149 B).
+`precise` in `pg_autoc` costs 140 ms and buys nothing on a driver that does not
+reassociate. So `pg_autoc.comp` is compiled twice — as-is, and with
+`PG_NO_PRECISE` — and the host picks.
+
+**It picks by asking the device, not by recognising it.** `shaders/pg_probe.comp`
+runs the fast variant's own expressions on values whose fp32 results are inexact
+and reports whether the error terms survived; zero means the compiler reassociated
+and the safe build is bound instead. A vendor allowlist would be wrong the first
+time anyone runs this on an untested driver, and it could not see
+`MVK_CONFIG_FAST_MATH_ENABLED` being set by hand — which is exactly the case that
+makes the fast variant unsafe on Apple. The probe is one dispatch at init and the
+banner reports which build won (`df native` / `df via NoContraction`).
+
+Intel is unaffected: it fails the probe and gets what 332ac61 gave it.
+
+## The host was standing in the device's way (1.14-1.19x)
+
+`runChunk` submitted and immediately waited, so the ~8 MB PCM `memcpy` for the
+next chunk and the ~2 MB file write for the last one both happened with the device
+idle — 109 ms of encode phase against 86 ms of device time on the master mix.
+
+Two slots fix it, and the ordering is the whole design:
+
+```
+stage chunk i's PCM        <- overlaps chunk i-1 running
+wait for chunk i-1
+submit chunk i             <- device restarts before any host work
+read back and write i-1    <- overlaps chunk i running
+```
+
+Waiting before submitting is deliberate. It means **no two chunks ever execute at
+once**, so only the buffers the host touches (`B_PCM`, `B_OUT`) need duplicating
+and every intermediate stays single-slot — +16 MB, against +85 MB for a second
+full set. Everything the host reads out of a shared buffer (`B_TOTAL`, `B_FINFO`)
+is read after the fence and before the next submit.
+
+`FLACOUT_PG_NOPIPE=1` turns it off, which is how it was measured: master mix
+1.14x, MLKDream 1.19x, syn3m_mix 1.14x, music_20s 1.01x (too few chunks to
+amortise anything). Profiling forces it off — the serialised mode fences inside
+the recording and there is one timestamp pool.
+
+### Both together
+
+Interleaved best-of-5, `-n` on every arm, separate pipeline caches per binary:
+
+| fixture | 332ac61 | now | speedup |
+|---|---|---|---|
+| master mix | 0.269 s | **0.112 s** | **2.39x** |
+| MLKDream | 0.231 s | 0.110 s | 2.10x |
+| syn3m_mix | 0.262 s | 0.108 s | 2.43x |
+| music_20s | 0.056 s | 0.041 s | 1.37x |
+| music_10s | 0.045 s | 0.037 s | 1.21x |
+| music_3s | 0.035 s | 0.032 s | 1.10x |
+
+All 18 fixtures byte-identical to 332ac61 and verified lossless (`flac -t` plus
+decoded-audio MD5). The short fixtures gain least because the ~20 ms fixed
+startup, not the device, is what bounds them.
+
+**The stage map has moved again** (master mix, timestamps): sweep 41.9%, autoc
+34.6%, levinson ~5%, rice ~6%, everything else under 2%. The window/order
+frontier in "Windows are worth more than orders" was tuned when a window cost 5x
+what it now costs in `pg_autoc`, so it is stale in the direction of buying more
+windows, and is the next thing to re-sweep.
+
 ## Build order
 
 Each step ends somewhere testable. Do not skip to step 4.

@@ -1,0 +1,50 @@
+#version 450
+//
+// Pure-GPU encoder, init-time probe: **does this driver leave fp32 alone?**
+//
+// The double-float arithmetic in pg_autoc and pg_levinson is built out of error
+// terms that only exist if the compiler does not reassociate or contract:
+//
+//     p = a * b;  e = fma(a, b, -p);        // e is the part of a*b that p lost
+//     s = a + b;  e = (a - (s - bb)) + ...  // likewise for the sum
+//
+// A compiler that reassociates folds both e to exactly zero, at which point the
+// double-float code is not merely useless but *harmful* -- it adds rounding
+// without adding precision (measured: Mesa ANV and MoltenVK with fast math on
+// both produced a worse result than plain fp32). The portable defence is the
+// `precise` qualifier, and on a driver that never needed it that qualifier costs
+// 5x in pg_autoc for byte-identical output.
+//
+// So rather than deciding by vendor -- a list that is wrong the moment someone
+// runs this on a driver nobody tested -- ask the device. This kernel is compiled
+// **without** `precise`, exactly like the fast pg_autoc variant, and reports
+// whether the error terms survived. If they did, the fast variant is safe here.
+//
+// d[0..1]: fp32 bit patterns of a product pair whose product is inexact.
+// d[2..3]: fp32 bit patterns of a sum pair whose sum is inexact.
+// d[4]:    written 1 if either error term collapsed to zero (use `precise`),
+//          0 if both survived (the fast variant is exact here).
+
+// 32 rather than 1 because the pipelines are created with
+// REQUIRE_FULL_SUBGROUPS when subgroup size control is available, which demands
+// a local size that is a multiple of the subgroup size. Only lane 0 does work.
+layout(local_size_x = 32) in;
+
+layout(std430, binding = 0) buffer P { uint d[]; };
+
+void main() {
+    if (gl_LocalInvocationID.x != 0u) return;
+
+    const float a = uintBitsToFloat(d[0]);
+    const float b = uintBitsToFloat(d[1]);
+    const float p = a * b;
+    const float ep = fma(a, b, -p);
+
+    const float c  = uintBitsToFloat(d[2]);
+    const float e  = uintBitsToFloat(d[3]);
+    const float s  = c + e;
+    const float bb = s - c;
+    const float es = (c - (s - bb)) + (e - bb);
+
+    d[4] = (ep == 0.0 || es == 0.0) ? 1u : 0u;
+}

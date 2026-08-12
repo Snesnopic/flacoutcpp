@@ -93,7 +93,7 @@ if(FLACOUT_VULKAN)
     # Pure-GPU pipeline (-P): one kernel per stage, each embedded the same way.
     # Names map mechanically: shaders/pg_foo.comp -> pg_foo_spv.h -> kPgFooSpv.
     set(PG_SHADERS prepare autoc levinson quant fixed sweep
-                   select rice layout frame pack crc)
+                   select rice layout frame pack crc probe)
     set(PG_HDRS "")
     foreach(pg ${PG_SHADERS})
         set(_src "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pg_${pg}.comp")
@@ -123,6 +123,32 @@ if(FLACOUT_VULKAN)
             VERBATIM)
         list(APPEND PG_HDRS "${_hdr}")
     endforeach()
+
+    # A second build of pg_autoc with the `precise` qualifiers compiled out. It
+    # is the same kernel and, on a driver that does not reassociate fp32, the
+    # same arithmetic -- 5x faster there for byte-identical output. Which one
+    # runs is decided at init by shaders/pg_probe.comp, never by vendor name.
+    set(_asrc "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pg_autoc.comp")
+    set(_aspv "${CMAKE_CURRENT_BINARY_DIR}/pg_autoc_fast.spv")
+    set(_ahdr "${CMAKE_CURRENT_BINARY_DIR}/generated/pg_autoc_fast_spv.h")
+    if(FLACOUT_GLSLC)
+        set(_acmd ${FLACOUT_GLSLC} -O --target-env=vulkan1.1 -DPG_NO_PRECISE
+                  -fshader-stage=compute "${_asrc}" -o "${_aspv}")
+    else()
+        set(_acmd ${FLACOUT_GLSLANG} -V --target-env vulkan1.1 -DPG_NO_PRECISE
+                  -S comp "${_asrc}" -o "${_aspv}")
+    endif()
+    add_custom_command(
+        OUTPUT "${_ahdr}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated"
+        COMMAND ${_acmd}
+        COMMAND ${CMAKE_COMMAND} -DSPV=${_aspv} -DHDR=${_ahdr}
+                -DSYM=kPgAutocFastSpv -DSRC=shaders/pg_autoc.comp
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_spv.cmake"
+        DEPENDS "${_asrc}" "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_spv.cmake"
+        COMMENT "Compiling and embedding shaders/pg_autoc.comp (PG_NO_PRECISE)"
+        VERBATIM)
+    list(APPEND PG_HDRS "${_ahdr}")
 
     add_custom_target(flacout_shaders DEPENDS "${SWEEP_HDR}" ${PG_HDRS})
     add_dependencies(flacout_lib flacout_shaders)

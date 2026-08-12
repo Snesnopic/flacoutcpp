@@ -363,10 +363,53 @@ overhead each):
 | rice | 5.1% |
 | everything else | ~1% each |
 
-**CRC-16 is the new second bottleneck**, and it is the naive implementation on
-purpose (one lane per frame, byte at a time). The combine trick the stage note
-describes — CRC is linear over GF(2), so `CRC(A||B)` folds from its parts — is
-now worth building. So is a look at `prepare`, which reads the PCM twice.
+### CRC-16 was a parallelism problem, not an algorithm problem (10.7x)
+
+At 15.3% it was the second bottleneck, and the diagnosis is worth keeping
+because the number that mattered was not a share:
+
+```
+96 MB/s   on an M4 Max
+```
+
+A chunk holds at most 256 frames, so a lane-per-frame kernel has **256 threads
+for ~1.8 MB**, each walking ~7 KB serially from a different region of the buffer.
+It was short of parallelism by two orders of magnitude, and uncoalesced besides.
+No table trick (slice-by-4, slice-by-8) addresses that — they divide the 7 KB
+walk, they do not add threads.
+
+Splitting *within* a frame needs CRC's one exploitable property, and it is the
+property MD5 lacks: **it is linear over GF(2).** With init 0 and no final xor,
+`CRC(M) = M*x^16 mod P`, so for `M = A||B` with `|B| = n` bytes:
+
+```
+CRC(A||B) = CRC(A) * x^(8n)  +  CRC(B)      (mod P, + is xor)
+```
+
+So every lane CRCs its own slice from init 0 and a tree reduction folds them --
+one workgroup per frame, 8 levels for 256 lanes. The only new primitive is
+multiplication in `GF(2)[x]/P` (a 16-iteration carryless multiply); the `x^(8n)`
+factor is square-and-multiply on `x^8`. The reduction carries `(crc, length)`
+rather than `crc` alone, so it stays associative when the last slice is short --
+~8 `powx8` calls per lane against the ~7000 byte-steps they replace.
+
+**0.0192 s → 0.0018 s, 10.7x**, ~96 MB/s → ~1 GB/s. 1.8 ms is at this
+profiler's submit-overhead floor, so the true cost is now below what it can
+resolve. Verified end to end rather than by argument: `flac -t` validates every
+frame's CRC-16, so a wrong fold fails on the first frame of any fixture.
+
+Profile after the sweep cap and this (master mix; small stages carry ~1.2 ms of
+submit overhead each, so their shares are inflated):
+
+| stage | share |
+|---|---|
+| sweep | 61.5% |
+| prepare | 9.7% |
+| autoc | 9.4% |
+| rice | 6.3% |
+| pack | 2.2% |
+| crc | 2.0% |
+| everything else | ~1.5% each |
 
 ### End-to-end, against the CPU
 
@@ -374,19 +417,19 @@ Interleaved best-of-5, quiet machine, `-n` on every arm. Times include decode,
 MD5 and file I/O, which are common fixed costs (decode alone is 0.109 s on the
 master mix, so the device is the bulk of `-P`).
 
-| fixture | `-P` | CPU default | CPU `-E 0` | size vs CPU default |
-|---|---|---|---|---|
-| music_10s | 0.075 s | 0.136 s (1.81x) | 0.118 s (1.57x) | +0.40% |
-| music_20s | 0.084 s | 0.195 s (2.33x) | 0.163 s (1.95x) | +0.14% |
-| MLKDream | 0.367 s | 1.461 s (**3.98x**) | 1.158 s (3.16x) | +1.12% |
-| master mix | 0.265 s | 0.981 s (3.70x) | 0.809 s (3.05x) | +0.99% |
-| syn3m_mix | 0.272 s | 0.930 s (3.41x) | 0.792 s (2.91x) | **+7.62%** |
+| fixture | `-P` wall | device only | CPU default | speedup | size |
+|---|---|---|---|---|---|
+| music_20s | 0.085 s | 0.023 s | 0.196 s | 2.31x | +0.14% |
+| MLKDream | 0.338 s | 0.123 s | 1.449 s | **4.29x** | +1.12% |
+| master mix | 0.239 s | 0.106 s | 0.976 s | 4.09x | +0.99% |
+| syn3m_mix | 0.250 s | 0.116 s | 0.926 s | 3.71x | +7.62% |
 
-Note what the short fixtures are now bounded by: libFLAC's single-threaded
-decode is 0.109 s of the master mix's 0.265 s. **The pipeline is approaching
-decode-bound**, which is the point at which further kernel work stops showing up
-in wall clock and the next move is to overlap decode with the encode (frames are
-independent, so chunk N can be encoding while chunk N+1 decodes).
+**The pipeline is now decode-bound.** libFLAC's single-threaded decode is 0.109 s
+of the master mix's 0.239 s wall clock, against 0.106 s of device time — the
+encode is now faster than the decode feeding it. Further kernel work will not
+show up in wall clock. The next move is to overlap them: frames are independent
+at a fixed block size, so chunk N can encode while chunk N+1 decodes, which
+should take the master mix to ~0.13 s (~7x) without touching a shader.
 
 Losslessness verified by decode on all 18 fixtures (`flac -t` ok and decoded
 audio MD5 equal to the input's), including 24-bit, mono, and the `<1024`-sample

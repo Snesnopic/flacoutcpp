@@ -795,8 +795,10 @@ bool PureGpuEncoder::Impl::runChunk(
         (int32_t)nblkThis, (int32_t)B, nsub, nsig, ncand };
       go(S_PACK, &p, sizeof p, nblkThis * (uint32_t)nsub); }
 
+    // One workgroup per frame now, not one lane per frame: the fold inside the
+    // kernel is what supplies the parallelism a 256-frame chunk cannot.
     { struct { int32_t nframe; } p{ (int32_t)nblkThis };
-      go(S_CRC, &p, sizeof p, ceilDiv(nblkThis, 256)); }
+      go(S_CRC, &p, sizeof p, nblkThis); }
 
     vkEndCommandBuffer(cmd);
 

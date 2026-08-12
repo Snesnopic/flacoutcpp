@@ -3,19 +3,40 @@
 // Pure-GPU encoder, stage 12: CRC-16 over each finished frame.
 //
 // CRC-16 covers header *and* payload, so unlike CRC-8 it cannot run until the
-// packer has finished. One lane per frame, byte at a time through a table the
-// workgroup builds in shared memory on entry -- 256 lanes, one table entry each,
-// so no host upload and no constant buffer.
+// packer has finished.
 //
-// This is the simple thing on purpose. CRC is linear over GF(2), so
-// CRC(A||B) is recoverable from CRC(A), CRC(B) and |B|, which would make it a
-// subgroup reduce over chunks of one frame. With hundreds of frames in flight
-// there is already enough parallelism to saturate the device, so the combine
-// trick would buy latency on the last frame and nothing else. Revisit only if a
-// profile puts this kernel on the critical path.
+// **One workgroup per frame, not one lane.** The obvious shape -- a lane per
+// frame, byte at a time -- measured 96 MB/s on an M4 Max and 15.3% of device
+// time. Nothing about the algorithm was at fault: a chunk holds at most 256
+// frames, so a lane-per-frame kernel has 256 threads for ~1.8 MB and each of
+// them walks 7 KB serially from a different region of the buffer. It was short
+// of parallelism by two orders of magnitude, and uncoalesced besides.
+//
+// Splitting *within* a frame needs CRC's one exploitable property: it is linear
+// over GF(2). With init 0 and no final xor, CRC(M) is M*x^16 mod P, so for
+// M = A||B with |B| = n bytes:
+//
+//     CRC(A||B) = CRC(A) * x^(8n)  +  CRC(B)      (mod P, + is xor)
+//
+// So every lane CRCs its own slice from init 0, and a tree reduction folds the
+// slices together -- 8 levels for 256 lanes. The only new primitive is
+// multiplication in GF(2)[x]/P, which is a 16-iteration carryless multiply; the
+// x^(8n) factor comes from square-and-multiply on x^8.
+//
+// The reduction carries (crc, length) rather than crc alone, because the last
+// lane's slice is short whenever the frame is not a multiple of 256 bytes. That
+// makes the operator associative for arbitrary splits instead of only for equal
+// ones, at the cost of computing x^(8n) per combine (~8 per lane per frame,
+// against the 7000 byte-steps it replaces).
+//
+// Correctness is checked end to end rather than by argument: `flac -t` validates
+// every frame's CRC-16, so a wrong fold fails on the first frame of any fixture.
 
 #define LOCAL 256
 #define FINFO_STRIDE 4
+// x^16 + x^15 + x^2 + 1, with the implicit x^16 dropped -- the same polynomial
+// BitWriter::CRC16_TABLE is built from.
+#define POLY 0x8005u
 
 layout(local_size_x = LOCAL) in;
 
@@ -27,6 +48,8 @@ layout(push_constant) uniform PC {
 } pc;
 
 shared uint tbl[256];
+shared uint sC[LOCAL];
+shared uint sL[LOCAL];
 
 // File byte `pos` is the (pos & 3)-th low byte of word (pos >> 2) on a
 // little-endian host -- the same convention the packer's byte-swap produces.
@@ -38,27 +61,72 @@ void putByte(uint pos, uint v) {
     atomicOr(outw[pos >> 2], (v & 0xFFu) << (8u * (pos & 3u)));
 }
 
+// (a * b) mod P, both operands of degree < 16. Bit-serial over b from the top,
+// reducing after each shift so nothing ever exceeds 16 bits.
+uint mulmod(uint a, uint b) {
+    uint r = 0u;
+    for (int i = 15; i >= 0; --i) {
+        r = ((r & 0x8000u) != 0u) ? (((r << 1) ^ POLY) & 0xFFFFu)
+                                  : ((r << 1) & 0xFFFFu);
+        if (((b >> uint(i)) & 1u) != 0u) r ^= a;
+    }
+    return r & 0xFFFFu;
+}
+
+// x^(8n) mod P, by square-and-multiply on x^8. n == 0 gives 1, so folding in a
+// zero-length slice is the identity.
+uint powx8(uint n) {
+    uint result = 1u;        // x^0
+    uint base   = 0x0100u;   // x^8
+    while (n != 0u) {
+        if ((n & 1u) != 0u) result = mulmod(result, base);
+        base = mulmod(base, base);
+        n >>= 1u;
+    }
+    return result;
+}
+
 void main() {
     const uint t = gl_LocalInvocationID.x;
+    const uint f = gl_WorkGroupID.x;
 
     uint c = t << 8;
     for (int j = 0; j < 8; ++j)
-        c = ((c & 0x8000u) != 0u) ? (((c << 1) ^ 0x8005u) & 0xFFFFu)
+        c = ((c & 0x8000u) != 0u) ? (((c << 1) ^ POLY) & 0xFFFFu)
                                   : ((c << 1) & 0xFFFFu);
     tbl[t] = c;
     barrier();
 
-    const uint f = gl_GlobalInvocationID.x;
     if (f >= uint(pc.nframe)) return;
 
     const uint bo = finfo[f * FINFO_STRIDE + 0];
     const uint nb = finfo[f * FINFO_STRIDE + 1];
+    const uint n  = nb - 2u;          // the CRC covers everything before itself
 
-    // The CRC covers everything before its own two bytes.
+    // Equal slices, with the remainder falling to the last lanes. A lane whose
+    // slice is empty folds in as the identity.
+    const uint L     = (n + uint(LOCAL) - 1u) / uint(LOCAL);
+    const uint start = min(t * L, n);
+    const uint end   = min(start + L, n);
+
     uint crc = 0u;
-    for (uint i = 0u; i < nb - 2u; ++i)
+    for (uint i = start; i < end; ++i)
         crc = ((crc << 8) ^ tbl[((crc >> 8) ^ getByte(bo + i)) & 0xFFu]) & 0xFFFFu;
 
-    putByte(bo + nb - 2u, crc >> 8);
-    putByte(bo + nb - 1u, crc);
+    sC[t] = crc;
+    sL[t] = end - start;
+    barrier();
+
+    for (uint s = 1u; s < uint(LOCAL); s <<= 1) {
+        if ((t & ((s << 1) - 1u)) == 0u && t + s < uint(LOCAL)) {
+            sC[t] = mulmod(sC[t], powx8(sL[t + s])) ^ sC[t + s];
+            sL[t] += sL[t + s];
+        }
+        barrier();
+    }
+
+    if (t == 0u) {
+        putByte(bo + nb - 2u, sC[0] >> 8);
+        putByte(bo + nb - 1u, sC[0]);
+    }
 }

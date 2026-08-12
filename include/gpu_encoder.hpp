@@ -58,7 +58,7 @@ public:
         /// the Levinson prediction error. This is the dominant speed knob: the
         /// Rice sweep is ~92% of device time and its cost is proportional to the
         /// summed order of the candidates it prices.
-        uint32_t orders = 8;
+        uint32_t orders = 3;
         /// Cap on the *sweep's* Rice partition-order search (1..8). Ranking only
         /// -- the winner is re-priced with the full search, so this cannot
         /// mis-state what the bitstream pays. The kernel is dominated by

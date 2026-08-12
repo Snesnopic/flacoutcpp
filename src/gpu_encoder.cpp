@@ -408,7 +408,7 @@ bool PureGpuEncoder::Impl::init() {
     nsub = (int)nch;
     nsig = (nch == 2) ? 4 : 1;
     nwin = (int)cfg.windows.size();
-    if (nwin < 1 || nwin > 16) { why = "window count must be 1..16"; return false; }
+    if (nwin < 1 || nwin > 26) { why = "window count must be 1..26"; return false; }
     nprec = (int)cfg.precisions.size();
     if (nprec < 1 || nprec > 4) { why = "precision count must be 1..4"; return false; }
     for (int i = 0; i < nprec; ++i) {
@@ -1133,9 +1133,26 @@ PureGpuEncoder::PureGpuEncoder(uint32_t channels, uint32_t bps,
     m_impl->bps   = bps;
     m_impl->srate = sample_rate;
     m_impl->cfg   = cfg;
+    // The six dense tapers of the CPU's estimated-DP shortlist (which is those
+    // six plus the partial/punchout pair at each offset).
+    //
+    // Windows are worth more than orders per unit of *device* time, so the old
+    // four-window, eight-order default was off the frontier in both directions.
+    // MLKDream, total device time from FLACOUT_PG_PROFILE:
+    //
+    //   4w x 4o   107.3 ms   28032077
+    //   4w x 8o   127.2 ms   28027341   <- the old default
+    //   6w x 3o   109.4 ms   28008023   <- faster AND smaller than 4w x 8o
+    //   10w x 3o  140.3 ms   28003888
+    //
+    // Beware measuring this on sweep time alone: the autocorrelation also scales
+    // with window count (14 -> 30 ms from 4 to 10 windows), and a first pass at
+    // this frontier picked 10 windows on sweep time and made the encoder *slower*
+    // overall.
     if (m_impl->cfg.windows.empty())
         m_impl->cfg.windows = {WindowType::TUKEY_050, WindowType::HANN,
-                               WindowType::WELCH, WindowType::RECTANGULAR};
+                               WindowType::WELCH,     WindowType::RECTANGULAR,
+                               WindowType::TUKEY_005, WindowType::TUKEY_020};
     if (!m_impl->init()) m_impl->ok = false;
 }
 

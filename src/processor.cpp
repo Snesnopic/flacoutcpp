@@ -7,7 +7,9 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -16,6 +18,16 @@
 #include <cstring>
 
 namespace flacoutcpp {
+
+// Per-worker decode range, for the parallel streaming decode used by -P. These
+// are thread_local rather than members because every worker shares one Processor
+// as its libFLAC client_data, and the alternative -- a per-worker context struct
+// -- would change all three callback signatures for the CPU path's benefit too.
+static thread_local uint64_t t_range_lo = 0;
+static thread_local uint64_t t_range_hi = UINT64_MAX;
+/// End sample of the last frame this worker decoded, so its loop knows when it
+/// has covered its range.
+static thread_local uint64_t t_frame_end = 0;
 
 // ============================================================
 // Constructor / destructor
@@ -509,9 +521,38 @@ bool Processor::process() {
 // The -P pipeline
 // ============================================================
 
+void Processor::advance_decoded(size_t idx)
+{
+    std::lock_guard<std::mutex> lk(m_decode_mu);
+    if (idx < m_range_done.size()) m_range_done[idx] = 1;
+    // Push the published count to the end of the contiguous completed prefix.
+    // Ranges finish out of order, so a single completion may unlock several.
+    uint64_t at = m_decoded.load(std::memory_order_relaxed);
+    size_t next = (size_t)(at / m_range_len);
+    while (next < m_range_done.size() && m_range_done[next]) {
+        at = std::min((uint64_t)(next + 1) * m_range_len, m_total_samples);
+        ++next;
+    }
+    m_decoded.store(at, std::memory_order_release);
+    m_decode_cv.notify_all();
+}
+
 bool Processor::process_pure_gpu(std::vector<std::vector<uint8_t>>& extra_blocks)
 {
     // ---- decode metadata on this thread, so the stream shape is known --------
+    // FLACOUT_PG_WALL: wall-clock phases, to see what is left outside the
+    // overlapped decode/encode window.
+    const bool wt = std::getenv("FLACOUT_PG_WALL") != nullptr;
+    auto wt0 = std::chrono::steady_clock::now();
+    const auto t_origin = wt0;
+    auto wlap = [&](const char* what) {
+        if (!wt) return;
+        const auto now = std::chrono::steady_clock::now();
+        std::printf("  wall %-24s %7.2f ms\n", what,
+                    1e3 * std::chrono::duration<double>(now - wt0).count());
+        wt0 = now;
+    };
+
     FLAC__StreamDecoder* decoder = FLAC__stream_decoder_new();
     if (!decoder) return false;
     FLAC__stream_decoder_set_metadata_respond(decoder, FLAC__METADATA_TYPE_STREAMINFO);
@@ -533,8 +574,10 @@ bool Processor::process_pure_gpu(std::vector<std::vector<uint8_t>>& extra_blocks
     }
 
     // ---- preallocate, then decode on a background thread ---------------------
+    wlap("metadata decode");
     m_pcm_data.assign(m_channels, std::vector<int32_t>());
     for (auto& ch : m_pcm_data) ch.resize((size_t)m_total_samples);
+    wlap("PCM buffer alloc");
     m_stream_mode = true;
     m_decoded.store(0, std::memory_order_relaxed);
     m_decode_done.store(false, std::memory_order_relaxed);
@@ -583,13 +626,98 @@ bool Processor::process_pure_gpu(std::vector<std::vector<uint8_t>>& extra_blocks
         }
     });
 
-    std::thread decode_thread([this, decoder]() {
-        const bool ok = FLAC__stream_decoder_process_until_end_of_stream(decoder);
-        if (!ok || m_decoded.load(std::memory_order_relaxed) != m_total_samples)
-            m_decode_failed.store(true, std::memory_order_release);
-        m_decode_done.store(true, std::memory_order_release);
-        m_decode_cv.notify_all();
-    });
+    // Parallel decode. libFLAC is single-threaded and its decode was 109 ms of a
+    // 148 ms wall clock against ~99 ms of device time, so the two were co-bound
+    // and cutting either alone bought nothing. Frames are independent once you
+    // know where they start, and each worker learns that by seeking: the stream
+    // is split into contiguous ranges, worker i seeks to its start and decodes
+    // until it passes its end. Each frame is placed by its own sample number and
+    // clipped to the worker's range, so there is exactly one writer per sample.
+    //
+    // The first worker reuses the already-open decoder (it starts at 0 and needs
+    // no seek); the rest open their own.
+    unsigned nthr = std::thread::hardware_concurrency();
+    nthr = std::max(1u, std::min(nthr ? nthr / 2 : 1u, 8u));
+    if (const char* e = std::getenv("FLACOUT_PG_DECODE_THREADS"))
+        nthr = std::max(1, std::min(32, atoi(e)));
+    if (m_total_samples < 4ull * m_config.pg_block_size) nthr = 1;
+
+    // Ranges are block-aligned so the published prefix always lands on a frame
+    // boundary the encoder can consume.
+    const uint64_t blk = std::max(1u, m_config.pg_block_size);
+    uint64_t rlen = (m_total_samples + nthr - 1) / nthr;
+    rlen = ((rlen + blk - 1) / blk) * blk;
+    nthr = (unsigned)((m_total_samples + rlen - 1) / rlen);
+    m_range_len = rlen;
+    m_range_done.assign(nthr, 0);
+
+    std::vector<std::thread> decoders;
+    std::atomic<unsigned> live{nthr};
+    for (unsigned i = 0; i < nthr; ++i) {
+        decoders.emplace_back([this, i, rlen, decoder, &live, t_origin]() {
+            const uint64_t lo = (uint64_t)i * rlen;
+            const uint64_t hi = std::min(lo + rlen, m_total_samples);
+            t_range_lo = lo;
+            t_range_hi = hi;
+
+            FLAC__StreamDecoder* d = decoder;
+            bool own = false;
+            if (i != 0) {
+                d = FLAC__stream_decoder_new();
+                if (d && FLAC__stream_decoder_init_file(
+                             d, m_input.c_str(), write_callback, nullptr,
+                             error_callback, this)
+                         == FLAC__STREAM_DECODER_INIT_STATUS_OK) {
+                    own = true;
+                } else {
+                    if (d) FLAC__stream_decoder_delete(d);
+                    m_decode_failed.store(true, std::memory_order_release);
+                    m_decode_cv.notify_all();
+                    if (--live == 0) {
+                        m_decode_done.store(true, std::memory_order_release);
+                        m_decode_cv.notify_all();
+                    }
+                    return;
+                }
+                if (!FLAC__stream_decoder_seek_absolute(d, lo)) {
+                    FLAC__stream_decoder_delete(d);
+                    m_decode_failed.store(true, std::memory_order_release);
+                    m_decode_cv.notify_all();
+                    if (--live == 0) {
+                        m_decode_done.store(true, std::memory_order_release);
+                        m_decode_cv.notify_all();
+                    }
+                    return;
+                }
+            }
+
+            // Decode frame by frame until this range is covered. The seek already
+            // positioned inside it, and process_single stops at end of stream.
+            bool ok = true;
+            for (;;) {
+                const FLAC__StreamDecoderState st = FLAC__stream_decoder_get_state(d);
+                if (st == FLAC__STREAM_DECODER_END_OF_STREAM) break;
+                if (st == FLAC__STREAM_DECODER_ABORTED ||
+                    st == FLAC__STREAM_DECODER_OGG_ERROR ||
+                    st == FLAC__STREAM_DECODER_SEEK_ERROR ||
+                    st == FLAC__STREAM_DECODER_MEMORY_ALLOCATION_ERROR) { ok = false; break; }
+                if (!FLAC__stream_decoder_process_single(d)) { ok = false; break; }
+                if (t_frame_end >= hi) break;
+            }
+            if (own) FLAC__stream_decoder_delete(d);
+            if (!ok) m_decode_failed.store(true, std::memory_order_release);
+
+            advance_decoded(i);
+            if (--live == 0) {
+                m_decode_done.store(true, std::memory_order_release);
+                m_decode_cv.notify_all();
+                if (std::getenv("FLACOUT_PG_WALL"))
+                    std::printf("  wall %-24s %7.2f ms\n", "[decode complete at]",
+                                1e3 * std::chrono::duration<double>(
+                                    std::chrono::steady_clock::now() - t_origin).count());
+            }
+        });
+    }
 
     // The barrier the encoder blocks on. Returns false rather than deadlocking if
     // the decoder dies or ends short.
@@ -605,7 +733,7 @@ bool Processor::process_pure_gpu(std::vector<std::vector<uint8_t>>& extra_blocks
     };
 
     auto finish_decode = [&]() {
-        if (decode_thread.joinable()) decode_thread.join();
+        for (auto& th : decoders) if (th.joinable()) th.join();
         // The decode thread's exit notifies the cv, so the MD5 consumer cannot
         // still be waiting once that join returns.
         if (md5_thread.joinable()) md5_thread.join();
@@ -634,6 +762,7 @@ bool Processor::process_pure_gpu(std::vector<std::vector<uint8_t>>& extra_blocks
     if (m_config.verbose)
         std::cout << "Pure GPU: " << enc.why() << "\n";
 
+    wlap("Vulkan init (overlapped)");
     const std::string tmp_output = m_output + ".partial";
     std::fstream out(tmp_output,
                      std::ios::binary | std::ios::out | std::ios::trunc);
@@ -658,6 +787,7 @@ bool Processor::process_pure_gpu(std::vector<std::vector<uint8_t>>& extra_blocks
                   (std::streamsize)blk.size());
     }
 
+    wlap("open + header");
     PureGpuEncoder::Stats st{};
     bool wrote_ok = true;
     const bool enc_ok = enc.encode(m_pcm_data,
@@ -667,7 +797,9 @@ bool Processor::process_pure_gpu(std::vector<std::vector<uint8_t>>& extra_blocks
             return true;
         }, &st, wait_for);
 
+    wlap("encode (overlapped decode)");
     finish_decode();
+    wlap("join decode/md5");
 
     if (!enc_ok || !wrote_ok || m_decode_failed.load(std::memory_order_acquire)) {
         std::cerr << "Error: "
@@ -699,6 +831,7 @@ bool Processor::process_pure_gpu(std::vector<std::vector<uint8_t>>& extra_blocks
     }
     out.close();
 
+    wlap("streaminfo patch + close");
     if (std::rename(tmp_output.c_str(), m_output.c_str()) != 0) {
         std::cerr << "Error: could not finalize output file: " << m_output << "\n";
         std::remove(tmp_output.c_str());
@@ -734,19 +867,30 @@ FLAC__StreamDecoderWriteStatus Processor::write_callback(
     uint32_t bsize = frame->header.blocksize;
 
     if (self->m_stream_mode) {
-        // Preallocated; write at the published offset and republish after.
-        const uint64_t at = self->m_decoded.load(std::memory_order_relaxed);
-        if (at + bsize > self->m_total_samples) {
-            self->m_decode_failed.store(true, std::memory_order_release);
-            self->m_decode_cv.notify_all();
-            return FLAC__STREAM_DECODER_WRITE_STATUS_ABORT;
-        }
-        for (uint32_t c = 0; c < nch; ++c)
-            std::memcpy(self->m_pcm_data[c].data() + at, buffer[c],
-                        (size_t)bsize * sizeof(int32_t));
+        // The frame carries its own position, so a thread that seeked into the
+        // middle of the stream writes to the right place and ranges may complete
+        // in any order.
+        uint64_t at;
+        if (frame->header.number_type == FLAC__FRAME_NUMBER_TYPE_SAMPLE_NUMBER)
+            at = frame->header.number.sample_number;
+        else
+            at = (uint64_t)frame->header.number.frame_number * bsize;
 
-        self->m_decoded.store(at + bsize, std::memory_order_release);
-        self->m_decode_cv.notify_all();
+        // Clip to this worker's range. A seek lands on the frame *containing* the
+        // target sample, so the first frame usually starts before it -- those
+        // samples belong to the previous range and are written by its owner.
+        // Clipping keeps exactly one writer per sample rather than relying on two
+        // writers agreeing.
+        const uint64_t lo = std::max(at, t_range_lo);
+        const uint64_t hi = std::min(at + bsize,
+                                     std::min(t_range_hi, self->m_total_samples));
+        t_frame_end = at + bsize;
+        if (hi > lo)
+            for (uint32_t c = 0; c < nch; ++c)
+                std::memcpy(self->m_pcm_data[c].data() + lo,
+                            buffer[c] + (lo - at),
+                            (size_t)(hi - lo) * sizeof(int32_t));
+
         return FLAC__STREAM_DECODER_WRITE_STATUS_CONTINUE;
     }
 

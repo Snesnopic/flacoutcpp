@@ -591,6 +591,80 @@ arithmetic is nearly free. Device total 91.6 → 104.4 ms; master mix wall clock
 better than anything on the CPU's own frontier, where the whole estimated-DP dial
 spans ~0.1% for 6.4x.
 
+## Absolute throughput: parallel decode, then the real candidate frontier
+
+Two changes, and the second one caught a measurement mistake worth recording.
+
+### The decode had to be parallelised to make anything else pay
+
+With `FLACOUT_PG_WALL=1`, the master mix's 148 ms broke down as ~3 ms buffer
+allocation, ~30 ms Vulkan init (overlapped with decode), and a 115 ms
+encode phase that was *waiting on the decode* — libFLAC's single-threaded decode
+was ~109 ms against ~99 ms of device time. Being co-bound is why cutting either
+alone had bought nothing.
+
+Frames are independent once you know where they start, and a seek is how a worker
+finds out. The stream is split into block-aligned contiguous ranges; worker *i*
+seeks to its start and decodes until it passes its end. Each frame is placed by
+**its own sample number** (from the frame header, not a running counter) and
+clipped to the worker's range, so there is exactly one writer per sample — a seek
+lands on the frame *containing* the target, so the first frame usually starts
+before it, and clipping is what keeps two workers from both writing those samples.
+
+The published counter advances only as a **contiguous prefix** of ranges
+completes, which preserves the "anything below this is readable" rule that the
+encoder and the MD5 consumer both depend on.
+
+```
+decode threads    1      2      4      6      8     12
+decode done at  99.8   59.3   33.6   23.1   18.2   16.4  ms
+```
+
+5.5x at 8 threads (the default is `min(cores/2, 8)`; `FLACOUT_PG_DECODE_THREADS`
+overrides). Decode stops being the bound: 18 ms against ~99 ms of device work.
+Vulkan init also fell from 30 ms to 18 ms, because `vkCreateInstance` had been
+contending with the old single decode thread (24.7 ms under load, 12.3 ms idle).
+
+### Windows are worth more than orders — but measure *device* time, not sweep time
+
+The default was 4 windows x 8 orders. Sweeping the two axes on MLKDream showed it
+**dominated in both directions**, and the frontier is much flatter in orders than
+in windows.
+
+The trap: a first pass measured only *sweep* time, concluded 10 windows x 2 orders
+(sweep 44 ms against 61 ms) and made the encoder **slower overall** — because the
+**autocorrelation also scales with window count** (14 ms at 4 windows, 30 ms at
+10), and it is the second-largest stage. On total device time:
+
+| config | total | MLKDream | master mix |
+|---|---|---|---|
+| 4w x 4o | 107.3 ms | 28032077 | 16930720 |
+| 4w x 8o | 127.2 ms | 28027341 | 16927410 |
+| **6w x 3o** | **109.4 ms** | **28008023** | **16925777** |
+| 8w x 3o | 123.9 ms | 28005095 | 16896703 |
+| 10w x 3o | 140.3 ms | 28003888 | 16883922 |
+
+6w x 3o is faster *and* smaller than the old default on both fixtures, so it is
+the new one. The six are the dense tapers of the CPU's shortlist (which is those
+six plus the partial/punchout pair at each offset). Note 10w x 3o is another
+0.24% smaller on the master mix if size is what matters — the knobs expose the
+whole frontier.
+
+### Result
+
+| fixture | `-P` | at first commit | CPU default | speedup | size vs 4w8o |
+|---|---|---|---|---|---|
+| music_10s | 0.059 s | 0.075 s | 0.138 s | 2.32x | -0.01% |
+| music_20s | 0.065 s | 0.084 s | 0.200 s | 3.06x | -0.02% |
+| MLKDream | 0.164 s | 0.421 s | 1.485 s | **9.04x** | -0.07% |
+| master mix | 0.145 s | 0.412 s | 0.990 s | 6.83x | -0.01% |
+| syn3m_mix | 0.144 s | 0.395 s | 0.941 s | 6.54x | +0.49% |
+| s24_2s | 0.052 s | — | 0.089 s | 1.71x | +1.24% |
+
+Faster everywhere and smaller on all real music; the two synthetic fixtures pay
+for the shallower order search and want `--pg-orders 8` back. Against the first
+working commit this is **2.6-2.8x** on the long fixtures.
+
 ## Block size: the cap was worth raising, a device-side DP is not
 
 The residual gap after the double-float fix was ~3.9%, of which the fixed

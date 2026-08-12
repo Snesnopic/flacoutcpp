@@ -112,7 +112,7 @@ struct ProcessorConfig {
     std::vector<int> pg_precisions;
 
     /// See flacoutcpp::Config::pg_orders.
-    uint32_t pg_orders = 8;
+    uint32_t pg_orders = 3;
 
     /// See flacoutcpp::Config::pg_partition_cap.
     uint32_t pg_partition_cap = 4;
@@ -234,7 +234,17 @@ private:
     // encoder may read anything below what it has acquired. That is the whole
     // synchronisation: no lock on the sample data itself.
     bool                  m_stream_mode = false;
+    /// Highest sample count that is complete *contiguously* from zero. With a
+    /// parallel decode the ranges finish out of order, so this advances only as a
+    /// prefix of them completes -- which is what lets readers keep the simple
+    /// "anything below this is readable" rule.
     std::atomic<uint64_t> m_decoded{0};
+    /// One entry per decode range; see advance_decoded().
+    std::vector<uint8_t>  m_range_done;
+    uint64_t              m_range_len = 0;
+    /// Mark range `idx` complete and push m_decoded as far as the contiguous
+    /// prefix now reaches. Takes m_decode_mu.
+    void advance_decoded(size_t idx);
     std::atomic<bool>     m_decode_done{false};
     std::atomic<bool>     m_decode_failed{false};
     std::mutex              m_decode_mu;

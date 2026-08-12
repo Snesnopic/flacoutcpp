@@ -1,0 +1,138 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic      : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle    : require
+//
+// Pure-GPU encoder, stage 3: Levinson-Durbin for every order 1..32.
+//
+// **One subgroup per solve, lane j holding a[j].** That is the whole trick, and
+// it is not a stylistic choice: the CPU keeps `double ld_a[33][33]` (~8 KB) on
+// the stack, and a private array that size per lane is a rout, not a spill.
+// shaders/sweep.comp already records that a bare `int qc[32]` cost a quarter of
+// the register budget at SIMD32 and had to be deleted.
+//
+// Only two rows of ld_a are ever live, and with lane j holding row element j the
+// recursion's two inner loops collapse to one subgroup op each:
+//
+//   lambda = autoc[ord] - sum_j a[j]*autoc[ord-1-j]      -> subgroupAdd
+//   a'[j]  = a[j] - k * a[ord-2-j]                       -> subgroupShuffle
+//
+// ~32 sequential steps of ~3 subgroup ops. No private arrays, no shared memory.
+// Order <= 32 and subgroup == 32 line up exactly; the host pins the width.
+//
+// Parallelism is across the batch, not within a solve: a chunk holds
+// nblk x nsig x nwin independent subgroups, which is thousands.
+
+#define LOCAL 128
+#define NLAG  33
+#define MAXO  32
+
+layout(local_size_x = LOCAL) in;
+
+layout(std430, binding = 0) readonly  buffer Autoc { float autoc[]; };
+layout(std430, binding = 1) writeonly buffer Lpcf  { float lpcf[];  };
+// Residual energy after predicting at each order -- err[0] is the unpredicted
+// energy. This is what makes an order shortlist possible: it is the exact
+// quantity the CPU's ranked search (-c) ranks by, and the recursion already has
+// it in hand, so the ranking costs one store per order. Orders the recursion
+// never reached are left negative and must be skipped by readers.
+layout(std430, binding = 2) writeonly buffer Err   { float err[];    };
+
+layout(push_constant) uniform PC {
+    int   nsolve;   // nblk * nsig * nwin
+    float ridge;    // white-noise correction on lag 0; see below
+} pc;
+
+void main() {
+    // Clamp rather than return early: every subgroup op below needs uniform
+    // control flow across the subgroup, and the stores are gated instead.
+    const uint raw  = gl_WorkGroupID.x * (LOCAL / 32u) + gl_SubgroupID;
+    const bool live = raw < uint(pc.nsolve);
+    const uint idx  = live ? raw : 0u;
+
+    const uint j  = gl_SubgroupInvocationID;
+    const uint ab = idx * NLAG;       // autocorrelation base
+    const uint eb = idx * NLAG;       // per-order error base (same shape)
+    const uint lb = idx * MAXO * MAXO;  // coefficient base
+
+    // ---- the fp32 instability problem, and the shape of the fix --------------
+    //
+    // The autocorrelation of a finite sequence is positive semi-definite, which
+    // is what guarantees |PARCOR| < 1 at every order. Computed in fp32 it is
+    // only PSD to ~1e-7, so a near-singular solve can produce |k| >= 1 from
+    // rounding alone -- and the recursion then has to abandon that order *and
+    // every order above it*, which is exactly where the good predictors live.
+    //
+    // Measured on s24_2s: the side channel lost every candidate of order >= 7,
+    // leaving orders 1-6 and a subframe roughly twice the size the CPU found
+    // (46649 bits against ~23600 for the CPU's order 7).
+    //
+    // The textbook fix is a white-noise correction -- inflate lag 0 by a
+    // relative epsilon, equivalent to adding a hair of white noise to the
+    // signal, which strictly improves diagonal dominance. **Applied globally it
+    // is a bad trade**, because it also biases every solve that was already
+    // fine. Swept, output bytes:
+    //
+    //   ridge     s24_2s   stereo_4s   music_3s   music_10s
+    //   0         348745      349350     486300     1667289
+    //   1e-6      338721      329645     492044     1680691
+    //   1e-5      351810      353673     503636     1715166
+    //
+    // So it is applied per solve, on demand: run clean, and only if the
+    // recursion broke early retry with escalating ridge, filling in *just* the
+    // orders the clean pass never reached. Solves that never break are
+    // bit-for-bit unaffected, so real music does not pay for the fixtures that
+    // need this. Worst case is 3x the Levinson work, a rounding error next to
+    // the sweep.
+    if (live && j == 0u) {
+        err[eb] = autoc[ab];
+        for (int o = 1; o <= MAXO; ++o) err[eb + uint(o)] = -1.0;
+    }
+
+    int from = 1;   // lowest order whose coefficient row is still unwritten
+
+    for (int att = 0; att < 3 && from <= MAXO; ++att) {
+        const float r = (att == 0) ? 0.0
+                      : ((att == 1) ? pc.ridge : pc.ridge * 100.0);
+        float e = autoc[ab] * (1.0 + r);
+        // A degenerate block (silence, or a window that zeroed everything) has
+        // no predictor at all, and no ridge changes that.
+        if (e <= 0.0) break;
+
+        const int f0 = from;
+        float A = 0.0;
+        int reached = 0;
+
+        for (int ord = 1; ord <= MAXO; ++ord) {
+            const float term = (int(j) <= ord - 2)
+                             ? A * autoc[ab + uint(ord - 1 - int(j))] : 0.0;
+            const float k    = (autoc[ab + uint(ord)] - subgroupAdd(term)) / e;
+
+            if (abs(k) >= 1.0) break;
+
+            // Read the reversed element before overwriting A. The index is only
+            // meaningful for j <= ord-2; clamp so the shuffle is well-formed.
+            const float rev =
+                subgroupShuffle(A, uint(clamp(ord - 2 - int(j), 0, MAXO - 1)));
+
+            A = (int(j) == ord - 1) ? k
+              : ((int(j) <= ord - 2) ? A - k * rev : A);
+
+            e *= (1.0 - k * k);
+            if (e <= 0.0) e = 1e-10;
+            reached = ord;
+
+            if (live && ord >= f0) {
+                lpcf[lb + uint((ord - 1) * MAXO) + j] = (int(j) < ord) ? A : 0.0;
+                if (j == 0u) err[eb + uint(ord)] = e;
+            }
+        }
+        from = max(from, reached + 1);
+    }
+
+    // Orders no attempt reached get all-zero coefficients, which pg_quant turns
+    // into an invalid candidate that loses on cost -- the same outcome as the
+    // CPU giving up on an unstable filter.
+    for (int o = from; o <= MAXO; ++o)
+        if (live) lpcf[lb + uint((o - 1) * MAXO) + j] = 0.0;
+}

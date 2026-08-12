@@ -1,0 +1,132 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic      : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+//
+// Pure-GPU encoder, stage 7: pick the winning subframe per signal, then the
+// stereo pairing per block.
+//
+// One workgroup per block, looping the signals. Two reductions:
+//
+//  (a) argmin over this signal's candidates, against the two closed-form modes.
+//      CONSTANT and VERBATIM need no residual and no sweep -- CONSTANT is
+//      settled by the min==max flag stage 1 already reduced, VERBATIM is
+//      arithmetic on the block size -- so they enter the argmin as costs, not as
+//      candidates.
+//
+//  (b) the stereo pairing, which is a min over four sums of (a)'s results:
+//
+//        INDEPENDENT  L + R        LEFT_SIDE   L + S
+//        MID_SIDE     M + S        RIGHT_SIDE  S + R
+//
+//      Each signal's cost already carries its own effective bps, so the side
+//      channel's extra bit is priced where it is paid and this stays a sum.
+//
+// The winner is recorded as a candidate slot, or a negative sentinel for the two
+// closed-form modes. Stage 8 re-derives everything else from the slot.
+
+#define LOCAL 256
+#define CSTRIDE 36
+#define WIN_VERBATIM (-1)
+#define WIN_CONSTANT (-2)
+#define PLAN_STRIDE 8
+
+layout(local_size_x = LOCAL) in;
+
+layout(std430, binding = 0) readonly  buffer Cands   { int  cand[];    };
+layout(std430, binding = 1) readonly  buffer OutCost { uint outCost[]; };
+layout(std430, binding = 2) readonly  buffer Meta    { uint meta[];    };
+layout(std430, binding = 3) writeonly buffer Plan    { int  plan[];     };
+
+layout(push_constant) uniform PC {
+    int nblk;
+    int bsize;
+    int nsig;
+    int ncand;
+    int bps;
+} pc;
+
+shared uint sCost[LOCAL / 32];
+shared int  sSlot[LOCAL / 32];
+shared uint gCost[4];
+shared int  gSlot[4];
+
+void main() {
+    const int blk = int(gl_WorkGroupID.x);
+    const int t   = int(gl_LocalInvocationID.x);
+
+    for (int sgi = 0; sgi < pc.nsig; ++sgi) {
+        const int  bs     = sgi * pc.nblk + blk;
+        const uint m      = meta[bs];
+        const int  wasted = int(m & 0xFFu);
+        const bool isCon  = (m & 0x100u) != 0u;
+        const int  bpsCh  = pc.bps + ((sgi == 3) ? 1 : 0);
+        const int  effBps = bpsCh - wasted;
+        const int  subhdr = 8 + ((wasted > 0) ? wasted : 0);
+
+        uint best = 0xFFFFFFFFu;
+        int  slot = WIN_VERBATIM;
+
+        for (int s = t; s < pc.ncand; s += LOCAL) {
+            const uint rc = outCost[bs * pc.ncand + s];
+            if (rc == 0xFFFFFFFFu) continue;          // kernel declined this one
+            const uint tot = uint(cand[(bs * pc.ncand + s) * CSTRIDE + 3]) + rc;
+            if (tot < best) { best = tot; slot = s; }
+        }
+
+        // Ties go to the lower slot so the choice does not depend on which lane
+        // reduced first -- the pipeline is deterministic and should stay so.
+        const uint sgBest = subgroupMin(best);
+        const int  sgSlot  = subgroupMin((best == sgBest) ? slot : 0x7FFFFFFF);
+        if (subgroupElect()) {
+            sCost[gl_SubgroupID] = sgBest;
+            sSlot[gl_SubgroupID] = sgSlot;
+        }
+        barrier();
+
+        if (t == 0) {
+            uint b = 0xFFFFFFFFu; int sl = WIN_VERBATIM;
+            for (int k = 0; k < LOCAL / 32; ++k)
+                if (sCost[k] < b || (sCost[k] == b && sSlot[k] < sl)) { b = sCost[k]; sl = sSlot[k]; }
+
+            const uint vcost = uint(subhdr + effBps * pc.bsize);
+            if (vcost < b) { b = vcost; sl = WIN_VERBATIM; }
+            if (isCon) {
+                const uint ccost = uint(subhdr + effBps);
+                if (ccost < b) { b = ccost; sl = WIN_CONSTANT; }
+            }
+            gCost[sgi] = b;
+            gSlot[sgi] = sl;
+        }
+        barrier();
+    }
+
+    if (t != 0) return;
+
+    const int po = blk * PLAN_STRIDE;
+
+    if (pc.nsig == 1) {
+        plan[po + 0] = 0;
+        plan[po + 1] = 0;   plan[po + 2] = -1;
+        plan[po + 3] = gSlot[0]; plan[po + 4] = 0;
+        plan[po + 5] = int(gCost[0]); plan[po + 6] = 0;
+        plan[po + 7] = 0;
+        return;
+    }
+
+    const uint tIndep = gCost[0] + gCost[1];
+    const uint tLeft  = gCost[0] + gCost[3];
+    const uint tRight = gCost[3] + gCost[1];
+    const uint tMid   = gCost[2] + gCost[3];
+
+    int mode = 0, a = 0, b = 1;
+    uint best = tIndep;
+    if (tLeft  < best) { best = tLeft;  mode = 8;  a = 0; b = 3; }
+    if (tRight < best) { best = tRight; mode = 9;  a = 3; b = 1; }
+    if (tMid   < best) { best = tMid;   mode = 10; a = 2; b = 3; }
+
+    plan[po + 0] = mode;
+    plan[po + 1] = a;         plan[po + 2] = b;
+    plan[po + 3] = gSlot[a];  plan[po + 4] = gSlot[b];
+    plan[po + 5] = int(gCost[a]); plan[po + 6] = int(gCost[b]);
+    plan[po + 7] = 0;
+}

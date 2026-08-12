@@ -78,6 +78,11 @@ bool optimise(const std::string& input_path, const std::string& output_path, con
     pc.gpu_partition_cap = config.gpu_partition_cap;
     pc.gpu_slots      = config.gpu_slots;
     pc.gpu_duty       = config.gpu_duty;
+    pc.pure_gpu       = config.pure_gpu;
+    pc.pg_block_size  = config.pg_block_size;
+    pc.pg_precisions  = config.pg_precisions;
+    pc.pg_orders      = config.pg_orders;
+    pc.pg_blocks_per_chunk = config.pg_blocks_per_chunk;
     pc.dp_candidates = config.dp_candidates;
     pc.reuse_frames  = config.reuse_frames;
     pc.warn_superior = config.warn_superior;

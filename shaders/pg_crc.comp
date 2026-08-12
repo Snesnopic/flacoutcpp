@@ -1,0 +1,64 @@
+#version 450
+//
+// Pure-GPU encoder, stage 12: CRC-16 over each finished frame.
+//
+// CRC-16 covers header *and* payload, so unlike CRC-8 it cannot run until the
+// packer has finished. One lane per frame, byte at a time through a table the
+// workgroup builds in shared memory on entry -- 256 lanes, one table entry each,
+// so no host upload and no constant buffer.
+//
+// This is the simple thing on purpose. CRC is linear over GF(2), so
+// CRC(A||B) is recoverable from CRC(A), CRC(B) and |B|, which would make it a
+// subgroup reduce over chunks of one frame. With hundreds of frames in flight
+// there is already enough parallelism to saturate the device, so the combine
+// trick would buy latency on the last frame and nothing else. Revisit only if a
+// profile puts this kernel on the critical path.
+
+#define LOCAL 256
+#define FINFO_STRIDE 4
+
+layout(local_size_x = LOCAL) in;
+
+layout(std430, binding = 0) readonly buffer Finfo { uint finfo[]; };
+layout(std430, binding = 1)          buffer Out   { uint outw[];  };
+
+layout(push_constant) uniform PC {
+    int nframe;
+} pc;
+
+shared uint tbl[256];
+
+// File byte `pos` is the (pos & 3)-th low byte of word (pos >> 2) on a
+// little-endian host -- the same convention the packer's byte-swap produces.
+uint getByte(uint pos) {
+    return (outw[pos >> 2] >> (8u * (pos & 3u))) & 0xFFu;
+}
+
+void putByte(uint pos, uint v) {
+    atomicOr(outw[pos >> 2], (v & 0xFFu) << (8u * (pos & 3u)));
+}
+
+void main() {
+    const uint t = gl_LocalInvocationID.x;
+
+    uint c = t << 8;
+    for (int j = 0; j < 8; ++j)
+        c = ((c & 0x8000u) != 0u) ? (((c << 1) ^ 0x8005u) & 0xFFFFu)
+                                  : ((c << 1) & 0xFFFFu);
+    tbl[t] = c;
+    barrier();
+
+    const uint f = gl_GlobalInvocationID.x;
+    if (f >= uint(pc.nframe)) return;
+
+    const uint bo = finfo[f * FINFO_STRIDE + 0];
+    const uint nb = finfo[f * FINFO_STRIDE + 1];
+
+    // The CRC covers everything before its own two bytes.
+    uint crc = 0u;
+    for (uint i = 0u; i < nb - 2u; ++i)
+        crc = ((crc << 8) ^ tbl[((crc >> 8) ^ getByte(bo + i)) & 0xFFu]) & 0xFFFFu;
+
+    putByte(bo + nb - 2u, crc >> 8);
+    putByte(bo + nb - 1u, crc);
+}

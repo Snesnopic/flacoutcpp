@@ -1,0 +1,186 @@
+#version 450
+//
+// Pure-GPU encoder, stage 4: quantize float LPC coefficients to the integers the
+// bitstream carries, and build the candidate records the sweep prices.
+//
+// One lane per (solve, order, precision). The error-feedback loop is strictly
+// sequential in the tap index -- each rounding decision feeds the next -- so it
+// cannot be spread across lanes, but there are nblk*nsig*nwin*32*nprec of them,
+// which is hundreds of thousands. Sequential *within* a lane, embarrassingly
+// parallel across them. (Folding this into the Levinson subgroup instead would
+// serialise ~512 steps behind 31 idle lanes; measured on paper as the wrong
+// side of the sweep's own cost, so it stays a separate dispatch.)
+//
+// A CANDIDATE IS THE UNIT OF WORK FOR EVERYTHING DOWNSTREAM. Layout, 36 ints:
+//
+//   0 order   1 shift   2 sample offset   3 header bits (incl. the +6 residual
+//   header)   4..35 qc[32]
+//
+// `header bits` is everything the subframe costs that is *not* residual: the
+// subframe header, the wasted-bits unary, warm-up samples, and for LPC the
+// precision/shift/coefficient fields. The sweep returns residual bits only, so
+// stage 6 just adds the two. Invalid candidates get INVALID_HDR and lose on
+// cost rather than needing a validity flag -- the sweep still prices them, which
+// is wasted work but not wrong work.
+
+#define MAXO 32
+#define CSTRIDE 36
+#define INVALID_HDR 0x10000000
+// A candidate the sweep should not spend a subgroup on at all. Distinct from
+// INVALID_HDR, which still gets priced (and still loses): this one short-circuits
+// before any subgroup op, which is what makes an order shortlist cheap.
+#define SKIP_ORDER (-1)
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly  buffer Lpcf  { float lpcf[]; };
+layout(std430, binding = 1) readonly  buffer Meta  { uint  meta[]; };
+layout(std430, binding = 2) writeonly buffer Cands { int   cand[]; };
+layout(std430, binding = 3) readonly  buffer Err   { float err[];  };
+
+layout(push_constant) uniform PC {
+    int  nblk;
+    int  bsize;
+    int  nsig;
+    int  nwin;
+    int  nprec;
+    int  ncand;     // candidate slots per (signal, block)
+    int  bps;
+    // The nprec precisions to try, low index first. Four scalars rather than an
+    // ivec4 because a vec4 in a push-constant block carries a 16-byte alignment
+    // rule that silently shifts every field after it.
+    int  prec0, prec1, prec2, prec3;
+    int  norders;   // orders actually swept per (block, signal, window)
+} pc;
+
+int precAt(int p) {
+    return (p == 0) ? pc.prec0 : ((p == 1) ? pc.prec1
+         : ((p == 2) ? pc.prec2 : pc.prec3));
+}
+
+void main() {
+    const int g = int(gl_GlobalInvocationID.x);
+    const int nsolve = pc.nblk * pc.nsig * pc.nwin;
+    if (g >= nsolve * MAXO * pc.nprec) return;
+
+    const int p   = g % pc.nprec;
+    const int ord = ((g / pc.nprec) % MAXO) + 1;
+    const int idx = g / (pc.nprec * MAXO);
+
+    const int w  = idx % pc.nwin;
+    const int bs = idx / pc.nwin;          // sgi * nblk + blk
+    const int sgi = bs / pc.nblk;
+    const int blk = bs % pc.nblk;
+
+    const int prec = precAt(p);
+    const int slot = (w * MAXO + (ord - 1)) * pc.nprec + p;
+    const int co   = (bs * pc.ncand + slot) * CSTRIDE;
+
+    const uint m      = meta[bs];
+    const int  wasted = int(m & 0xFFu);
+    // Only the side channel widens; mid stays at bps because its samples are
+    // (L+R)>>1. Signal 3 is S by the stage-1 numbering.
+    const int  bpsCh  = pc.bps + ((sgi == 3) ? 1 : 0);
+    const int  effBps = bpsCh - wasted;
+
+    // Subframe header: 1 pad + 6 type + 1 wasted flag, then a `wasted`-bit
+    // unary when the flag is set (write_unary(w-1) emits w-1 zeros and a 1).
+    const int subhdr = 8 + ((wasted > 0) ? wasted : 0);
+
+    cand[co + 2] = (sgi * pc.nblk + blk) * pc.bsize;   // sample offset in sig[]
+
+    // ---- order shortlist ---------------------------------------------------
+    //
+    // Sweeping all 32 orders is what made the sweep 92% of device time, and most
+    // of that work is spent on orders that were never going to win. This is the
+    // same idea as the CPU's -c: rank by the Levinson prediction error, which the
+    // recursion produced for free, and fully evaluate only the best few.
+    //
+    // The estimate is the standard one -- residual entropy plus what the
+    // coefficients cost to name:
+    //
+    //   bits(ord) ~ 0.5 * bsize * log2(err[ord]) + ord * (prec + effBps)
+    //
+    // Constant factors and err[0] cancel because only the ordering matters. Rank
+    // is computed by counting how many orders score better rather than by
+    // sorting: each lane already needs its own score, the other 31 are one loop,
+    // and no scratch buffer or second dispatch is involved.
+    const int eb = idx * (MAXO + 1);
+    const float myErr = err[eb + ord];
+    if (myErr <= 0.0) {                 // recursion never reached this order
+        cand[co + 0] = SKIP_ORDER;
+        cand[co + 3] = INVALID_HDR;
+        return;
+    }
+    const float myScore = 0.5 * float(pc.bsize) * log2(myErr)
+                        + float(ord) * float(prec + effBps);
+    int better = 0;
+    for (int o = 1; o <= MAXO; ++o) {
+        const float oe = err[eb + o];
+        if (oe <= 0.0) continue;
+        const float sc2 = 0.5 * float(pc.bsize) * log2(oe)
+                        + float(o) * float(prec + effBps);
+        // Ties break toward the lower order, so the shortlist is deterministic.
+        if (sc2 < myScore || (sc2 == myScore && o < ord)) ++better;
+    }
+    if (better >= pc.norders) {
+        cand[co + 0] = SKIP_ORDER;
+        cand[co + 3] = INVALID_HDR;
+        return;
+    }
+
+    const int lb = idx * MAXO * MAXO + (ord - 1) * MAXO;
+
+    float cmax = 0.0;
+    for (int j = 0; j < ord; ++j) cmax = max(cmax, abs(lpcf[lb + j]));
+
+    if (cmax <= 0.0) {
+        cand[co + 0] = 1;
+        cand[co + 1] = 0;
+        cand[co + 3] = INVALID_HDR;
+        for (int j = 0; j < MAXO; ++j) cand[co + 4 + j] = 0;
+        return;
+    }
+
+    // floor(log2(cmax)) via the exponent, so a cmax below 1 *raises* the shift
+    // and quantizes more finely -- same as the CPU's frexp path.
+    int e;
+    frexp(cmax, e);
+    const int log2cmax = e - 1;
+
+    int shift = (prec - 1) - log2cmax - 1;
+    // The subframe header carries the shift in 5 signed bits.
+    if (shift > 15) shift = 15;
+    if (shift < -16) {
+        cand[co + 0] = 1;
+        cand[co + 1] = 0;
+        cand[co + 3] = INVALID_HDR;
+        for (int j = 0; j < MAXO; ++j) cand[co + 4 + j] = 0;
+        return;
+    }
+
+    const int qmax =  (1 << (prec - 1)) - 1;
+    const int qmin = -(1 << (prec - 1));
+
+    // Error feedback: the residue of each rounding is carried into the next tap,
+    // which shapes the quantization error instead of letting it accumulate. This
+    // is the part that cannot be predicted away -- CLAUDE.md records that a
+    // white-noise model of this error shrinks d'Rd by a median 2^-4.15, i.e. the
+    // feedback is doing real work.
+    const float sc = (shift >= 0) ? float(1 << shift) : 1.0 / float(1 << (-shift));
+    float acc = 0.0;
+    for (int j = 0; j < ord; ++j) {
+        acc += lpcf[lb + j] * sc;
+        // std::lround is half-away-from-zero; GLSL round() is allowed to pick
+        // either direction on a tie, so spell it out.
+        float q = (acc >= 0.0) ? floor(acc + 0.5) : ceil(acc - 0.5);
+        int qi = int(clamp(q, float(qmin), float(qmax)));
+        acc -= float(qi);
+        cand[co + 4 + j] = qi;
+    }
+    for (int j = ord; j < MAXO; ++j) cand[co + 4 + j] = 0;
+
+    cand[co + 0] = ord;
+    cand[co + 1] = max(shift, 0);   // a negative shift was folded into sc
+    cand[co + 3] = subhdr + 4 + 5 + ord * prec + ord * effBps + 6;
+}

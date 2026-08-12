@@ -1,0 +1,72 @@
+#version 450
+//
+// Pure-GPU encoder, stage 5: the FIXED predictors, as ordinary candidates.
+//
+// A FLAC fixed predictor of order f *is* an LPC predictor with integer
+// coefficients and shift 0 -- the finite-difference rows of Pascal's triangle:
+//
+//   f=0  {}            r = s[i]
+//   f=1  {1}           r = s[i] - s[i-1]
+//   f=2  {2,-1}        r = s[i] - 2s[i-1] + s[i-2]
+//   f=3  {3,-3,1}      r = s[i] - 3s[i-1] + 3s[i-2] - s[i-3]
+//   f=4  {4,-6,4,-1}   r = s[i] - 4s[i-1] + 6s[i-2] - 4s[i-3] + s[i-4]
+//
+// So the sweep kernel prices them with no special case at all: same dot product,
+// same Rice search. Only the header differs (no precision/shift/coefficient
+// fields), which is a `hdrbits` difference and nothing more.
+//
+// One lane per (signal, block, order). ~5 * nsig * nblk lanes -- a rounding
+// error next to the sweep, and it keeps the candidate set uniform so stage 6 is
+// a plain argmin over one array.
+
+#define MAXO 32
+#define CSTRIDE 36
+#define NFIXED 5
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly  buffer Meta  { uint meta[]; };
+layout(std430, binding = 1) writeonly buffer Cands { int  cand[]; };
+
+layout(push_constant) uniform PC {
+    int nblk;
+    int bsize;
+    int nsig;
+    int ncand;
+    int lpcSlots;   // nwin * 32 * nprec -- where the FIXED slots begin
+    int bps;
+} pc;
+
+const int COEF[NFIXED][4] = {
+    { 0,  0, 0,  0},
+    { 1,  0, 0,  0},
+    { 2, -1, 0,  0},
+    { 3, -3, 1,  0},
+    { 4, -6, 4, -1}
+};
+
+void main() {
+    const int g = int(gl_GlobalInvocationID.x);
+    const int nbs = pc.nblk * pc.nsig;
+    if (g >= nbs * NFIXED) return;
+
+    const int f  = g % NFIXED;
+    const int bs = g / NFIXED;
+    const int sgi = bs / pc.nblk;
+    const int blk = bs % pc.nblk;
+
+    const int co = (bs * pc.ncand + pc.lpcSlots + f) * CSTRIDE;
+
+    const uint m      = meta[bs];
+    const int  wasted = int(m & 0xFFu);
+    const int  bpsCh  = pc.bps + ((sgi == 3) ? 1 : 0);
+    const int  effBps = bpsCh - wasted;
+    const int  subhdr = 8 + ((wasted > 0) ? wasted : 0);
+
+    cand[co + 0] = f;
+    cand[co + 1] = 0;
+    cand[co + 2] = (sgi * pc.nblk + blk) * pc.bsize;
+    cand[co + 3] = subhdr + f * effBps + 6;
+    for (int j = 0; j < MAXO; ++j)
+        cand[co + 4 + j] = (j < 4) ? COEF[f][j] : 0;
+}

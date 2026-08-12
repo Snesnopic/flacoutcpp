@@ -1,0 +1,84 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic      : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+//
+// Pure-GPU encoder, stage 2: apodization window x autocorrelation, lags 0..32.
+//
+// One workgroup per (block, signal, window). The windowed block lives in shared
+// memory for the whole reduction -- 4096 floats = 16 KB, which is why MAXB is
+// 4096 and the host refuses a larger block size for this path.
+//
+// **fp32, deliberately.** The CPU path is double throughout and the project is
+// built -ffp-contract=off because a last-bit difference flips which candidate
+// wins. None of that applies here: everything upstream of the *integer*
+// coefficients is a heuristic, and a worse heuristic costs compression, never
+// losslessness. See PURE_GPU_PLAN.md.
+//
+// Two things keep fp32 honest anyway:
+//
+//  - **Samples are scaled to ~unit magnitude** (pc.scale = 2^-(bps-1)). LPC is
+//    scale-invariant -- the Levinson recursion sees only ratios of
+//    autocorrelation terms -- so this changes no decision, but it moves the
+//    products from ~2^46 down to ~2^0 and stops the sum eating the mantissa.
+//  - **The reduction is a tree, not a running sum.** Each lane folds B/LOCAL
+//    terms, then subgroups fold, then one final pass over LOCAL/32 partials.
+//    Error grows with the depth of the tree (~log B), not with B.
+
+#define LOCAL 256
+#define MAXB  4096
+#define NLAG  33
+
+layout(local_size_x = LOCAL) in;
+
+layout(std430, binding = 0) readonly  buffer Sig   { int   sig[];   };
+layout(std430, binding = 1) readonly  buffer Win   { float win[];   };
+layout(std430, binding = 2) writeonly buffer Autoc { float autoc[]; };
+
+layout(push_constant) uniform PC {
+    int   nblk;
+    int   bsize;
+    int   nwin;
+    float scale;    // 2^-(bps-1); see above
+} pc;
+
+shared float wnd[MAXB];
+shared float part[(LOCAL / 32) * NLAG];
+
+void main() {
+    const int blk = int(gl_WorkGroupID.x);
+    const int sgi = int(gl_WorkGroupID.y);
+    const int w   = int(gl_WorkGroupID.z);
+    const int B   = pc.bsize;
+    const int t   = int(gl_LocalInvocationID.x);
+
+    const int src = (sgi * pc.nblk + blk) * B;
+
+    for (int i = t; i < B; i += LOCAL)
+        wnd[i] = float(sig[src + i]) * pc.scale * win[w * B + i];
+    barrier();
+
+    float acc[NLAG];
+    for (int l = 0; l < NLAG; ++l) acc[l] = 0.0;
+
+    for (int i = t; i < B; i += LOCAL) {
+        const float x = wnd[i];
+        for (int l = 0; l < NLAG; ++l) {
+            const int j = i + l;
+            acc[l] += (j < B) ? x * wnd[j] : 0.0;
+        }
+    }
+
+    const uint sgid = gl_SubgroupID;
+    for (int l = 0; l < NLAG; ++l) {
+        const float s = subgroupAdd(acc[l]);
+        if (subgroupElect()) part[sgid * NLAG + l] = s;
+    }
+    barrier();
+
+    if (t < NLAG) {
+        float s = 0.0;
+        for (int k = 0; k < LOCAL / 32; ++k) s += part[k * NLAG + t];
+        const int idx = ((sgi * pc.nblk + blk) * pc.nwin + w);
+        autoc[idx * NLAG + t] = s;
+    }
+}

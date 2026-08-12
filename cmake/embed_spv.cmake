@@ -1,9 +1,19 @@
 # Turn a .spv into a C header holding a uint32_t array. Run at build time by
-# the FLACOUT_VULKAN branch of CMakeLists.txt; SPV and HDR come in via -D.
+# the FLACOUT_VULKAN branch of CMakeLists.txt; SPV, HDR and (optionally) SYM/SRC
+# come in via -D.
+#
+# SYM defaults to kSweepSpv so the original single-shader call site keeps working
+# unchanged; the pure-GPU path passes one symbol per kernel.
+if(NOT DEFINED SYM)
+    set(SYM "kSweepSpv")
+endif()
+if(NOT DEFINED SRC)
+    set(SRC "shaders/sweep.comp")
+endif()
 file(READ "${SPV}" _hex HEX)
 string(LENGTH "${_hex}" _len)
 math(EXPR _words "${_len} / 8")
-set(_out "// Generated from shaders/sweep.comp -- do not edit.\n#pragma once\n#include <cstdint>\n\nstatic const uint32_t kSweepSpv[] = {\n")
+set(_out "// Generated from ${SRC} -- do not edit.\n#pragma once\n#include <cstdint>\n\nstatic const uint32_t ${SYM}[] = {\n")
 set(_i 0)
 while(_i LESS _words)
     math(EXPR _off "${_i} * 8")

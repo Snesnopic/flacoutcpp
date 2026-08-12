@@ -1,0 +1,239 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+//
+// Pure-GPU encoder, stage 11: variable-length bit packing.
+//
+// This is the stage that decides whether a pure-GPU encoder is possible at all,
+// and it is the standard GPU entropy-coding shape: a length pass, a prefix scan
+// to turn lengths into absolute bit offsets, then a scatter.
+//
+// Three things make it work here:
+//
+//  1. **Disjoint bit ranges OR together in any order.** No code overlaps another,
+//     so `atomicOr` into a zeroed buffer is correct with no ordering constraint
+//     and no locks. The buffer is cleared by vkCmdFillBuffer before this runs.
+//
+//  2. **A long unary run costs one write, not many.** A Rice code is q zeros, a
+//     1, then k remainder bits. The zeros are already in the buffer, so a code
+//     of any length is exactly two atomicOrs -- the stop bit and the remainder.
+//     Long codes get *cheaper* than short ones, which is the opposite of the
+//     usual worry about unary in a fixed-width lane.
+//
+//  3. **The scan never materialises 4096 offsets.** Lane t owns CH contiguous
+//     samples; only the 256 per-lane subtotals are scanned, and each lane
+//     re-derives its own running offset in the scatter pass. psize is a power of
+//     two >= CH, so a lane's chunk never straddles a partition -- which is what
+//     lets the parameter fields be placed by the same scan.
+//
+// The bit-address convention: global bit gb lives in word gb>>5 at bit position
+// 31-(gb&31). That makes the buffer a big-endian bit stream over uint32 words,
+// which is exactly FLAC's MSB-first order, so a value spans at most two words.
+//
+// The buffer is then read back as raw bytes on a little-endian host, so each
+// word has to be byte-reversed to land in file order. That reversal is applied
+// to the *value* before the atomicOr rather than in a later pass over the
+// buffer: byte-swapping is a permutation of bit positions, so
+// bswap(a) | bswap(b) == bswap(a | b), and OR-ing pre-swapped values gives
+// exactly the swapped result. Free, and it keeps the spanning logic in the one
+// convention that makes a code cross at most one word boundary.
+
+#define LOCAL 256
+#define SFP_STRIDE 272
+#define KOFF 16
+#define FINFO_STRIDE 4
+#define PLAN_STRIDE  8
+#define CSTRIDE 36
+
+#define KIND_CONSTANT 0
+#define KIND_VERBATIM 1
+#define KIND_FIXED    2
+#define KIND_LPC      3
+
+layout(local_size_x = LOCAL) in;
+
+layout(std430, binding = 0) readonly buffer Sig   { int  sig[];   };
+layout(std430, binding = 1) readonly buffer Res   { int  res[];   };
+layout(std430, binding = 2) readonly buffer Sfp   { int  sfp[];   };
+layout(std430, binding = 3) readonly buffer Cands { int  cand[];  };
+layout(std430, binding = 4) readonly buffer Plan  { int  plan[];  };
+layout(std430, binding = 5) readonly buffer Finfo { uint finfo[]; };
+layout(std430, binding = 6)          buffer Out   { uint outw[];  };
+
+layout(push_constant) uniform PC {
+    int nblk;
+    int bsize;
+    int nsub;
+    int nsig;
+    int ncand;
+} pc;
+
+shared uint sSum[LOCAL];
+shared uint sBase[LOCAL];
+shared uint sParam[LOCAL];
+
+uint bswap(uint v) {
+    return ((v & 0x000000FFu) << 24) | ((v & 0x0000FF00u) << 8)
+         | ((v & 0x00FF0000u) >> 8) | ((v & 0xFF000000u) >> 24);
+}
+
+void putBits(uint gb, uint nbits, uint value) {
+    if (nbits == 0u) return;
+    const uint mask = (nbits >= 32u) ? 0xFFFFFFFFu : ((1u << nbits) - 1u);
+    // Shift is in [1,63] for nbits in [1,32] and off in [0,31] -- never 64,
+    // which would be undefined.
+    const uint64_t x = uint64_t(value & mask) << (64u - nbits - (gb & 31u));
+    const uint w = gb >> 5;
+    atomicOr(outw[w], bswap(uint(x >> 32)));
+    if ((gb & 31u) + nbits > 32u)
+        atomicOr(outw[w + 1u], bswap(uint(x & 0xFFFFFFFFu)));
+}
+
+void main() {
+    const int raw = int(gl_WorkGroupID.x);
+    const int blk = raw / pc.nsub;
+    const int sub = raw % pc.nsub;
+    const int t   = int(gl_LocalInvocationID.x);
+    const int B   = pc.bsize;
+    const int CH  = B / LOCAL;
+
+    const int so = raw * SFP_STRIDE;
+    const int po = blk * PLAN_STRIDE;
+
+    const int kind   = sfp[so + 0];
+    const int ord    = sfp[so + 1];
+    const int prec   = sfp[so + 2];
+    const int shift  = sfp[so + 3];
+    const int wasted = sfp[so + 4];
+    const int method = sfp[so + 5];
+    const int pord   = sfp[so + 6];
+    const int sgi    = sfp[so + 8];
+    const int effBps = sfp[so + 9];
+
+    const int off = (sgi * pc.nblk + blk) * B;
+
+    // Bit base: the frame's byte offset, its byte-aligned header, then every
+    // preceding subframe's total. Subframe boundaries carry no padding, which is
+    // why this has to be counted in bits.
+    uint gb = finfo[blk * FINFO_STRIDE + 0] * 8u + finfo[blk * FINFO_STRIDE + 2];
+    for (int s = 0; s < sub; ++s)
+        gb += uint(sfp[(blk * pc.nsub + s) * SFP_STRIDE + 10]);
+
+    const uint hdrLen = 8u + ((wasted > 0) ? uint(wasted) : 0u);
+
+    if (t == 0) {
+        uint type = 0u;
+        if (kind == KIND_VERBATIM)   type = 0x01u;
+        else if (kind == KIND_FIXED) type = 0x08u | uint(ord);
+        else if (kind == KIND_LPC)   type = 0x20u | uint(ord - 1);
+        putBits(gb, 7u, type);                       // 1 pad bit + 6 type bits
+        if (wasted > 0) {
+            putBits(gb + 7u, 1u, 1u);
+            // write_unary(wasted-1): wasted-1 zeros then a 1, so the 1 lands on
+            // the last bit of the field and the zeros are already there.
+            putBits(gb + 7u + uint(wasted), 1u, 1u);
+        } else {
+            putBits(gb + 7u, 1u, 0u);
+        }
+    }
+
+    const uint p0 = gb + hdrLen;
+
+    if (kind == KIND_CONSTANT) {
+        if (t == 0) putBits(p0, uint(effBps), uint(sig[off]));
+        return;
+    }
+
+    if (kind == KIND_VERBATIM) {
+        for (int i = t; i < B; i += LOCAL)
+            putBits(p0 + uint(i) * uint(effBps), uint(effBps), uint(sig[off + i]));
+        return;
+    }
+
+    // Warm-up samples: the first `ord` samples verbatim, shared by FIXED and LPC.
+    for (int i = t; i < ord; i += LOCAL)
+        putBits(p0 + uint(i) * uint(effBps), uint(effBps), uint(sig[off + i]));
+
+    uint rh = p0 + uint(ord) * uint(effBps);
+
+    if (kind == KIND_LPC) {
+        const int slot = plan[po + 3 + sub];
+        const int cb   = ((sgi * pc.nblk + blk) * pc.ncand + slot) * CSTRIDE;
+        if (t == 0) {
+            putBits(rh, 4u, uint(prec - 1));
+            putBits(rh + 4u, 5u, uint(shift));
+        }
+        for (int j = t; j < ord; j += LOCAL)
+            putBits(rh + 9u + uint(j) * uint(prec), uint(prec), uint(cand[cb + 4 + j]));
+        rh += 9u + uint(ord) * uint(prec);
+    }
+
+    if (t == 0) {
+        putBits(rh, 2u, uint(method));
+        putBits(rh + 2u, 4u, uint(pord));
+    }
+    const uint rbase = rh + 6u;
+
+    const int  nparts = 1 << pord;
+    const int  psize  = B / nparts;
+    const uint plen   = (method != 0) ? 5u : 4u;
+    const uint escM   = (method != 0) ? 31u : 15u;
+
+    // ---- pass 1: per-lane code-length subtotal -----------------------------
+    const int  first = t * CH;
+    const int  myp   = first / psize;
+    const int  kraw  = sfp[so + KOFF + myp];
+    const int  k     = kraw & 0xFF;
+    const bool esc   = (uint(k) >= escM);
+    const uint ebps  = uint(kraw >> 8);
+
+    const int rb = raw * B;
+    uint sum = 0u;
+    for (int i = first; i < first + CH; ++i) {
+        if (i < ord) continue;                  // warm-up carries no code
+        if (esc) { sum += ebps; continue; }
+        const uint u = (uint(res[rb + i]) << 1) ^ uint(res[rb + i] >> 31);
+        sum += (u >> k) + 1u + uint(k);
+    }
+    sSum[t] = sum;
+
+    // ---- pass 2: scan the subtotals, and the parameter fields ---------------
+    if (t == 0) {
+        uint p = 0u;
+        for (int q = 0; q < nparts; ++q) {
+            const int kr = sfp[so + KOFF + q];
+            sParam[q] = p;
+            p += plen + ((uint(kr & 0xFF) >= escM) ? 5u : 0u);
+        }
+    }
+    barrier();
+    if (t == 0) {
+        uint acc = 0u;
+        for (int i = 0; i < LOCAL; ++i) { sBase[i] = acc; acc += sSum[i]; }
+    }
+    barrier();
+
+    // ---- pass 3: scatter ----------------------------------------------------
+    uint cur = rbase + sParam[myp] + plen
+             + ((esc ? 5u : 0u)) + sBase[t];
+
+    if (first % psize == 0) {
+        const uint pgb = rbase + sParam[myp] + sBase[t];
+        putBits(pgb, plen, esc ? escM : uint(k));
+        if (esc) putBits(pgb + plen, 5u, ebps);
+    }
+
+    for (int i = first; i < first + CH; ++i) {
+        if (i < ord) continue;
+        const int r = res[rb + i];
+        if (esc) {
+            putBits(cur, ebps, uint(r));
+            cur += ebps;
+        } else {
+            const uint u = (uint(r) << 1) ^ uint(r >> 31);
+            const uint q = u >> k;
+            putBits(cur + q, 1u, 1u);            // the q zeros are already zero
+            if (k > 0) putBits(cur + q + 1u, uint(k), u & ((1u << k) - 1u));
+            cur += q + 1u + uint(k);
+        }
+    }
+}

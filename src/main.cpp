@@ -79,6 +79,31 @@ static void print_usage(const char* prog) {
         << "                       stays lossless and its size never mis-stated.\n"
         << "                       build with -DFLACOUT_VULKAN=ON and a device\n"
         << "                       with 32-lane subgroups and shaderInt64.\n"
+        << "  -P, --pure-gpu       Encode entirely on the GPU: windowing,\n"
+        << "                       autocorrelation, Levinson, quantization, the\n"
+        << "                       Rice sweep, mode choice, bit packing and both\n"
+        << "                       CRCs all run as compute dispatches. A DIFFERENT\n"
+        << "                       encoder, not a backend for -G: fixed block size,\n"
+        << "                       no DP, no reuse, fp32 analysis. Output is\n"
+        << "                       lossless but not byte-identical to the CPU path,\n"
+        << "                       so verify by decoding, not with cmp. Ignores\n"
+        << "                       -c/-p/-L/-e/-E/-Q/-b/-a. MD5 stays on a host\n"
+        << "                       thread (it cannot be parallelized) and overlaps\n"
+        << "                       the encode, so it is free.\n"
+        << "      --pg-block N       Frame size for -P: multiple of 256, <= 4096\n"
+        << "                       (default 4096).\n"
+        << "      --pg-prec L        Comma-separated LPC precisions to sweep\n"
+        << "                       (1-4 of them, each 5-15; default 15).\n"
+        << "      --pg-orders N      LPC orders swept per (block, signal, window)\n"
+        << "                       out of 32, ranked by Levinson error (default\n"
+        << "                       8; 32 = all). The dominant speed knob: the Rice\n"
+        << "                       sweep is ~92% of device time. On a 188-track\n"
+        << "                       mix, against all 32: 8 costs +0.028% for 2.8x,\n"
+        << "                       4 costs +0.084% for 4.2x, 1 costs +0.30% for\n"
+        << "                       6.6x.\n"
+        << "      --pg-chunk N       Frames per device chunk (default 256). Bounds\n"
+        << "                       peak device memory; frames are independent at a\n"
+        << "                       fixed block size, so this costs only memory.\n"
         << "  -Q, --lattice N      Refine the winning subframe's quantized LPC\n"
         << "                       coefficients by coordinate descent: try each\n"
         << "                       tap at +-1, keep what lowers the exact cost,\n"
@@ -300,6 +325,81 @@ int main(int argc, char* argv[]) {
             // only the unlimited sweep produces, and the precision ladder
             // exists to dodge CPU cost that the GPU does not pay.
             cfg.use_gpu = true;
+
+        } else if (arg == "-P" || arg == "--pure-gpu") {
+            cfg.pure_gpu = true;
+
+        } else if (arg == "--pg-block") {
+            if (i + 1 >= argc) { std::cerr << "Error: --pg-block requires a number.\n"; return EXIT_FAILURE; }
+            ++i;
+            try {
+                cfg.pg_block_size = (uint32_t)std::stoul(argv[i]);
+            } catch (const std::exception&) {
+                std::cerr << "Error: --pg-block requires a number, got '" << argv[i] << "'.\n";
+                return EXIT_FAILURE;
+            }
+            if (cfg.pg_block_size % 256 != 0 || cfg.pg_block_size < 256 ||
+                cfg.pg_block_size > 4096) {
+                std::cerr << "Error: --pg-block must be a multiple of 256 in [256, 4096].\n";
+                return EXIT_FAILURE;
+            }
+
+        } else if (arg == "--pg-orders") {
+            if (i + 1 >= argc) { std::cerr << "Error: --pg-orders requires a number.\n"; return EXIT_FAILURE; }
+            ++i;
+            try {
+                cfg.pg_orders = (uint32_t)std::stoul(argv[i]);
+            } catch (const std::exception&) {
+                std::cerr << "Error: --pg-orders requires a number, got '" << argv[i] << "'.\n";
+                return EXIT_FAILURE;
+            }
+            if (cfg.pg_orders < 1 || cfg.pg_orders > 32) {
+                std::cerr << "Error: --pg-orders takes 1-32.\n";
+                return EXIT_FAILURE;
+            }
+
+        } else if (arg == "--pg-chunk") {
+            if (i + 1 >= argc) { std::cerr << "Error: --pg-chunk requires a number.\n"; return EXIT_FAILURE; }
+            ++i;
+            try {
+                cfg.pg_blocks_per_chunk = (uint32_t)std::stoul(argv[i]);
+            } catch (const std::exception&) {
+                std::cerr << "Error: --pg-chunk requires a number, got '" << argv[i] << "'.\n";
+                return EXIT_FAILURE;
+            }
+            if (cfg.pg_blocks_per_chunk < 1 || cfg.pg_blocks_per_chunk > 1024) {
+                std::cerr << "Error: --pg-chunk takes 1-1024.\n";
+                return EXIT_FAILURE;
+            }
+
+        } else if (arg == "--pg-prec") {
+            if (i + 1 >= argc) { std::cerr << "Error: --pg-prec requires a list.\n"; return EXIT_FAILURE; }
+            ++i;
+            cfg.pg_precisions.clear();
+            std::string spec(argv[i]);
+            size_t pos = 0;
+            while (pos <= spec.size()) {
+                const size_t comma = spec.find(',', pos);
+                const std::string tok = spec.substr(pos, comma == std::string::npos
+                                                        ? std::string::npos : comma - pos);
+                if (!tok.empty()) {
+                    try {
+                        const int p = std::stoi(tok);
+                        if (p < 5 || p > 15) throw std::out_of_range("range");
+                        cfg.pg_precisions.push_back(p);
+                    } catch (const std::exception&) {
+                        std::cerr << "Error: --pg-prec entries must be 5-15, got '"
+                                  << tok << "'.\n";
+                        return EXIT_FAILURE;
+                    }
+                }
+                if (comma == std::string::npos) break;
+                pos = comma + 1;
+            }
+            if (cfg.pg_precisions.empty() || cfg.pg_precisions.size() > 4) {
+                std::cerr << "Error: --pg-prec takes 1-4 precisions.\n";
+                return EXIT_FAILURE;
+            }
 
         } else if (arg == "-Q" || arg == "--lattice") {
             if (i + 1 >= argc) {

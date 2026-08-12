@@ -54,6 +54,7 @@ add_library(flacout_lib
     src/frame_writer.cpp
     src/flacoutcpp.cpp
     src/gpu.cpp
+    src/gpu_encoder.cpp
 )
 target_link_libraries(flacout_lib FLAC)
 
@@ -89,7 +90,41 @@ if(FLACOUT_VULKAN)
                 "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_spv.cmake"
         COMMENT "Compiling and embedding shaders/sweep.comp"
         VERBATIM)
-    add_custom_target(flacout_shaders DEPENDS "${SWEEP_HDR}")
+    # Pure-GPU pipeline (-P): one kernel per stage, each embedded the same way.
+    # Names map mechanically: shaders/pg_foo.comp -> pg_foo_spv.h -> kPgFooSpv.
+    set(PG_SHADERS prepare autoc levinson quant fixed sweep
+                   select rice layout frame pack crc)
+    set(PG_HDRS "")
+    foreach(pg ${PG_SHADERS})
+        set(_src "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pg_${pg}.comp")
+        set(_spv "${CMAKE_CURRENT_BINARY_DIR}/pg_${pg}.spv")
+        set(_hdr "${CMAKE_CURRENT_BINARY_DIR}/generated/pg_${pg}_spv.h")
+        # kPgPrepareSpv from "prepare": capitalise the first letter only.
+        string(SUBSTRING "${pg}" 0 1 _first)
+        string(SUBSTRING "${pg}" 1 -1 _rest)
+        string(TOUPPER "${_first}" _first)
+        set(_sym "kPg${_first}${_rest}Spv")
+        if(FLACOUT_GLSLC)
+            set(_cmd ${FLACOUT_GLSLC} -O --target-env=vulkan1.1
+                     -fshader-stage=compute "${_src}" -o "${_spv}")
+        else()
+            set(_cmd ${FLACOUT_GLSLANG} -V --target-env vulkan1.1 -S comp
+                     "${_src}" -o "${_spv}")
+        endif()
+        add_custom_command(
+            OUTPUT "${_hdr}"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated"
+            COMMAND ${_cmd}
+            COMMAND ${CMAKE_COMMAND} -DSPV=${_spv} -DHDR=${_hdr}
+                    -DSYM=${_sym} -DSRC=shaders/pg_${pg}.comp
+                    -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_spv.cmake"
+            DEPENDS "${_src}" "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_spv.cmake"
+            COMMENT "Compiling and embedding shaders/pg_${pg}.comp"
+            VERBATIM)
+        list(APPEND PG_HDRS "${_hdr}")
+    endforeach()
+
+    add_custom_target(flacout_shaders DEPENDS "${SWEEP_HDR}" ${PG_HDRS})
     add_dependencies(flacout_lib flacout_shaders)
 
     target_include_directories(flacout_lib PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")

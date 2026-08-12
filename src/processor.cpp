@@ -2,13 +2,16 @@
 #include "optimizer.hpp"
 #include "frame_writer.hpp"
 #include "md5.hpp"
+#include "gpu_encoder.hpp"
 #include "FLAC/stream_decoder.h"
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cstdio>
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <thread>
 #include <vector>
 #include <cstring>
 
@@ -133,6 +136,12 @@ bool Processor::process() {
         std::cout << "Decoded " << m_total_samples << " samples ("
                   << m_channels << " ch, " << m_bps << " bps, "
                   << m_sample_rate << " Hz)\n";
+
+    // -P diverges here: it shares the decode and the file plumbing with the CPU
+    // path and nothing else, so it gets its own function rather than a branch
+    // threaded through the search, reuse and DP code below.
+    if (m_config.pure_gpu)
+        return process_pure_gpu(extra_blocks);
 
     // --- Step 2b: compute MD5 over interleaved little-endian PCM ----
     // The FLAC spec mandates MD5 over the raw audio (channel-interleaved,
@@ -491,6 +500,128 @@ bool Processor::process() {
                           ? ", " + std::to_string(frames_reused) + " input frames reused"
                           : std::string())
                       << ").\n";
+    }
+    return true;
+}
+
+// ============================================================
+// The -P pipeline
+// ============================================================
+
+bool Processor::process_pure_gpu(std::vector<std::vector<uint8_t>>& extra_blocks)
+{
+    PureGpuEncoder::Config gcfg;
+    gcfg.block_size       = m_config.pg_block_size;
+    gcfg.windows          = m_config.windows;
+    gcfg.blocks_per_chunk = m_config.pg_blocks_per_chunk;
+    gcfg.orders           = m_config.pg_orders;
+    gcfg.verbose          = m_config.verbose;
+    if (!m_config.pg_precisions.empty()) gcfg.precisions = m_config.pg_precisions;
+
+    PureGpuEncoder enc(m_channels, m_bps, m_sample_rate, gcfg);
+    if (!enc.available()) {
+        std::cerr << "Error: -P unavailable: " << enc.why() << "\n";
+        return false;
+    }
+    if (m_config.verbose)
+        std::cout << "Pure GPU: " << enc.why() << "\n";
+
+    // MD5 is the one stage that cannot be parallelized -- it chains 64-byte
+    // blocks and has no combine operator, unlike CRC, which is linear over
+    // GF(2) and runs on the device. So it runs on a host thread *beside* the
+    // encode instead of before it: it depends on nothing the device produces,
+    // so its cost is hidden entirely.
+    std::array<uint8_t, 16> md5_digest{};
+    std::thread md5_thread([&]() {
+        const int bps_bytes = (m_bps + 7) / 8;
+        detail::MD5 md5;
+        std::vector<uint8_t> buf(m_channels * bps_bytes);
+        for (uint64_t s = 0; s < m_total_samples; ++s) {
+            for (uint32_t c = 0; c < m_channels; ++c) {
+                const int32_t v = m_pcm_data[c][s];
+                for (int b = 0; b < bps_bytes; ++b)
+                    buf[c * bps_bytes + b] = (uint8_t)(v >> (b * 8));
+            }
+            md5.update(buf.data(), m_channels * bps_bytes);
+        }
+        md5_digest = md5.digest();
+    });
+
+    const std::string tmp_output = m_output + ".partial";
+    std::fstream out(tmp_output,
+                     std::ios::binary | std::ios::out | std::ios::trunc);
+    if (!out) {
+        md5_thread.join();
+        std::cerr << "Error: cannot open output file: " << tmp_output << "\n";
+        return false;
+    }
+
+    out.write("fLaC", 4);
+    const bool si_is_last = extra_blocks.empty();
+    auto si_block = FrameWriter::make_streaminfo_block(
+        si_is_last, m_config.pg_block_size, m_config.pg_block_size, 0, 0,
+        m_sample_rate, m_channels, m_bps, m_total_samples);
+    out.write(reinterpret_cast<const char*>(si_block.data()),
+              (std::streamsize)si_block.size());
+    for (size_t i = 0; i < extra_blocks.size(); ++i) {
+        auto& blk = extra_blocks[i];
+        if (i == extra_blocks.size() - 1) blk[0] |= 0x80u;
+        else                              blk[0] &= 0x7Fu;
+        out.write(reinterpret_cast<const char*>(blk.data()),
+                  (std::streamsize)blk.size());
+    }
+
+    PureGpuEncoder::Stats st{};
+    bool wrote_ok = true;
+    const bool enc_ok = enc.encode(m_pcm_data,
+        [&](const uint8_t* p, size_t n) {
+            out.write(reinterpret_cast<const char*>(p), (std::streamsize)n);
+            if (!out) { wrote_ok = false; return false; }
+            return true;
+        }, &st);
+
+    md5_thread.join();
+
+    if (!enc_ok || !wrote_ok) {
+        std::cerr << "Error: " << (wrote_ok ? "GPU encode failed" : "write failed")
+                  << ".\n";
+        out.close();
+        std::remove(tmp_output.c_str());
+        return false;
+    }
+
+    // Patch STREAMINFO: fLaC(4) + block header(4) = byte 8, then the 34-byte
+    // payload only.
+    out.seekp(8, std::ios::beg);
+    auto si_updated = FrameWriter::make_streaminfo_block(
+        si_is_last, st.min_block, st.max_block, st.min_frame, st.max_frame,
+        m_sample_rate, m_channels, m_bps, m_total_samples, md5_digest.data());
+    out.write(reinterpret_cast<const char*>(si_updated.data() + 4), 34);
+    out.flush();
+    if (!out) {
+        std::cerr << "Error: write failed.\n";
+        out.close();
+        std::remove(tmp_output.c_str());
+        return false;
+    }
+    out.close();
+
+    if (std::rename(tmp_output.c_str(), m_output.c_str()) != 0) {
+        std::cerr << "Error: could not finalize output file: " << m_output << "\n";
+        std::remove(tmp_output.c_str());
+        return false;
+    }
+
+    if (m_config.verbose) {
+        const double secs = st.device_secs;
+        std::cout << "Wrote " << st.bytes << " bytes of audio data ("
+                  << st.frames << " frames, min=" << st.min_block
+                  << " max=" << st.max_block << " samples/frame) in "
+                  << secs << " s";
+        if (secs > 0.0)
+            std::cout << " (" << (double)m_total_samples / secs / 1e6
+                      << " Msample/s)";
+        std::cout << ".\n";
     }
     return true;
 }

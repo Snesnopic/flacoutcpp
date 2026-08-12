@@ -878,6 +878,14 @@ static void compute_window_coeffs(WindowType wt, uint32_t N, double* out)
     }
 }
 
+// Public wrapper: the pure-GPU encoder uploads a coefficient table to the device
+// once and never applies a window on the host, so it needs the shapes without
+// going through apply_window's per-block table lookup.
+void window_coefficients(WindowType wt, uint32_t N, double* out)
+{
+    compute_window_coeffs(wt, N, out);
+}
+
 
 static int candidate_slot(uint32_t N)
 {

@@ -240,6 +240,36 @@ struct Config {
     unsigned gpu_duty = 100;
 
     /**
+     * @brief Fully GPU-resident encoder (`-P`). A different encoder, not a
+     *        backend for the one above.
+     *
+     * Every stage from PCM to packed frame bytes runs as a compute dispatch: the
+     * host uploads samples, waits, and writes out the result. Nothing else here
+     * applies when this is set — no variable-block DP, no ranked search, no
+     * patience, no precision ladder, no frame reuse, and the analysis runs in
+     * fp32 rather than double.
+     *
+     * Output is lossless (the residual is exact integer arithmetic once the
+     * coefficients are integers) but is **not** bit-identical to the CPU path,
+     * so bench/check.sh cannot gate it. Verify by decoding. See PURE_GPU_PLAN.md.
+     */
+    bool pure_gpu = false;
+
+    /// Fixed frame size for `-P`. Multiple of 256, at most 4096.
+    uint32_t pg_block_size = 4096;
+
+    /// LPC precisions swept per (window, order) under `-P`. Empty → {15}.
+    std::vector<int> pg_precisions;
+
+    /// Orders swept per (block, signal, window) under `-P`, out of 32, ranked by
+    /// Levinson error. The dominant speed knob: the Rice sweep is ~92% of device
+    /// time and costs roughly the summed order of what it prices.
+    uint32_t pg_orders = 8;
+
+    /// Frames per device chunk under `-P`; bounds peak device memory.
+    uint32_t pg_blocks_per_chunk = 256;
+
+    /**
      * @brief Effort level 0-9: one dial across the measured size/time frontier.
      *
      * @ref max_candidates and @ref precision_rungs are not independent — they

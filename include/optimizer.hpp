@@ -186,6 +186,15 @@ std::string window_to_name(WindowType wt);
  */
 std::vector<WindowType> all_window_types(bool include_experimental = false);
 
+/**
+ * @brief Fill @p out with @p N apodization coefficients for @p wt.
+ *
+ * Exported for the pure-GPU encoder, which uploads a coefficient table to the
+ * device once at startup instead of applying windows on the host. Callers
+ * outside the optimizer should have no other reason to want this.
+ */
+void window_coefficients(WindowType wt, uint32_t N, double* out);
+
 /// @}
 
 

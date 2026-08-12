@@ -1,0 +1,296 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic            : require
+#extension GL_KHR_shader_subgroup_ballot           : require
+#extension GL_KHR_shader_subgroup_arithmetic       : require
+#extension GL_KHR_shader_subgroup_shuffle_relative : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+//
+// Pure-GPU encoder, stage 8: materialise the winner's residual and recover the
+// Rice parameters the bitstream has to name.
+//
+// The sweep (stage 6) deliberately throws the residual away and returns only a
+// cost -- materialising every candidate's residual would make the design
+// bandwidth-bound. But the *winner* has to be written, and the bitstream carries
+// an explicit k per partition, so exactly one candidate per subframe gets a
+// second pass that keeps both.
+//
+// This is the sweep's streaming fold with two additions:
+//
+//   - the residual is stored as it is produced;
+//   - closePartition records the argmin k (or the escape marker) per
+//     (level, partition), so the winning level's parameters can be read out.
+//
+// One subgroup per subframe -- two per block against 133 candidates priced, so
+// the extra pass is ~1.5% of the sweep's work and needs no cleverness.
+//
+// `residual_bits` written here is AUTHORITATIVE. Stage 7 chose this candidate
+// using the sweep's cost, and if the two ever disagreed on a tie the sweep's
+// number would be the wrong one to lay out against. Everything downstream reads
+// what this kernel counted, which makes the packed size self-consistent by
+// construction rather than by two implementations agreeing.
+
+#define SG      32
+#define NPLANE  32
+#define MAXP    8
+#define NLEV    (MAXP + 1)
+#define CSTRIDE 36
+#define SFP_STRIDE 272
+#define KOFF 16
+
+#define KIND_CONSTANT 0
+#define KIND_VERBATIM 1
+#define KIND_FIXED    2
+#define KIND_LPC      3
+
+#define WIN_VERBATIM (-1)
+#define WIN_CONSTANT (-2)
+#define PLAN_STRIDE 8
+
+layout(local_size_x = SG) in;
+
+layout(std430, binding = 0) readonly  buffer Samples { int  samples[]; };
+layout(std430, binding = 1) readonly  buffer Cands   { int  cand[];    };
+layout(std430, binding = 2) readonly  buffer Plan    { int  plan[];    };
+layout(std430, binding = 3) readonly  buffer Meta    { uint meta[];    };
+layout(std430, binding = 4) writeonly buffer Res     { int  res[];     };
+layout(std430, binding = 5) writeonly buffer Sfp     { int  sfp[];     };
+
+layout(push_constant) uniform PC {
+    int nblk;
+    int bsize;
+    int nsig;
+    int nsub;       // subframes per frame == channel count
+    int ncand;
+    int nwin;
+    int nprec;
+    int bps;
+    // Scalars, not an ivec4: a vec4 in a push-constant block is 16-byte aligned
+    // and would shift every field placed after it.
+    int prec0, prec1, prec2, prec3;
+} pc;
+
+int precAt(int p) {
+    return (p == 0) ? pc.prec0 : ((p == 1) ? pc.prec1
+         : ((p == 2) ? pc.prec2 : pc.prec3));
+}
+
+uint Bacc[NLEV], Nacc[NLEV], Hacc[NLEV];
+uint total0[NLEV], total1[NLEV];
+int  gP;
+
+// k per (level, partition), one array per coding method. Level l occupies
+// [2^l - 1, 2^(l+1) - 1), so all nine levels fit in 511 slots.
+// Packed: low 8 bits = k, or the method's escape marker; bits 8.. = escape bps.
+shared uint karr[2][511];
+
+void closePartition(int q, uint B0, uint N0, uint H0) {
+    const uint lane = gl_SubgroupInvocationID;
+    for (int l = gP; l >= 0; --l) {
+        if (((q + 1) & ((1 << (gP - l)) - 1)) != 0) break;
+
+        const uint B  = (l == gP) ? B0 : Bacc[l];
+        const uint n  = (l == gP) ? N0 : Nacc[l];
+        const uint hi = (l == gP) ? H0 : Hacc[l];
+
+        uint v = B, w = 2u;
+        for (int st = 0; st < 5; ++st) {
+            const uint up = subgroupShuffleDown(v, 1u << st);
+            if (lane + (1u << st) < uint(SG)) {
+                const uint m = (up != 0u && w > 0xFFFFFFFFu / up) ? 0xFFFFFFFFu : w * up;
+                v = (v > 0xFFFFFFFFu - m) ? 0xFFFFFFFFu : v + m;
+            }
+            w = (st < 4) ? ((w > 0xFFFFFFFFu / w) ? 0xFFFFFFFFu : w * w) : w;
+        }
+
+        const uint nk   = n * (1u + lane);
+        const uint bits = (nk > 0xFFFFFFFFu - v) ? 0xFFFFFFFFu : nk + v;
+
+        const uint min0 = subgroupMin(lane <= 14u ? bits : 0xFFFFFFFFu);
+        const uint min1 = subgroupMin(lane <= 30u ? bits : 0xFFFFFFFFu);
+
+        // Smallest k wins a tie, which is also what the CPU's ascending scan
+        // with an early break lands on.
+        const uint bal0 = subgroupBallot(lane <= 14u && bits == min0).x;
+        const uint bal1 = subgroupBallot(lane <= 30u && bits == min1).x;
+        uint k0 = (bal0 != 0u) ? uint(findLSB(bal0)) : 0u;
+        uint k1 = (bal1 != 0u) ? uint(findLSB(bal1)) : 0u;
+
+        uint best0 = min0, best1 = min1;
+        uint e0 = k0, e1 = k1;
+        if (hi <= 30u) {
+            const uint ebps = (hi >= 1u) ? (hi + 1u) : 1u;
+            const uint eb   = 5u + ebps * n;
+            // Rice keeps a tie; the escape has to be strictly cheaper. The bits
+            // counted here are the bits written, so either choice is consistent
+            // -- this one just prefers the shorter parameter field.
+            if (eb < best0) { best0 = eb; e0 = 15u | (ebps << 8); }
+            if (eb < best1) { best1 = eb; e1 = 31u | (ebps << 8); }
+        }
+
+        // Every value here is subgroup-uniform (subgroupMin/Ballot results and
+        // the uniform `hi`), so one lane stores for the whole subgroup.
+        const int qIdx = (q >> (gP - l)) + ((1 << l) - 1);
+        if (lane == 0u) {
+            karr[0][qIdx] = e0;
+            karr[1][qIdx] = e1;
+        }
+
+        total0[l] = (total0[l] > 0xFFFFFFFFu - best0) ? 0xFFFFFFFFu : total0[l] + best0;
+        total1[l] = (total1[l] > 0xFFFFFFFFu - best1) ? 0xFFFFFFFFu : total1[l] + best1;
+
+        if (l > 0) {
+            Bacc[l - 1] += B;
+            Nacc[l - 1] += n;
+            Hacc[l - 1]  = max(Hacc[l - 1], hi);
+        }
+        Bacc[l] = 0u; Nacc[l] = 0u; Hacc[l] = 0u;
+    }
+}
+
+void main() {
+    const uint lane = gl_SubgroupInvocationID;
+    const int  raw  = int(gl_WorkGroupID.x);
+    const int  blk  = raw / pc.nsub;
+    const int  sub  = raw % pc.nsub;
+    const int  B    = pc.bsize;
+
+    const int po   = blk * PLAN_STRIDE;
+    const int sgi  = plan[po + 1 + sub];
+    const int slot = plan[po + 3 + sub];
+    const int so   = raw * SFP_STRIDE;
+
+    const int  bs     = sgi * pc.nblk + blk;
+    const uint m      = meta[bs];
+    const int  wasted = int(m & 0xFFu);
+    const int  bpsCh  = pc.bps + ((sgi == 3) ? 1 : 0);
+    const int  effBps = bpsCh - wasted;
+    const int  subhdr = 8 + ((wasted > 0) ? wasted : 0);
+
+    if (lane == 0u) {
+        sfp[so + 4] = wasted;
+        sfp[so + 8] = sgi;
+        sfp[so + 9] = effBps;
+    }
+
+    // The two closed-form modes carry no residual and no parameters.
+    if (slot < 0) {
+        if (lane == 0u) {
+            const bool con = (slot == WIN_CONSTANT);
+            sfp[so + 0]  = con ? KIND_CONSTANT : KIND_VERBATIM;
+            sfp[so + 1]  = 0;
+            sfp[so + 2]  = 0;
+            sfp[so + 3]  = 0;
+            sfp[so + 5]  = 0;
+            sfp[so + 6]  = 0;
+            sfp[so + 7]  = 0;
+            sfp[so + 10] = subhdr + effBps * (con ? 1 : B);
+        }
+        return;
+    }
+
+    const int cb    = (bs * pc.ncand + slot) * CSTRIDE;
+    const int ord   = cand[cb + 0];
+    const int shift = cand[cb + 1];
+    const int off   = cand[cb + 2];
+
+    // A slot below the LPC region is a fixed predictor; recover its precision
+    // from the slot's position in the (window, order, precision) product.
+    const int lpcSlots = pc.nwin * 32 * pc.nprec;
+    const bool isLpc = slot < lpcSlots;
+    const int  prec  = isLpc ? precAt(slot % pc.nprec) : 0;
+
+    const int pcap = MAXP;
+    int P = 0;
+    for (int p = 1; p <= pcap; ++p) {
+        if ((B % (1 << p)) != 0) break;
+        if ((B >> p) < ord)      break;
+        P = p;
+    }
+    gP = P;
+    const int psize = B >> P;
+
+    for (int l = 0; l <= P; ++l) {
+        Bacc[l] = 0u; Nacc[l] = 0u; Hacc[l] = 0u;
+        total0[l] = uint(4 << l);
+        total1[l] = uint(5 << l);
+    }
+
+    const int rbase = raw * B;
+
+    uint Bcur = 0u, Ncur = 0u, Hcur = 0u;
+    int  q = 0;
+
+    for (int c0 = 0; c0 < B; c0 += SG) {
+        const int  i   = c0 + int(lane);
+        const bool act = (i >= ord) && (i < B);
+
+        uint u = 0u;
+        if (i < B) {
+            int64_t sum = 0L;
+            for (int j = 0; j < ord; ++j)
+                sum += int64_t(cand[cb + 4 + j]) * int64_t(samples[off + i - 1 - j]);
+            // Warm-up samples are written verbatim by the packer, but the slot
+            // still has to hold something the escape path can read; the CPU
+            // stores the raw sample there and so do we.
+            const int r = act ? (samples[off + i] - int(sum >> shift))
+                              : samples[off + i];
+            res[rbase + i] = r;
+            if (act) u = (uint(r) << 1) ^ uint(r >> 31);
+        }
+
+        uint myBallot = 0u;
+        for (int j = 0; j < NPLANE; ++j) {
+            const uvec4 b = subgroupBallot(act && ((u >> j) & 1u) != 0u);
+            if (lane == uint(j)) myBallot = b.x;
+        }
+        const uint actMask = subgroupBallot(act).x;
+
+        if (psize >= SG) {
+            Bcur += bitCount(myBallot);
+            Ncur += uint(bitCount(actMask));
+            Hcur  = max(Hcur, subgroupMax((myBallot != 0u) ? lane : 0u));
+            if (((c0 + SG) & (psize - 1)) == 0) {
+                closePartition(q, Bcur, Ncur, Hcur);
+                ++q; Bcur = 0u; Ncur = 0u; Hcur = 0u;
+            }
+        } else {
+            for (int p = 0; p < SG / psize; ++p) {
+                const uint mask = ((1u << psize) - 1u) << uint(p * psize);
+                closePartition(q,
+                    uint(bitCount(myBallot & mask)),
+                    uint(bitCount(actMask  & mask)),
+                    subgroupMax(((myBallot & mask) != 0u) ? lane : 0u));
+                ++q;
+            }
+        }
+    }
+
+    uint best = 0xFFFFFFFFu;
+    int  bestL = 0, bestM = 0;
+    for (int l = P; l >= 0; --l) {
+        if (total0[l] <= best) { best = total0[l]; bestL = l; bestM = 0; }
+        if (total1[l] <  best) { best = total1[l]; bestL = l; bestM = 1; }
+    }
+
+    // karr was written by lane 0 inside closePartition; the workgroup is a single
+    // subgroup, so this is the barrier that makes those stores visible here.
+    subgroupMemoryBarrierShared();
+
+    const int nparts = 1 << bestL;
+    const int koff   = (1 << bestL) - 1;
+    for (int p = int(lane); p < nparts; p += SG)
+        sfp[so + KOFF + p] = int(karr[bestM][koff + p]);
+
+    if (lane == 0u) {
+        sfp[so + 0]  = isLpc ? KIND_LPC : KIND_FIXED;
+        sfp[so + 1]  = ord;
+        sfp[so + 2]  = prec;
+        sfp[so + 3]  = shift;
+        sfp[so + 5]  = bestM;
+        sfp[so + 6]  = bestL;
+        sfp[so + 7]  = int(best);
+        // cand[cb+3] is the non-residual cost and already carries the +6 residual
+        // header, so the subframe total is just the two added.
+        sfp[so + 10] = cand[cb + 3] + int(best);
+    }
+}

@@ -1,0 +1,111 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+//
+// Pure-GPU encoder, stage 10: frame headers and CRC-8.
+//
+// One lane per frame. The header is byte-aligned start to finish, so this writes
+// bytes rather than bits, and CRC-8 covers only what this kernel just wrote --
+// no dependency on the payload, so it needs no second pass. (CRC-16 does: it
+// covers header+payload, so it lives in stage 12.)
+//
+// Every store is an atomicOr because a frame boundary is a byte boundary, not a
+// word boundary: the first bytes of frame f+1 can share a uint32 with the last
+// bytes of frame f's CRC-16. Disjoint bit ranges OR together in any order, which
+// is the property the whole packer rests on.
+
+#define FINFO_STRIDE 4
+#define PLAN_STRIDE  8
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly  buffer Plan  { int  plan[];  };
+layout(std430, binding = 1) readonly  buffer Finfo { uint finfo[]; };
+layout(std430, binding = 2)          buffer Out    { uint outw[];  };
+
+layout(push_constant) uniform PC {
+    int  nframe;
+    int  bsize;
+    int  nch;
+    int  bsCode;
+    int  srCode;
+    int  bsExtraVal;
+    int  bsExtraBits;
+    int  srExtraVal;
+    int  srExtraBits;
+    int  bpsCode;
+    uint baseLo;
+    uint baseHi;
+} pc;
+
+// Byte `pos` of the file is byte (pos & 3) of word (pos >> 2), and on a
+// little-endian host that is the (pos & 3)-th *low* byte of the uint32.
+void putByte(uint pos, uint v) {
+    atomicOr(outw[pos >> 2], (v & 0xFFu) << (8u * (pos & 3u)));
+}
+
+uint utf8Len(uint64_t v) {
+    if (v < 0x80UL)       return 1u;
+    if (v < 0x800UL)      return 2u;
+    if (v < 0x10000UL)    return 3u;
+    if (v < 0x200000UL)   return 4u;
+    if (v < 0x4000000UL)  return 5u;
+    if (v < 0x80000000UL) return 6u;
+    return 7u;
+}
+
+void main() {
+    const int f = int(gl_GlobalInvocationID.x);
+    if (f >= pc.nframe) return;
+
+    const uint bo = finfo[f * FINFO_STRIDE + 0];
+    const int  sm = plan[f * PLAN_STRIDE + 0];
+
+    // Channel assignment: 0..7 mean `nch-1` independent channels, 8/9/10 are the
+    // three joint-stereo couplings and carry the same numbering the optimizer's
+    // stereo_mode uses.
+    const uint chAssign = (sm != 0) ? uint(sm) : uint(pc.nch - 1);
+
+    uint b[20];
+    uint n = 0u;
+
+    // sync 0b11111111111110, reserved 0, blocking strategy 1 (variable ->
+    // sample-number addressing, which is what makes the UTF-8 field a sample
+    // count rather than a frame count).
+    b[n++] = 0xFFu;
+    b[n++] = 0xF9u;
+    b[n++] = (uint(pc.bsCode) << 4) | uint(pc.srCode);
+    b[n++] = (chAssign << 4) | (uint(pc.bpsCode) << 1);
+
+    const uint64_t sn = ((uint64_t(pc.baseHi) << 32) | uint64_t(pc.baseLo))
+                      + uint64_t(uint(f)) * uint64_t(uint(pc.bsize));
+    const uint ul = utf8Len(sn);
+    if (ul == 1u) {
+        b[n++] = uint(sn & 0x7FUL);
+    } else {
+        // Lead byte is (ul) high ones then a zero, i.e. 0xFF << (8-ul).
+        b[n++] = ((0xFFu << (8u - ul)) & 0xFFu)
+               | uint((sn >> (6u * (ul - 1u))) & 0xFFUL);
+        for (uint i = 1u; i < ul; ++i)
+            b[n++] = 0x80u | uint((sn >> (6u * (ul - 1u - i))) & 0x3FUL);
+    }
+
+    if (pc.bsExtraBits == 8)       b[n++] = uint(pc.bsExtraVal) & 0xFFu;
+    else if (pc.bsExtraBits == 16) { b[n++] = (uint(pc.bsExtraVal) >> 8) & 0xFFu;
+                                     b[n++] = uint(pc.bsExtraVal) & 0xFFu; }
+    if (pc.srExtraBits == 8)       b[n++] = uint(pc.srExtraVal) & 0xFFu;
+    else if (pc.srExtraBits == 16) { b[n++] = (uint(pc.srExtraVal) >> 8) & 0xFFu;
+                                     b[n++] = uint(pc.srExtraVal) & 0xFFu; }
+
+    // CRC-8, poly 0x07, init 0, no reflection. Bitwise: ~10 bytes for one lane
+    // per frame is nothing, and it needs no table upload.
+    uint crc = 0u;
+    for (uint i = 0u; i < n; ++i) {
+        crc ^= b[i];
+        for (int k = 0; k < 8; ++k)
+            crc = ((crc & 0x80u) != 0u) ? (((crc << 1) ^ 0x07u) & 0xFFu)
+                                        : ((crc << 1) & 0xFFu);
+    }
+    b[n++] = crc;
+
+    for (uint i = 0u; i < n; ++i) putByte(bo + i, b[i]);
+}

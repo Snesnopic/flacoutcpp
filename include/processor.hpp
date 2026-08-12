@@ -97,6 +97,22 @@ struct ProcessorConfig {
     /// See flacoutcpp::Config::gpu_duty.
     unsigned gpu_duty = 100;
 
+    /// Fully GPU-resident encoder. See flacoutcpp::Config::pure_gpu — and note
+    /// it makes every other search field here irrelevant.
+    bool pure_gpu = false;
+
+    /// See flacoutcpp::Config::pg_block_size.
+    uint32_t pg_block_size = 4096;
+
+    /// See flacoutcpp::Config::pg_precisions.
+    std::vector<int> pg_precisions;
+
+    /// See flacoutcpp::Config::pg_orders.
+    uint32_t pg_orders = 8;
+
+    /// See flacoutcpp::Config::pg_blocks_per_chunk.
+    uint32_t pg_blocks_per_chunk = 256;
+
     /**
      * @brief Adaptive per-subframe window selection (experimental,
      * estimated-DP modes only). See flacoutcpp::Config::adaptive_windows.
@@ -173,6 +189,14 @@ private:
 
     // Raw byte copy of non-STREAMINFO metadata blocks from input file.
     bool read_extra_metadata_blocks(std::vector<std::vector<uint8_t>>& out_blocks) const;
+
+    /// The `-P` pipeline: everything from decoded PCM to the finished file, with
+    /// the encode done entirely on the device. Kept separate from process()
+    /// rather than branching inside it, because it shares only the decode and
+    /// the file plumbing and none of the search, reuse or DP machinery — a
+    /// branch through all of that would put the CPU path at risk for nothing.
+    /// Called after decode; assumes m_pcm_data and the stream fields are set.
+    bool process_pure_gpu(std::vector<std::vector<uint8_t>>& extra_blocks);
 
     // --- Member state ----
     std::string     m_input;

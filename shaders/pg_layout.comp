@@ -1,0 +1,94 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+//
+// Pure-GPU encoder, stage 9: frame sizes and file offsets.
+//
+// The single fact that makes GPU packing tractable: **FrameWriter pads every
+// frame to a byte boundary before the CRC-16, so a frame is a whole number of
+// bytes.** Frames are therefore independently placeable -- an exclusive scan over
+// frame byte lengths gives each frame its final position, and stage 11 writes
+// straight into the output buffer at that position. No compaction pass, no
+// per-frame host copy: the encoded file comes back in one transfer.
+//
+// Bit-granular packing is only needed *inside* a frame, where subframe
+// boundaries carry no padding.
+//
+// One workgroup, and the scan is serial in lane 0. A chunk holds at most
+// MAXFRAMES frames and this runs in microseconds; the DP-scale argument from
+// CLAUDE.md applies -- O(n) sequential work on a few hundred entries is not
+// worth a Blelloch scan.
+
+#define LOCAL 256
+#define MAXFRAMES 1024
+#define SFP_STRIDE 272
+#define FINFO_STRIDE 4
+
+layout(local_size_x = LOCAL) in;
+
+layout(std430, binding = 0) readonly  buffer Sfp   { int  sfp[];   };
+layout(std430, binding = 1) writeonly buffer Finfo { uint finfo[]; };
+// finfo[nframe*FINFO_STRIDE] is followed by one trailing total, so the host can
+// read the chunk's encoded size without a second dispatch.
+layout(std430, binding = 2) writeonly buffer Total { uint total[]; };
+
+layout(push_constant) uniform PC {
+    int  nframe;
+    int  bsize;
+    int  nsub;
+    int  bsExtraBits;
+    int  srExtraBits;
+    uint baseLo;      // absolute sample number of this chunk's first frame
+    uint baseHi;
+} pc;
+
+shared uint sBytes[MAXFRAMES];
+shared uint sPay[MAXFRAMES];
+shared uint sHdr[MAXFRAMES];
+
+uint utf8Len(uint64_t v) {
+    if (v < 0x80UL)       return 1u;
+    if (v < 0x800UL)      return 2u;
+    if (v < 0x10000UL)    return 3u;
+    if (v < 0x200000UL)   return 4u;
+    if (v < 0x4000000UL)  return 5u;
+    if (v < 0x80000000UL) return 6u;
+    return 7u;
+}
+
+void main() {
+    const int t = int(gl_LocalInvocationID.x);
+    const uint64_t base = (uint64_t(pc.baseHi) << 32) | uint64_t(pc.baseLo);
+
+    for (int f = t; f < pc.nframe; f += LOCAL) {
+        // sync(14) + reserved(1) + blocking(1) + bs code(4) + sr code(4)
+        // + channel assignment(4) + bps(3) + reserved(1) = 32, then the UTF-8
+        // sample number, the optional extra-bit fields, and CRC-8. Byte-aligned
+        // by construction, which is what lets stage 11 treat the payload's start
+        // as a byte offset.
+        const uint64_t sn = base + uint64_t(uint(f)) * uint64_t(uint(pc.bsize));
+        const uint hdrBits = 32u + 8u * utf8Len(sn)
+                           + uint(pc.bsExtraBits) + uint(pc.srExtraBits) + 8u;
+
+        uint pay = 0u;
+        for (int s = 0; s < pc.nsub; ++s)
+            pay += uint(sfp[(f * pc.nsub + s) * SFP_STRIDE + 10]);
+
+        const uint bits  = hdrBits + pay + ((8u - (pay % 8u)) % 8u) + 16u;
+        sBytes[f] = bits / 8u;
+        sPay[f]   = pay;
+        sHdr[f]   = hdrBits;
+    }
+    barrier();
+
+    if (t == 0) {
+        uint acc = 0u;
+        for (int f = 0; f < pc.nframe; ++f) {
+            finfo[f * FINFO_STRIDE + 0] = acc;
+            finfo[f * FINFO_STRIDE + 1] = sBytes[f];
+            finfo[f * FINFO_STRIDE + 2] = sHdr[f];
+            finfo[f * FINFO_STRIDE + 3] = sPay[f];
+            acc += sBytes[f];
+        }
+        total[0] = acc;
+    }
+}

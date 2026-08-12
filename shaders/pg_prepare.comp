@@ -1,0 +1,108 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic      : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+//
+// Pure-GPU encoder, stage 1: PCM -> per-block decorrelated, wasted-bit-shifted
+// signals, plus the per-(signal, block) metadata every later stage needs.
+//
+// One workgroup per (block, signal). The signal index selects the stereo
+// decorrelation:
+//
+//   0 = L    1 = R    2 = M = (L+R)>>1    3 = S = L-R
+//
+// Mono uses signal 0 only. S carries bps+1 bits, which is why the host tracks
+// an effective bps per signal rather than per stream.
+//
+// The PCM is read twice (once to reduce, once to store) rather than staged in
+// shared memory: 4096 samples would be 16 KB of the shared budget that stage 2
+// needs for its windowed copy, and the second read hits L2 anyway.
+//
+// Two per-block facts are reduced here because both are OR/min/max folds over
+// exactly this data and nothing later wants to re-walk the block for them:
+//
+//   wasted bits  -- ctz of the OR of every sample. FLAC codes the block at
+//                   (bps - wasted) and the shift is applied to the signal
+//                   in place, so every downstream stage sees shifted samples
+//                   and never has to know.
+//   constant     -- min == max, which is CONSTANT subframe mode. Cheaper to
+//                   settle here than to make it a candidate.
+
+#define LOCAL 256
+
+layout(local_size_x = LOCAL) in;
+
+layout(std430, binding = 0) readonly  buffer Pcm  { int  pcm[];  };
+layout(std430, binding = 1) writeonly buffer Sig  { int  sig[];  };
+// Per (signal, block): wasted bits in bits 0..7, constant flag in bit 8.
+layout(std430, binding = 2) writeonly buffer Meta { uint meta[]; };
+
+layout(push_constant) uniform PC {
+    int nblk;       // blocks in this chunk
+    int bsize;      // samples per block (uniform; the stream tail is not here)
+    int nch;        // 1 or 2
+    int chunkLen;   // samples per channel in the uploaded PCM
+} pc;
+
+shared uint sOr[LOCAL / 32];
+shared int  sMin[LOCAL / 32];
+shared int  sMax[LOCAL / 32];
+
+int decorrelate(int sigIdx, int i) {
+    const int L = pcm[i];
+    if (pc.nch == 1) return L;
+    const int R = pcm[pc.chunkLen + i];
+    if (sigIdx == 0) return L;
+    if (sigIdx == 1) return R;
+    // Arithmetic shift: (L+R)>>1 must floor, matching the CPU and the decoder's
+    // mid reconstruction. GLSL's >> on a signed int is arithmetic.
+    if (sigIdx == 2) return (L + R) >> 1;
+    return L - R;
+}
+
+void main() {
+    const int blk = int(gl_WorkGroupID.x);
+    const int sgi = int(gl_WorkGroupID.y);
+    const int B   = pc.bsize;
+    const int t   = int(gl_LocalInvocationID.x);
+
+    const int base = blk * B;                       // sample offset in the chunk
+    const int dst  = (sgi * pc.nblk + blk) * B;     // slot in the signal buffer
+
+    // ---- pass 1: fold ----------------------------------------------------
+    uint orAll = 0u;
+    int  mn    = 0x7FFFFFFF;
+    int  mx    = -0x7FFFFFFF - 1;
+    for (int i = t; i < B; i += LOCAL) {
+        const int v = decorrelate(sgi, base + i);
+        orAll |= uint(v);
+        mn = min(mn, v);
+        mx = max(mx, v);
+    }
+
+    orAll = subgroupOr(orAll);
+    mn    = subgroupMin(mn);
+    mx    = subgroupMax(mx);
+    const uint sg = gl_SubgroupID;
+    if (subgroupElect()) { sOr[sg] = orAll; sMin[sg] = mn; sMax[sg] = mx; }
+    barrier();
+
+    if (t == 0) {
+        uint o = 0u; int a = 0x7FFFFFFF, b = -0x7FFFFFFF - 1;
+        for (int k = 0; k < LOCAL / 32; ++k) { o |= sOr[k]; a = min(a, sMin[k]); b = max(b, sMax[k]); }
+        sOr[0] = o; sMin[0] = a; sMax[0] = b;
+    }
+    barrier();
+
+    const uint orFinal = sOr[0];
+    // An all-zero block has no trailing-zero count to speak of; call it 0 wasted
+    // and let CONSTANT mode carry it, which is what the CPU path does.
+    const int  wasted  = (orFinal == 0u) ? 0 : findLSB(orFinal);
+    const bool isConst = (sMin[0] == sMax[0]);
+
+    if (t == 0)
+        meta[sgi * pc.nblk + blk] = uint(wasted) | (isConst ? 0x100u : 0u);
+
+    // ---- pass 2: store shifted ------------------------------------------
+    for (int i = t; i < B; i += LOCAL)
+        sig[dst + i] = decorrelate(sgi, base + i) >> wasted;
+}

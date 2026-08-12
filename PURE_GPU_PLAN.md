@@ -718,6 +718,63 @@ spare). For that:
   (GPU_PLAN.md already used it to find 511:1444 spills in `sweep.comp`).
 - **AMD / Nvidia**: Radeon GPU Profiler, Nsight Graphics.
 
+## The autocorrelation's 25% is not cheaply reducible — three failures
+
+With timestamps showing `pg_autoc` at 25.5% (a cost the double-float fix
+introduced), two obvious routes were tried and **both were reverted**. Neither
+failed for the reason it looked like it would.
+
+**Wrong framing first.** "Use double-float only for the lags Levinson actually
+cancels on" does not exist as an optimisation: `lambda = autoc[ord] - sum_j
+A[j]*autoc[ord-1-j]` mixes every lag at O(autoc[0]), so the precision requirement
+is uniform across lags. There is no subset to spare.
+
+**Failure 1: relaxed accumulation.** `dfAdd` renormalises every step (3 of its 11
+ops). Deferring that — twoSum the high parts, let the low parts accumulate in
+fp32, normalise once at the end — keeps the accuracy (measured 3e-15, unchanged)
+and makes the kernel **25% faster: 19.3 → 14.4 ms**. It makes the whole encoder
+**1.4x slower**:
+
+| stage | before | relaxed |
+|---|---|---|
+| autoc | 19.3 ms | **14.4 ms** |
+| sweep | 36.2 ms | **94.1 ms** |
+| total | 75.1 ms | 122.5 ms |
+
+The slightly different autocorrelation shifts which orders the shortlist ranks
+highest, the ranking moves toward higher orders, and the sweep's residual work is
+linear in the order it prices. **A kernel-local speedup in the analysis is not a
+program-level speedup, because the analysis decides how much work the sweep does.**
+This is the trap to remember from the whole exercise; the first measurement of it
+looked like a clean win because only `autoc` was timed.
+
+**Failure 2: fewer lags.** The autocorrelation's cost is linear in the lag count,
+which is `maxOrder + 1`, so capping the order should buy it back. It cannot be
+done with a push constant: the lag loop bounds a private `acc[33]` array, and
+making the bound dynamic stopped the array living in registers — **45.8 ms against
+19.3 ms**, spilled to scratch. A specialization constant is the documented fix
+(`sweep.comp` says so for its dead fp32 ladder) and it is **fragile here**: sizing
+the array by it produced a kernel that ran in 2.3 ms with visibly wrong output
+(+2.5% bytes) through MoltenVK, and even keeping the array fixed-size while
+bounding only the loops changed the output at `maxOrder = 32`, where every code
+path should be identical.
+
+That last one is the useful finding: **this kernel's loop bounds must stay
+compile-time.** A dynamic bound stops the unrolling, which changes instruction
+selection in the double-float arithmetic, which changes the coefficients. So a
+max-order knob is not free — it perturbs the numerics even where it should be a
+no-op — and an order cap would have to be accepted as an output change rather than
+a pure speed knob.
+
+**Failure 3 (earlier, same shape): shared-memory coefficients in the sweep.**
+0.0436 s against a 0.0431-0.0438 s baseline. The hardware broadcast of a
+subgroup-uniform load is already free.
+
+Sizes for the record, from the (spilled, so timing-invalid but size-valid) capped
+runs on MLKDream: `maxOrder` 24 costs +0.26%, 16 costs +0.81%, 8 costs +1.9%. Even
+if the speed were free, the exchange rate is poor next to the window/order
+frontier above.
+
 ## Inside the sweep: it was the dependency chain, not the fold
 
 The fold was the suspected bottleneck. It is not, and ablation said so before any

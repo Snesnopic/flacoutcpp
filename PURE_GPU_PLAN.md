@@ -417,19 +417,56 @@ Interleaved best-of-5, quiet machine, `-n` on every arm. Times include decode,
 MD5 and file I/O, which are common fixed costs (decode alone is 0.109 s on the
 master mix, so the device is the bulk of `-P`).
 
-| fixture | `-P` wall | device only | CPU default | speedup | size |
-|---|---|---|---|---|---|
-| music_20s | 0.085 s | 0.023 s | 0.196 s | 2.31x | +0.14% |
-| MLKDream | 0.338 s | 0.123 s | 1.449 s | **4.29x** | +1.12% |
-| master mix | 0.239 s | 0.106 s | 0.976 s | 4.09x | +0.99% |
-| syn3m_mix | 0.250 s | 0.116 s | 0.926 s | 3.71x | +7.62% |
+| fixture | `-P` wall | CPU default | speedup | size |
+|---|---|---|---|---|
+| music_10s | 0.068 s | 0.133 s | 1.96x | +0.40% |
+| music_20s | 0.076 s | 0.197 s | 2.58x | +0.14% |
+| MLKDream | 0.237 s | 1.458 s | **6.15x** | +1.12% |
+| master mix | 0.170 s | 0.984 s | 5.80x | +0.99% |
+| syn3m_mix | 0.177 s | 0.933 s | 5.27x | +7.62% |
 
-**The pipeline is now decode-bound.** libFLAC's single-threaded decode is 0.109 s
-of the master mix's 0.239 s wall clock, against 0.106 s of device time — the
-encode is now faster than the decode feeding it. Further kernel work will not
-show up in wall clock. The next move is to overlap them: frames are independent
-at a fixed block size, so chunk N can encode while chunk N+1 decodes, which
-should take the master mix to ~0.13 s (~7x) without touching a shader.
+### The pipeline: one producer, two consumers
+
+Decode was the binding constraint once the kernels were fast (0.109 s against
+0.106 s of device time), and it does not want to move to the GPU. Decoding is
+*not* the mirror of encoding: encoding variable-length codes is parallel because
+the lengths are computable independently and a prefix scan turns them into
+offsets, whereas **decoding cannot know where code i+1 starts until code i is
+decoded** — a set bit is a stop bit only if it is not inside a previous
+remainder field. Frame-boundary discovery parallelises (speculative sync scan
+validated by CRC-8, CRC-16 and sample-number chaining), and LPC reconstruction
+parallelises across subframes, but the Rice decode is a genuine serial
+dependency. Meanwhile libFLAC's decode scales ~7x across cores for free
+(8 concurrent decodes of the master mix: 0.124 s wall, 0.0155 s each) and the
+CPU is *idle* while the device works. Moving it onto the GPU would take work off
+an idle unit and put it on the saturated one.
+
+So `-P` drives its own streaming decode instead. `write_callback` writes into a
+**preallocated** buffer at the published offset and republishes the count with
+release ordering; the encoder acquires it and may read anything below. That is
+the entire synchronisation on the sample data — no lock. Chunk N is submitted as
+soon as its samples exist.
+
+**MD5 belongs on a third thread, and getting this wrong cost most of the win.**
+It was first folded into the decode thread on the theory that the samples are
+already hot. But MD5 is compute-bound at a few hundred MB/s, not memory-bound,
+so that serialised ~66 ms of hashing behind a 109 ms decode: the master mix went
+0.239 → 0.221 s instead of the predicted ~0.13 s. Split back out as its own
+consumer of the same counter (and batched, since `update()` at 6 bytes a call is
+mostly call overhead), it disappears: 0.221 → **0.170 s**.
+
+What is left is not encode work:
+
+```
+0.170 s  =  0.025 (Vulkan init + 12 pipeline compiles)
+          + 0.109 (decode, overlapped with 0.106 device)
+          + ~0.036 (metadata, 17 MB file write, process startup)
+```
+
+Two consequences. The ~25 ms fixed cost is why short inputs only reach ~2x
+(it is 37% of music_10s's wall clock) — a pipeline cache would address it.
+And **threading the decode is now pointless**: `max(0.109, 0.106)` becomes
+`max(0.016, 0.106)`, worth 3 ms, because the device is once again the bound.
 
 Losslessness verified by decode on all 18 fixtures (`flac -t` ok and decoded
 audio MD5 equal to the input's), including 24-bit, mono, and the `<1024`-sample

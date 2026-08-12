@@ -106,6 +106,13 @@ bool Processor::process() {
             std::cerr << "Warning: could not copy metadata from " << m_input << "\n";
     }
 
+    // -P diverges before the decode, not after: it drives its own streaming
+    // decode so the device can start on chunk 0 while the rest of the file is
+    // still being decoded. It shares the metadata handling and the file plumbing
+    // with the CPU path and nothing else.
+    if (m_config.pure_gpu)
+        return process_pure_gpu(extra_blocks);
+
     // --- Step 2: decode PCM with libFLAC ----
     FLAC__StreamDecoder* decoder = FLAC__stream_decoder_new();
     if (!decoder) return false;
@@ -136,12 +143,6 @@ bool Processor::process() {
         std::cout << "Decoded " << m_total_samples << " samples ("
                   << m_channels << " ch, " << m_bps << " bps, "
                   << m_sample_rate << " Hz)\n";
-
-    // -P diverges here: it shares the decode and the file plumbing with the CPU
-    // path and nothing else, so it gets its own function rather than a branch
-    // threaded through the search, reuse and DP code below.
-    if (m_config.pure_gpu)
-        return process_pure_gpu(extra_blocks);
 
     // --- Step 2b: compute MD5 over interleaved little-endian PCM ----
     // The FLAC spec mandates MD5 over the raw audio (channel-interleaved,
@@ -510,6 +511,27 @@ bool Processor::process() {
 
 bool Processor::process_pure_gpu(std::vector<std::vector<uint8_t>>& extra_blocks)
 {
+    // ---- decode metadata on this thread, so the stream shape is known --------
+    FLAC__StreamDecoder* decoder = FLAC__stream_decoder_new();
+    if (!decoder) return false;
+    FLAC__stream_decoder_set_metadata_respond(decoder, FLAC__METADATA_TYPE_STREAMINFO);
+    if (FLAC__stream_decoder_init_file(decoder, m_input.c_str(),
+                                       write_callback, metadata_callback,
+                                       error_callback, this)
+        != FLAC__STREAM_DECODER_INIT_STATUS_OK) {
+        FLAC__stream_decoder_delete(decoder);
+        return false;
+    }
+    if (!FLAC__stream_decoder_process_until_end_of_metadata(decoder) ||
+        m_channels == 0 || m_total_samples == 0) {
+        // A STREAMINFO without a sample count cannot be preallocated, and
+        // streaming needs a fixed destination. Rare enough to just refuse: the
+        // CPU path handles those files.
+        FLAC__stream_decoder_delete(decoder);
+        std::cerr << "Error: -P needs a STREAMINFO with a known sample count.\n";
+        return false;
+    }
+
     PureGpuEncoder::Config gcfg;
     gcfg.block_size       = m_config.pg_block_size;
     gcfg.windows          = m_config.windows;
@@ -521,38 +543,98 @@ bool Processor::process_pure_gpu(std::vector<std::vector<uint8_t>>& extra_blocks
 
     PureGpuEncoder enc(m_channels, m_bps, m_sample_rate, gcfg);
     if (!enc.available()) {
+        FLAC__stream_decoder_delete(decoder);
         std::cerr << "Error: -P unavailable: " << enc.why() << "\n";
         return false;
     }
     if (m_config.verbose)
         std::cout << "Pure GPU: " << enc.why() << "\n";
 
-    // MD5 is the one stage that cannot be parallelized -- it chains 64-byte
-    // blocks and has no combine operator, unlike CRC, which is linear over
-    // GF(2) and runs on the device. So it runs on a host thread *beside* the
-    // encode instead of before it: it depends on nothing the device produces,
-    // so its cost is hidden entirely.
-    std::array<uint8_t, 16> md5_digest{};
-    std::thread md5_thread([&]() {
-        const int bps_bytes = (m_bps + 7) / 8;
-        detail::MD5 md5;
-        std::vector<uint8_t> buf(m_channels * bps_bytes);
-        for (uint64_t s = 0; s < m_total_samples; ++s) {
-            for (uint32_t c = 0; c < m_channels; ++c) {
-                const int32_t v = m_pcm_data[c][s];
-                for (int b = 0; b < bps_bytes; ++b)
-                    buf[c * bps_bytes + b] = (uint8_t)(v >> (b * 8));
+    // ---- preallocate, then decode on a background thread ---------------------
+    m_pcm_data.assign(m_channels, std::vector<int32_t>());
+    for (auto& ch : m_pcm_data) ch.resize((size_t)m_total_samples);
+    m_stream_mode = true;
+    m_decoded.store(0, std::memory_order_relaxed);
+    m_decode_done.store(false, std::memory_order_relaxed);
+    m_decode_failed.store(false, std::memory_order_relaxed);
+
+    // MD5 gets its own thread, following the same published counter as the
+    // encoder. It was briefly folded into the decode thread on the theory that
+    // the samples are already hot -- but MD5 is compute-bound at a few hundred
+    // MB/s, not memory-bound, so that serialised ~66 ms of hashing behind a
+    // 109 ms decode and threw away most of the overlap this restructure exists
+    // for (master mix 0.239 s -> 0.221 s instead of the predicted ~0.13 s).
+    // Three consumers of one producer, all overlapped, is the right shape.
+    std::thread md5_thread([this]() {
+        const uint32_t bpsb = (m_bps + 7) / 8;
+        const uint32_t stride = m_channels * bpsb;
+        // Batch rather than calling update() per sample: at 6 bytes a call the
+        // per-call overhead dominates the hashing.
+        constexpr uint32_t BATCH = 4096;
+        std::vector<uint8_t> buf((size_t)BATCH * stride);
+        uint64_t at = 0;
+        while (at < m_total_samples) {
+            uint64_t have;
+            {
+                std::unique_lock<std::mutex> lk(m_decode_mu);
+                m_decode_cv.wait(lk, [&] {
+                    return m_decoded.load(std::memory_order_acquire) > at ||
+                           m_decode_done.load(std::memory_order_acquire) ||
+                           m_decode_failed.load(std::memory_order_acquire);
+                });
+                have = m_decoded.load(std::memory_order_acquire);
             }
-            md5.update(buf.data(), m_channels * bps_bytes);
+            if (m_decode_failed.load(std::memory_order_acquire)) return;
+            if (have <= at) return;   // producer finished short
+            while (at < have) {
+                const uint32_t n = (uint32_t)std::min<uint64_t>(BATCH, have - at);
+                uint8_t* w = buf.data();
+                for (uint32_t i = 0; i < n; ++i)
+                    for (uint32_t c = 0; c < m_channels; ++c) {
+                        const int32_t v = m_pcm_data[c][at + i];
+                        for (uint32_t b = 0; b < bpsb; ++b)
+                            *w++ = (uint8_t)(v >> (b * 8));
+                    }
+                m_md5.update(buf.data(), (size_t)n * stride);
+                at += n;
+            }
         }
-        md5_digest = md5.digest();
     });
+
+    std::thread decode_thread([this, decoder]() {
+        const bool ok = FLAC__stream_decoder_process_until_end_of_stream(decoder);
+        if (!ok || m_decoded.load(std::memory_order_relaxed) != m_total_samples)
+            m_decode_failed.store(true, std::memory_order_release);
+        m_decode_done.store(true, std::memory_order_release);
+        m_decode_cv.notify_all();
+    });
+
+    // The barrier the encoder blocks on. Returns false rather than deadlocking if
+    // the decoder dies or ends short.
+    auto wait_for = [this](uint64_t n) -> bool {
+        std::unique_lock<std::mutex> lk(m_decode_mu);
+        m_decode_cv.wait(lk, [&] {
+            return m_decoded.load(std::memory_order_acquire) >= n ||
+                   m_decode_done.load(std::memory_order_acquire) ||
+                   m_decode_failed.load(std::memory_order_acquire);
+        });
+        return m_decoded.load(std::memory_order_acquire) >= n &&
+               !m_decode_failed.load(std::memory_order_acquire);
+    };
+
+    auto finish_decode = [&]() {
+        if (decode_thread.joinable()) decode_thread.join();
+        // The decode thread's exit notifies the cv, so the MD5 consumer cannot
+        // still be waiting once that join returns.
+        if (md5_thread.joinable()) md5_thread.join();
+        FLAC__stream_decoder_delete(decoder);
+    };
 
     const std::string tmp_output = m_output + ".partial";
     std::fstream out(tmp_output,
                      std::ios::binary | std::ios::out | std::ios::trunc);
     if (!out) {
-        md5_thread.join();
+        finish_decode();
         std::cerr << "Error: cannot open output file: " << tmp_output << "\n";
         return false;
     }
@@ -579,17 +661,23 @@ bool Processor::process_pure_gpu(std::vector<std::vector<uint8_t>>& extra_blocks
             out.write(reinterpret_cast<const char*>(p), (std::streamsize)n);
             if (!out) { wrote_ok = false; return false; }
             return true;
-        }, &st);
+        }, &st, wait_for);
 
-    md5_thread.join();
+    finish_decode();
 
-    if (!enc_ok || !wrote_ok) {
-        std::cerr << "Error: " << (wrote_ok ? "GPU encode failed" : "write failed")
+    if (!enc_ok || !wrote_ok || m_decode_failed.load(std::memory_order_acquire)) {
+        std::cerr << "Error: "
+                  << (!wrote_ok ? "write failed"
+                     : m_decode_failed.load(std::memory_order_acquire)
+                       ? "decode failed" : "GPU encode failed")
                   << ".\n";
         out.close();
         std::remove(tmp_output.c_str());
         return false;
     }
+
+    // Accumulated on the MD5 thread, which finish_decode() has now joined.
+    auto md5_digest = m_md5.digest();
 
     // Patch STREAMINFO: fLaC(4) + block header(4) = byte 8, then the 34-byte
     // payload only.
@@ -614,6 +702,8 @@ bool Processor::process_pure_gpu(std::vector<std::vector<uint8_t>>& extra_blocks
     }
 
     if (m_config.verbose) {
+        // This is now decode-and-encode overlapped, so it is wall clock for the
+        // pipeline rather than device time.
         const double secs = st.device_secs;
         std::cout << "Wrote " << st.bytes << " bytes of audio data ("
                   << st.frames << " frames, min=" << st.min_block
@@ -638,6 +728,23 @@ FLAC__StreamDecoderWriteStatus Processor::write_callback(
     auto* self = static_cast<Processor*>(client_data);
     uint32_t nch   = frame->header.channels;
     uint32_t bsize = frame->header.blocksize;
+
+    if (self->m_stream_mode) {
+        // Preallocated; write at the published offset and republish after.
+        const uint64_t at = self->m_decoded.load(std::memory_order_relaxed);
+        if (at + bsize > self->m_total_samples) {
+            self->m_decode_failed.store(true, std::memory_order_release);
+            self->m_decode_cv.notify_all();
+            return FLAC__STREAM_DECODER_WRITE_STATUS_ABORT;
+        }
+        for (uint32_t c = 0; c < nch; ++c)
+            std::memcpy(self->m_pcm_data[c].data() + at, buffer[c],
+                        (size_t)bsize * sizeof(int32_t));
+
+        self->m_decoded.store(at + bsize, std::memory_order_release);
+        self->m_decode_cv.notify_all();
+        return FLAC__STREAM_DECODER_WRITE_STATUS_CONTINUE;
+    }
 
     if (self->m_pcm_data.empty())
         self->m_pcm_data.resize(nch);

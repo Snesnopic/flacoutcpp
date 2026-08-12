@@ -6,9 +6,13 @@
 #ifndef PROCESSOR_HPP
 #define PROCESSOR_HPP
 
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
 #include <string>
 #include <vector>
 #include <cstdint>
+#include "md5.hpp"
 #include "FLAC/stream_decoder.h"
 #include "optimizer.hpp"
 
@@ -217,6 +221,29 @@ private:
     std::vector<InputFrame> m_input_frames;
     uint64_t m_prev_frame_end = 0;   // rolling byte offset during decode
     bool     m_frame_pos_ok   = true; // false if the decoder can't report positions
+
+    // --- streaming decode, used by -P only ----
+    //
+    // The CPU path decodes the whole file, then encodes. -P cannot afford that:
+    // libFLAC's single-threaded decode was 0.109 s of the master mix's 0.239 s
+    // against 0.106 s of device time, so the two are near-equal and serialising
+    // them wastes half the wall clock.
+    //
+    // In streaming mode write_callback writes into a *preallocated* m_pcm_data at
+    // m_decoded and then publishes the new count with release ordering, so the
+    // encoder may read anything below what it has acquired. That is the whole
+    // synchronisation: no lock on the sample data itself.
+    bool                  m_stream_mode = false;
+    std::atomic<uint64_t> m_decoded{0};
+    std::atomic<bool>     m_decode_done{false};
+    std::atomic<bool>     m_decode_failed{false};
+    std::mutex              m_decode_mu;
+    std::condition_variable m_decode_cv;
+    /// MD5 runs on the decode thread, folded into the same pass. It is the one
+    /// stage that cannot be parallelised (no combine operator, unlike CRC), and
+    /// doing it here means it costs nothing: the samples are already hot, and the
+    /// thread would otherwise be waiting on I/O.
+    detail::MD5 m_md5;
 
     // Decoded PCM (per-channel, arrays of channel samples)
     std::vector<std::vector<int32_t>> m_pcm_data;

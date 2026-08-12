@@ -15,7 +15,7 @@ PureGpuEncoder::~PureGpuEncoder() = default;
 bool PureGpuEncoder::available() const { return false; }
 const std::string& PureGpuEncoder::why() const { return m_impl->why; }
 bool PureGpuEncoder::encode(const std::vector<std::vector<int32_t>>&,
-                            const Sink&, Stats*) { return false; }
+                            const Sink&, Stats*, const Wait&) { return false; }
 } // namespace flacoutcpp
 
 #else
@@ -900,7 +900,7 @@ bool PureGpuEncoder::available() const { return m_impl->ok; }
 const std::string& PureGpuEncoder::why() const { return m_impl->why; }
 
 bool PureGpuEncoder::encode(const std::vector<std::vector<int32_t>>& pcm,
-                            const Sink& sink, Stats* out)
+                            const Sink& sink, Stats* out, const Wait& wait)
 {
     Impl& I = *m_impl;
     if (!I.ok || pcm.empty()) return false;
@@ -917,6 +917,10 @@ bool PureGpuEncoder::encode(const std::vector<std::vector<int32_t>>& pcm,
 
     for (uint64_t done = 0; done < nfull; ) {
         const uint32_t n = (uint32_t)std::min<uint64_t>(I.maxBlk, nfull - done);
+        // Block only on the samples this chunk needs. With a streaming producer
+        // this is what overlaps decode with encode; with a fully-decoded buffer
+        // it returns immediately.
+        if (wait && !wait((done + n) * I.B)) return false;
         uint32_t bytes = 0;
         if (!I.runChunk(pcm, done * I.B, n, &bytes)) return false;
 
@@ -941,6 +945,7 @@ bool PureGpuEncoder::encode(const std::vector<std::vector<int32_t>>& pcm,
     // which is why it has not been worth a second set of kernels for a
     // non-power-of-two block size. Losslessness does not care.
     if (tail > 0) {
+        if (wait && !wait(total)) return false;
         BlockParams bp{};
         bp.block_size  = (uint32_t)tail;
         bp.stereo_mode = 0;

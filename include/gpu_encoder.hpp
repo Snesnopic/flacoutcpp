@@ -74,6 +74,13 @@ public:
     /// Receives finished frame bytes in stream order. Return false to abort.
     using Sink = std::function<bool(const uint8_t*, size_t)>;
 
+    /// Blocks until at least N samples per channel are readable in the PCM
+    /// buffers, returning false if the producer failed or ended short. Lets the
+    /// caller decode *while* the device encodes: chunk N is submitted as soon as
+    /// its samples exist, rather than after the whole file is decoded. Omit for
+    /// a fully-decoded buffer.
+    using Wait = std::function<bool(uint64_t)>;
+
     struct Stats {
         uint64_t frames      = 0;
         uint32_t min_frame   = 0;
@@ -102,10 +109,11 @@ public:
      * @param pcm   Decoded samples, pcm[channel][sample].
      * @param sink  Called with each chunk's frame bytes, in order.
      * @param out   Frame/size statistics for STREAMINFO.
-     * @return false on a device error or a sink refusal.
+     * @param wait  Optional producer barrier; see Wait.
+     * @return false on a device error, a sink refusal, or a producer failure.
      */
     bool encode(const std::vector<std::vector<int32_t>>& pcm,
-                const Sink& sink, Stats* out);
+                const Sink& sink, Stats* out, const Wait& wait = {});
 
 private:
     struct Impl;

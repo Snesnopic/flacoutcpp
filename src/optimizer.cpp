@@ -1,6 +1,8 @@
 #include "optimizer.hpp"
 #include "frame_writer.hpp"
 #include <algorithm>
+#include <array>
+#include <unordered_map>
 #if defined(_MSC_VER) && !defined(__clang__)
 #include <intrin.h>
 #endif
@@ -15,6 +17,7 @@
 #include <limits>
 #include <sstream>
 #include <mutex>
+#include <numeric>
 #include <map>
 #include <string>
 #include <thread>
@@ -39,10 +42,14 @@ struct InstrCounters {
     std::atomic<uint64_t> rice_scan_samples{0}; // residuals scanned in sums pass
     std::atomic<uint64_t> rice_k_ops{0};        // (u>>k) accumulations
     std::atomic<uint64_t> rice_fold_ops{0};
+    std::atomic<uint64_t> rice_sums2_parts{0};   // partitions taking the RICE2 pass
+    std::atomic<uint64_t> rice_sums2_samples{0}; // residuals it rescans, scalar
     std::atomic<uint64_t> rice_chunk_fast{0};  // 32-bit lane accumulation held
     std::atomic<uint64_t> rice_chunk_slow{0};  // OR proved it could wrap; redone in 64-bit
     std::atomic<uint64_t> autoc_macs{0};
     std::atomic<uint64_t> window_samples{0};
+    std::atomic<uint64_t> lattice_evals{0};     // -Q: +-1 perturbations costed
+    std::atomic<uint64_t> lattice_accepts{0};   // of which: adopted (cost dropped)
     std::atomic<uint64_t> win_order_hist[33]{};
     std::atomic<uint64_t> best_order_hist[33]{};
     std::atomic<uint64_t> best_prec_hist[16]{};
@@ -61,10 +68,18 @@ struct InstrCounters {
         std::fprintf(stderr, "residual loops run      : %llu   (delta updates: %llu)\n",
                      (unsigned long long)residual_calls, (unsigned long long)residual_delta);
         std::fprintf(stderr, "residual MACs           : %llu\n", (unsigned long long)residual_macs);
+        {
+            unsigned long long ev = lattice_evals, ac = lattice_accepts;
+            std::fprintf(stderr, "lattice evals/accepts   : %llu / %llu (%.4f%% adopted)\n",
+                         ev, ac, ev ? 100.0 * (double)ac / (double)ev : 0.0);
+        }
         std::fprintf(stderr, "rice calls              : %llu\n", (unsigned long long)rice_calls);
         std::fprintf(stderr, "rice residuals scanned  : %llu\n", (unsigned long long)rice_scan_samples);
         std::fprintf(stderr, "rice (u>>k) ops         : %llu\n", (unsigned long long)rice_k_ops);
         std::fprintf(stderr, "rice fold ops           : %llu\n", (unsigned long long)rice_fold_ops);
+        std::fprintf(stderr, "rice sums2 parts/samples: %llu / %llu\n",
+                     (unsigned long long)rice_sums2_parts,
+                     (unsigned long long)rice_sums2_samples);
         {
             unsigned long long f = rice_chunk_fast, sl = rice_chunk_slow;
             std::fprintf(stderr, "rice chunks fast/slow   : %llu / %llu (%.4f%% fell back)\n",
@@ -275,6 +290,22 @@ WindowType window_from_name(const std::string& raw) {
 // Optimizer constructor
 // ============================================================
 
+// The DP's candidate block sizes (shared with find_optimal_block_partitioning).
+// Window coefficient tables for these sizes are precomputed once; any other
+// size (the remainder block, the short-stream path) computes on the fly.
+// The estimated-DP shortlist: six dense tapers plus the partial/punchout pair
+// at each offset. Also what exact DP falls back to at a small -c.
+std::vector<WindowType> default_shortlist() {
+    return {WindowType::TUKEY_050, WindowType::HANN,
+            WindowType::WELCH,    WindowType::RECTANGULAR,
+            WindowType::TUKEY_005, WindowType::TUKEY_020,
+            WindowType::PARTIAL_TUKEY_2_033,  WindowType::PARTIAL_TUKEY_2_067,
+            WindowType::PUNCHOUT_TUKEY_2_033, WindowType::PUNCHOUT_TUKEY_2_067};
+}
+
+static const uint32_t DP_CANDIDATES[] = { 1024, 2048, 4096, 8192, 16384 };
+static constexpr size_t NUM_DP_CANDIDATES = 5;
+
 Optimizer::Optimizer(uint32_t channels, uint32_t bps, uint32_t sample_rate,
                      std::vector<WindowType> windows,
                      unsigned max_threads,
@@ -283,13 +314,40 @@ Optimizer::Optimizer(uint32_t channels, uint32_t bps, uint32_t sample_rate,
                      unsigned max_candidates,
                      bool adaptive_windows,
                      unsigned patience,
-                     unsigned precision_rungs)
+                     unsigned precision_rungs,
+                     std::vector<uint32_t> dp_candidates,
+                     unsigned lattice_sweeps)
     : m_channels(channels), m_bps(bps), m_sample_rate(sample_rate),
       m_max_threads(max_threads),
       m_exhaustive(exhaustive), m_verbose(verbose), m_max_candidates(max_candidates),
       m_adaptive(adaptive_windows), m_patience(patience),
-      m_precision_rungs(precision_rungs)
+      m_precision_rungs(precision_rungs), m_lattice_sweeps(lattice_sweeps)
 {
+    // Block-size ladder. Empty means the built-in one, whose coefficient
+    // tables are precomputed; any other size falls back to computing window
+    // coefficients per block (correct, just slower), so a custom ladder costs
+    // no memory.
+    if (dp_candidates.empty())
+        m_dp_candidates.assign(std::begin(DP_CANDIDATES), std::end(DP_CANDIDATES));
+    else
+        m_dp_candidates = std::move(dp_candidates);
+    std::sort(m_dp_candidates.begin(), m_dp_candidates.end());
+    m_dp_candidates.erase(std::unique(m_dp_candidates.begin(), m_dp_candidates.end()),
+                          m_dp_candidates.end());
+
+    // The node spacing is the GCD: every candidate must be walkable from one
+    // node to another. Validation in main.cpp keeps every entry a multiple of
+    // 16, so the GCD is too — which the estimated path needs, since it indexes
+    // 16-sample granules by node.
+    uint32_t g = m_dp_candidates.front();
+    for (uint32_t c : m_dp_candidates) g = std::gcd(g, c);
+    m_dp_step = g;
+    // The smallest candidate must equal the step, or nodes between reachable
+    // positions are dead and the DP can fail to reach the end of the stream
+    // at all. main.cpp rejects such ladders; this catches library callers.
+    assert(m_dp_candidates.front() == m_dp_step &&
+           "every -b block size must be a multiple of the smallest");
+
     if (windows.empty()) {
         // Exact-DP mode (-e) affords the widest window set; the ranking pays
         // per candidate evaluated, not per window offered, so offering more
@@ -333,14 +391,29 @@ Optimizer::Optimizer(uint32_t channels, uint32_t bps, uint32_t sample_rate,
         // *old* four-window list was multi-lobe, i.e. redundant with the
         // partial/punchout pair already here — which is exactly why the
         // 4-window baseline must not be used to judge a new window.
-        if (full_search()) {
+        // Exact DP widens to all 26 only at an *unlimited* candidate budget.
+        // The ranking pays per candidate evaluated, not per window offered, so
+        // at -c 0 extra windows are free options — but at any finite -c they
+        // crowd better candidates out of the top N and cost both size and
+        // time. On the 188-track mix the shortlist wins on both axes at every
+        // budget measured: -e -E 0 is -0.520% at 7.7x the default against
+        // -0.413% at 15.4x for the wide set, and -e -c 24 -L 1 is -0.610% at
+        // 24x against -0.598% at 41x. Real music (music_10s) prefers the
+        // shortlist at -c 2 through 48 and only loses by 0.0065% at -c 0.
+        //
+        // The synthetic 24-bit fixture disagrees — s24_2s wants the wide set
+        // from -c 16 on, by up to 0.49% — which is exactly the trap in
+        // CLAUDE.md: synthetic noise floors mispredict window choice. Tuned to
+        // the real-music result deliberately.
+        //
+        // Bare -e implies -c 0, so it is unaffected; an explicit -w overrides
+        // all of this.
+        if (full_search() && m_max_candidates == 0) {
             m_windows = all_window_types();
+        } else if (full_search()) {
+            m_windows = default_shortlist();
         } else {
-            m_windows = {WindowType::TUKEY_050, WindowType::HANN,
-                         WindowType::WELCH,    WindowType::RECTANGULAR,
-                         WindowType::TUKEY_005, WindowType::TUKEY_020,
-                         WindowType::PARTIAL_TUKEY_2_033,  WindowType::PARTIAL_TUKEY_2_067,
-                         WindowType::PUNCHOUT_TUKEY_2_033, WindowType::PUNCHOUT_TUKEY_2_067};
+            m_windows = default_shortlist();
         }
     } else {
         m_windows = std::move(windows);
@@ -785,11 +858,6 @@ static void compute_window_coeffs(WindowType wt, uint32_t N, double* out)
     }
 }
 
-// The DP's candidate block sizes (shared with find_optimal_block_partitioning).
-// Window coefficient tables for these sizes are precomputed once; any other
-// size (the remainder block, the short-stream path) computes on the fly.
-static const uint32_t DP_CANDIDATES[] = { 1024, 2048, 4096, 8192, 16384 };
-static constexpr size_t NUM_DP_CANDIDATES = 5;
 
 static int candidate_slot(uint32_t N)
 {
@@ -797,6 +865,42 @@ static int candidate_slot(uint32_t N)
         if (DP_CANDIDATES[c] == N) return (int)c;
     return -1;
 }
+
+
+#ifdef FLACOUT_DUMP_BLOCKCOST
+// Offline sink for the block-cost estimator's error: one row per (node, block
+// size) the DP considered, carrying the granule features available at
+// estimation time, the estimate, and the exact encoded cost. The point is to
+// find out whether the estimator's error is *systematic* — a per-block-size
+// bias a five-parameter recalibration could absorb — or content-dependent, in
+// which case it needs a model. Compiles to nothing unless defined; path from
+// FLACOUT_DUMP_PATH, else stderr.
+#include <cstdio>
+namespace {
+struct BlockCostDump {
+    std::FILE* fh = nullptr;
+    std::mutex mu;
+    BlockCostDump() {
+        const char* path = std::getenv("FLACOUT_DUMP_PATH");
+        fh = path ? std::fopen(path, "w") : stderr;
+        if (!fh) fh = stderr;
+        std::fprintf(fh, "node\tstart\tbsize\tch\tbps\test\texact\t"
+                         "energy\ttilt1\ttilt2\tcv2\tmode\testL\testR\testM\testS\n");
+    }
+    ~BlockCostDump() { if (fh && fh != stderr) std::fclose(fh); }
+    void row(size_t node, uint64_t start, uint32_t bsize, uint32_t ch, uint32_t bps,
+             uint32_t est, uint32_t exact, double energy, double t1, double t2,
+             double cv2, int mode, double eL, double eR, double eM, double eS) {
+        std::lock_guard<std::mutex> lk(mu);
+        std::fprintf(fh, "%zu\t%llu\t%u\t%u\t%u\t%u\t%u\t%.6g\t%.6g\t%.6g\t%.6g"
+                         "\t%d\t%.6g\t%.6g\t%.6g\t%.6g\n",
+                     node, (unsigned long long)start, bsize, ch, bps, est, exact,
+                     energy, t1, t2, cv2, mode, eL, eR, eM, eS);
+    }
+};
+BlockCostDump g_block_dump;
+} // namespace
+#endif
 
 #ifdef FLACOUT_DUMP_CANDIDATES
 // Offline training/analysis sink: one row per candidate the ranked scan
@@ -823,6 +927,28 @@ struct CandidateDump {
     ~CandidateDump() { if (fh && fh != stderr) std::fclose(fh); }
 };
 CandidateDump g_dump;
+} // namespace
+#endif
+
+#ifdef FLACOUT_DUMP_LATTICE
+// Sink for the coefficient-lattice refinement (-Q): one row per +-1
+// perturbation costed, carrying the signed cost delta against the rounded
+// point the quantizer chose. Answers whether that point is an axis-local
+// minimum of the *exact* cost, and if not, by how much it misses.
+namespace {
+struct LatticeDump {
+    std::FILE* fh = nullptr;
+    std::mutex mu;
+    LatticeDump() {
+        const char* path = std::getenv("FLACOUT_LATTICE_DUMP_PATH");
+        fh = path ? std::fopen(path, "w") : stderr;
+        if (!fh) fh = stderr;
+        std::fprintf(fh, "bsize\tord\tprec\ttap\tdelta\tdcost"
+                         "\tbps\twasted\tshift\tbase\tcoef\n");
+    }
+    ~LatticeDump() { if (fh && fh != stderr) std::fclose(fh); }
+};
+LatticeDump g_ldump;
 } // namespace
 #endif
 
@@ -862,6 +988,13 @@ std::atomic<uint64_t> g_pdump_sf{0};
 // count the sample as one the window cannot see. 0.0 means "exactly zero",
 // which is what the blind-region term originally tested; see the calibration
 // note at the ranked scorer for why that is worth a threshold.
+// Highest LPC coefficient precision whose winner -Q still tries to refine.
+// 15 disables the gate (every winner refined). See the gate in
+// optimize_subframe for the measured frontier behind the default.
+#ifndef FLACOUT_LATTICE_MAX_PREC
+#define FLACOUT_LATTICE_MAX_PREC 10
+#endif
+
 #ifndef FLACOUT_BLIND_EPS
 #define FLACOUT_BLIND_EPS 0.0
 #endif
@@ -1252,22 +1385,21 @@ static void autocorrelation(
     }
 }
 
-static void compute_lpc_residuals(
+// The blocked main loop, parameterised on accumulator width. Acc=int64_t is
+// the always-safe form; Acc=int32_t is selected by the caller's bound below
+// and is the same arithmetic in half the register width — twice the SIMD
+// lanes per multiply-accumulate, and no widening.
+template <typename Acc, uint32_t BLOCK>
+static inline uint32_t lpc_residual_blocked(
     const int32_t* shifted, uint32_t bsize,
     const int32_t* qc, int ord, int shift, int32_t* residuals,
-    int64_t* pred_out = nullptr)
+    int64_t* pred_out)
 {
-    assert(ord >= 1);
-
-    // 8 int64 accumulators = 4 128-bit registers, which leaves plenty spare for
-    // the sample history and coefficients on both NEON (32) and SSE2 (16).
-    constexpr uint32_t BLOCK = 16;
-
     uint32_t i = (uint32_t)ord;
     for (; i + BLOCK <= bsize; i += BLOCK) {
-        int64_t acc[BLOCK] = {};
+        Acc acc[BLOCK] = {};
         for (int j = 0; j < ord; ++j) {
-            const int64_t  c   = qc[j];
+            const Acc      c   = (Acc)qc[j];
             const int32_t* src = shifted + i - 1 - j;
             // Must be unrolled, or acc[] is indexed dynamically and spills.
 #if defined(__clang__)
@@ -1275,13 +1407,50 @@ static void compute_lpc_residuals(
 #elif defined(__GNUC__)
 #  pragma GCC unroll 16
 #endif
-            for (uint32_t k = 0; k < BLOCK; ++k) acc[k] += c * (int64_t)src[k];
+            for (uint32_t k = 0; k < BLOCK; ++k) acc[k] += c * (Acc)src[k];
         }
         if (pred_out)
             for (uint32_t k = 0; k < BLOCK; ++k) pred_out[i + k] = acc[k];
         for (uint32_t k = 0; k < BLOCK; ++k)
             residuals[i + k] = shifted[i + k] - (int32_t)(acc[k] >> shift);
     }
+    return i;
+}
+
+// `max_sum_abs_qc` is INT32_MAX >> (eff_bps - 1), the same bound the
+// precision-ladder delta already applies to its correction taps: every
+// partial sum of the dot product is bounded by sum|qc| * max|sample|, and
+// max|sample| is 2^(eff_bps-1), so when sum|qc| clears the bound the whole
+// accumulation fits in int32. Results are bit-identical either way —
+// identical partial products in identical order, and an arithmetic right
+// shift of an in-range value is the same at both widths. 0 disables it.
+//
+// It is worth branching on because the bound is 256x looser at 16 bits than
+// at 24: measured on the master mix (16-bit), 94.9% of all multiply-
+// accumulates take the narrow path; on 24-bit music_5s, 0.7%.
+static void compute_lpc_residuals(
+    const int32_t* shifted, uint32_t bsize,
+    const int32_t* qc, int ord, int shift, int32_t* residuals,
+    int64_t* pred_out = nullptr, int64_t max_sum_abs_qc = 0)
+{
+    assert(ord >= 1);
+
+    // 16 int64 accumulators = 8 128-bit registers, which leaves plenty spare
+    // for the sample history and coefficients on both NEON (32) and SSE2 (16).
+    constexpr uint32_t BLOCK = 16;
+
+    bool narrow = false;
+    if (max_sum_abs_qc > 0) {
+        int64_t s = 0;
+        for (int j = 0; j < ord; ++j) s += std::abs((int64_t)qc[j]);
+        narrow = s <= max_sum_abs_qc;
+    }
+
+    uint32_t i = narrow
+        ? lpc_residual_blocked<int32_t, BLOCK>(shifted, bsize, qc, ord, shift,
+                                               residuals, pred_out)
+        : lpc_residual_blocked<int64_t, BLOCK>(shifted, bsize, qc, ord, shift,
+                                               residuals, pred_out);
 
     // Tail: fewer than BLOCK samples left.
     for (; i < bsize; ++i) {
@@ -1561,13 +1730,66 @@ uint32_t Optimizer::calculate_rice_cost(
         const uint32_t start = p * p_size;
         const uint32_t end   = start + p_size;
         const uint32_t first = std::max(start, order);
+        INSTR(g_instr.rice_sums2_parts.fetch_add(1, std::memory_order_relaxed));
+        INSTR(g_instr.rice_sums2_samples.fetch_add(end - first, std::memory_order_relaxed));
         uint64_t* s2 = sums2[p];
-        // v ≤ 2^17 and n ≤ 65535, so plain 64-bit accumulation cannot wrap;
-        // no chunking needed. This path never runs for 16-bit content.
+        // Vectorized the same way as the 15-lane low-k scan above, and for the
+        // same reason: this is not the rare path the original comment assumed.
+        // 24-bit content rescans 41-73% of all residuals here (measured,
+        // music_3s and s24_2s under -e), against 0.18% at 16 bits -- so a
+        // scalar loop doing 16 shift-adds per residual was costing roughly
+        // what the whole vectorized low-k pass costs, on exactly the content
+        // where RICE2 exists to help.
+        //
+        // 32-bit lanes need the same wrap guard the low-k scan uses: v is
+        // bounded by 2^17 and a partition by 65535 residuals, whose product
+        // exceeds 32 bits. The OR of every v bounds each lane's total, so one
+        // compare decides whether the fast accumulation held.
+#if FLACOUT_HAVE_VECEXT
+        {
+            u32x4 acc2[NUM_K2] = {};
+            u32x4 orv2 = {};
+            uint32_t i = first;
+            for (; i + 4 <= end; i += 4) {
+                const u32x4 v = { zigzag(residuals[i])     >> 15,
+                                  zigzag(residuals[i + 1]) >> 15,
+                                  zigzag(residuals[i + 2]) >> 15,
+                                  zigzag(residuals[i + 3]) >> 15 };
+                orv2 |= v;
+#  if defined(__clang__)
+#    pragma unroll
+#  elif defined(__GNUC__)
+#    pragma GCC unroll 16
+#  endif
+                for (int k = 0; k < NUM_K2; ++k) acc2[k] += v >> k;
+            }
+            uint32_t tail2[NUM_K2] = {};
+            uint32_t or_tail2 = 0;
+            for (; i < end; ++i) {
+                const uint32_t v = zigzag(residuals[i]) >> 15;
+                or_tail2 |= v;
+                for (int k = 0; k < NUM_K2; ++k) tail2[k] += v >> k;
+            }
+            const uint32_t or_all2 =
+                or_tail2 | orv2[0] | orv2[1] | orv2[2] | orv2[3];
+            if ((uint64_t)(end - first) * or_all2 <= 0xFFFFFFFFull) {
+                for (int k = 0; k < NUM_K2; ++k)
+                    s2[k] = (uint64_t)acc2[k][0] + acc2[k][1] + acc2[k][2]
+                          + acc2[k][3] + tail2[k];
+            } else {
+                for (int k = 0; k < NUM_K2; ++k) s2[k] = 0;
+                for (uint32_t j = first; j < end; ++j) {
+                    const uint32_t v = zigzag(residuals[j]) >> 15;
+                    for (int k = 0; k < NUM_K2; ++k) s2[k] += v >> k;
+                }
+            }
+        }
+#else
         for (uint32_t i = first; i < end; ++i) {
             const uint32_t v = zigzag(residuals[i]) >> 15;
             for (int k = 0; k < NUM_K2; ++k) s2[k] += v >> k;
         }
+#endif
     }
     uint64_t best_total = std::numeric_limits<uint64_t>::max();
     int      best_porder = 0;
@@ -1883,7 +2105,8 @@ uint32_t Optimizer::estimate_subframe_cost(
 SubframeParams Optimizer::optimize_subframe(
     const int32_t* samples, uint32_t bsize, uint32_t bps,
     const std::vector<WindowType>& windows,
-    unsigned max_candidates, unsigned patience, unsigned precision_rungs)
+    unsigned max_candidates, unsigned patience, unsigned precision_rungs,
+    unsigned lattice_sweeps)
 {
     SubframeParams best{};
     best.bits_cost = std::numeric_limits<uint32_t>::max();
@@ -1950,6 +2173,31 @@ SubframeParams Optimizer::optimize_subframe(
         std::vector<int> precisions;
         for (int p = 8; p <= 15; ++p) precisions.push_back(p);
         const uint32_t min_prec  = (uint32_t)precisions.front();
+
+        // Rice costs memoised by predictor. Different windows routinely
+        // quantize to the SAME (order, shift, coefficients) at a given order,
+        // and an identical predictor has an identical residual and an
+        // identical Rice cost -- only the header differs, and that is
+        // recomputed per candidate anyway. Measured on real subframes (golden
+        // vectors): 4.2% of 6656 candidates at bsize 1024, 8.4% at 4096, none
+        // of them adjacent, so a backward peek finds none of it.
+        //
+        // Keyed by a hash into an arena of coefficients so a hit costs one
+        // lookup and one memcmp against ~100k multiply-accumulates avoided.
+        // Only worth it on the full sweep. Duplicates are cross-window, so a
+        // ranked search evaluating a handful of (window, order) pairs almost
+        // never hits one and just pays the hash: measured -2% at -c 8 against
+        // +4 to +16% at -c 0.
+        const bool use_memo = (max_candidates == 0);
+        struct MemoEnt { int ord, shift; uint32_t qoff; uint32_t rice; };
+        std::vector<MemoEnt>  memo;
+        std::vector<int32_t>  memo_qc;
+        std::unordered_map<uint64_t, std::vector<uint32_t>> memo_ix;
+
+        // Narrow-accumulator bound for compute_lpc_residuals; see its comment.
+        // Same expression the ladder delta applies to its correction taps.
+        const int64_t max_sum_abs_qc =
+            (eff_bps >= 1 && eff_bps <= 31) ? (int64_t)(INT32_MAX >> (eff_bps - 1)) : 0;
         const uint32_t hdr_fixed = 8u + (wasted ? (uint32_t)(1 + wasted) : 0u) + 4u + 5u;
 
         // Winner tracked as a bare description rather than a filled-in
@@ -1997,6 +2245,13 @@ SubframeParams Optimizer::optimize_subframe(
             // checked per step below once sum|d| is known.
             const int64_t max_sum_abs_d =
                 (eff_bps <= 31) ? (int64_t)(INT32_MAX >> (eff_bps - 1)) : 0;
+            // pred[] exists only to seed the ladder delta, and the delta needs
+            // two adjacent rungs. At -L 1 -- the default effort level, and the
+            // recommended companion to -e -- exactly one rung is ever encoded,
+            // so every candidate was writing a whole block of int64 predictions
+            // that nothing could ever read. Skip the store entirely there.
+            int64_t* const pred_ptr =
+                (precision_rungs == 1) ? nullptr : pred.data();
             bool       have_pred = false;
             int        prev_shift = 0;
             int32_t    prev_qc[32];
@@ -2116,6 +2371,37 @@ SubframeParams Optimizer::optimize_subframe(
                     continue; // degenerate coefficients, no usable quantization
                 if (clamped) { INSTR(g_instr.overflow_skips.fetch_add(1, std::memory_order_relaxed)); }
 
+
+                // Have we already priced this exact predictor?
+                bool memo_hit = false;
+                uint64_t mh = 0;
+                if (use_memo) {
+                    mh = 1469598103934665603ull ^ (uint64_t)ord;
+                    mh = mh * 1099511628211ull ^ (uint64_t)(uint32_t)shift;
+                    for (int j = 0; j < ord; ++j)
+                        mh = (mh ^ (uint64_t)(uint32_t)qc[j]) * 1099511628211ull;
+                    auto it = memo_ix.find(mh);
+                    if (it != memo_ix.end()) {
+                        for (uint32_t mi : it->second) {
+                            const MemoEnt& e = memo[mi];
+                            if (e.ord != ord || e.shift != shift) continue;
+                            if (std::memcmp(&memo_qc[e.qoff], qc,
+                                            (size_t)ord * sizeof(int32_t)) != 0) continue;
+                            const uint32_t cost2 = hdr + 6u + e.rice;
+                            if (cost2 < cand_best) cand_best = cost2;
+                            if (cost2 < best_lpc_cost) {
+                                best_lpc_cost = cost2;
+                                bl_ord = ord; bl_prec = prec; bl_shift = shift;
+                                std::memcpy(bl_qc, qc, (size_t)ord * sizeof(int32_t));
+                                INSTR(instr_best_win = (int)wt);
+                            }
+                            memo_hit = true;
+                            break;
+                        }
+                    }
+                }
+                if (memo_hit) continue;
+
                 INSTR(g_instr.residual_calls.fetch_add(1, std::memory_order_relaxed));
 
                 // One ladder step up from the coefficients pred[] was built
@@ -2144,11 +2430,12 @@ SubframeParams Optimizer::optimize_subframe(
                 if (!delta_done) {
                     INSTR(g_instr.residual_macs.fetch_add((uint64_t)(bsize - ord) * ord, std::memory_order_relaxed));
                     compute_lpc_residuals(shifted.data(), bsize, qc, ord, shift,
-                                          residuals.data(), pred.data());
+                                          residuals.data(), pred_ptr,
+                                          max_sum_abs_qc);
                 }
                 std::memcpy(prev_qc, qc, (size_t)ord * sizeof(int32_t));
                 prev_shift = shift;
-                have_pred  = true;
+                have_pred  = (pred_ptr != nullptr);
 
                 // Cost only — no out-params. Filling in a SubframeParams
                 // here would zero and populate ~1.3 KB (rice_k[256] alone is
@@ -2199,6 +2486,13 @@ SubframeParams Optimizer::optimize_subframe(
                         window_energy(wt, bsize), ac[0], sd2, drd1, drd4);
                 }
 #endif
+                if (use_memo) {
+                    MemoEnt e{ord, shift, (uint32_t)memo_qc.size(), rice};
+                    memo_qc.insert(memo_qc.end(), qc, qc + ord);
+                    memo_ix[mh].push_back((uint32_t)memo.size());
+                    memo.push_back(e);
+                }
+
                 if (cost < cand_best) cand_best = cost;
                 if (cost < best_lpc_cost) {
                     best_lpc_cost = cost;
@@ -2490,13 +2784,135 @@ SubframeParams Optimizer::optimize_subframe(
             }
         }
 
+        // ---- Coefficient-lattice refinement (-Q) ----
+        // Every candidate above got its integer coefficients from one fixed
+        // rule: round the Levinson solution with error feedback. That rule
+        // minimizes the quantization error's quadratic form d'Rd, which is not
+        // the cost we are actually paying — Rice bits are a step function of
+        // the residual magnitudes, so the cheapest lattice point near the
+        // real-valued optimum need not be the rounded one. Nothing in the
+        // search ever revisits it.
+        //
+        // Coordinate descent fixes that for the winner: try each tap at +-1,
+        // keep any perturbation that lowers the *exact* cost, sweep until a
+        // full pass finds nothing. FFmpeg's multi_dim_quant (flacenc.c) does
+        // the same search by enumerating all 3^order corners with at most 8
+        // taps differing, which is exponential and therefore unusable above
+        // order ~12 — it is off by default there. A coordinate sweep is
+        // 2*order evaluations and finds the same axis-local minimum.
+        //
+        // This runs once per subframe on the winner alone, so it does not
+        // multiply the search: 2*order*sweeps residual+Rice passes against the
+        // thousands the ranked scan already ran. It cannot lose bits — a
+        // perturbation is adopted only when the exact cost strictly drops.
+        // Precision gate. The lattice step is 2^-shift, so a low-precision
+        // winner was rounded far from the cost-optimal lattice point and has
+        // room to search, while a prec-15 one is already essentially on it —
+        // measured over every perturbation, 97.1% of the improvements on a
+        // gaining fixture sit at prec <= 9, and a fixture whose winners are
+        // mostly prec 11-15 yields nothing at all.
+        //
+        // Gating strictly improves the frontier (master mix, -Q 2, against
+        // -Q 0 at 0.80 s / 16827941 B, interleaved best-of-4 on an idle
+        // machine -- see trap 9, an earlier version of this table was measured
+        // against a second encoder and read ~0.015x high throughout):
+        //
+        //   gate  time   x       bytes
+        //   <=8   -      -       -3020   (50.5% of ungated -- too aggressive)
+        //   <=9   0.84   1.050   -5626   (94.1%)
+        //   <=10  0.85   1.062   -5851   (97.8%)  <- default
+        //   <=11  0.86   1.075   -5901   (98.7%)
+        //   <=12  0.86   1.075   -5934   (99.2%)
+        //   none  0.89   1.113   -5981   (100%)
+        //
+        // Read that table honestly: 10, 11 and 12 are inside timing noise of
+        // each other (0.85/0.86/0.86), so the real finding is "gate somewhere
+        // in 10-12", and 10 is picked for holding the most gain per unit time
+        // over the <=9 step (+225 B for +0.012x, against +83 B for the same
+        // 0.013x from 10 to 12). Only the ends are firm: <=8 throws away half
+        // the gain, and ungated pays 0.051x more than <=10 for 2.2% more.
+        // The gated point dominates ungated -Q 1 outright on both axes
+        // (0.85 s / -5851 B against 0.86 s / -5596 B), so this is not a
+        // speed-for-size trade.
+        //
+        // Under exact DP the gate still captures the gains (94.4% of the
+        // improvements and 92.9% of the headroom bits are at prec <= 10,
+        // measured over 660492 perturbations at -e -c 8 -L 1), but -Q is far
+        // more expensive there -- 1.24-1.80x rather than 1.06x -- because the
+        // exact DP prices every (position, block size, stereo mode) with a
+        // full optimize_subframe call, so the refinement runs on ~31x more
+        // subframes than end up in the file.
+        if (lattice_sweeps > 0 && bl_ord > 0 &&
+            bl_prec <= FLACOUT_LATTICE_MAX_PREC) {
+            const uint32_t hdr =
+                hdr_fixed + (uint32_t)bl_ord * (eff_bps + (uint32_t)bl_prec);
+            const int32_t qmax = (1 << (bl_prec - 1)) - 1;
+            const int32_t qmin = -(1 << (bl_prec - 1));
+            int32_t try_qc[32];
+            std::memcpy(try_qc, bl_qc, (size_t)bl_ord * sizeof(int32_t));
+
+            for (unsigned sweep = 0; sweep < lattice_sweeps; ++sweep) {
+                bool improved = false;
+                for (int j = 0; j < bl_ord; ++j) {
+                    const int32_t base = try_qc[j];
+                    bool accepted = false;
+                    for (int delta = -1; delta <= 1; delta += 2) {
+                        const int64_t v = (int64_t)base + delta;
+                        if (v < qmin || v > qmax) continue;
+                        try_qc[j] = (int32_t)v;
+                        INSTR(g_instr.lattice_evals.fetch_add(1, std::memory_order_relaxed));
+                        compute_lpc_residuals(shifted.data(), bsize, try_qc,
+                                              bl_ord, bl_shift, residuals.data(),
+                                              nullptr, max_sum_abs_qc);
+                        const uint32_t cost =
+                            hdr + 6u + calculate_rice_cost(residuals.data(), bsize,
+                                                           (uint32_t)bl_ord, nullptr);
+#ifdef FLACOUT_DUMP_LATTICE
+                        // Signed cost delta per perturbation. Reading the
+                        // *distribution* is the point: all-positive says the
+                        // rounded point really is an axis-local minimum, while
+                        // a large constant offset would mean the cost
+                        // expression here disagrees with the search's.
+                        {
+                            std::lock_guard<std::mutex> lk(g_ldump.mu);
+                            // base = the winner's exact cost, so dcost/base is
+                            // the *relative* steepness of the cost surface and
+                            // base/bsize its bits/sample. shift is the one that
+                            // matters: the lattice step is 2^-shift, and that
+                            // is what the precision gate above is really a
+                            // proxy for. coef is the tap's own magnitude.
+                            std::fprintf(g_ldump.fh,
+                                         "%u\t%d\t%d\t%d\t%d\t%lld"
+                                         "\t%u\t%d\t%d\t%u\t%d\n",
+                                         bsize, bl_ord, bl_prec, j, delta,
+                                         (long long)cost - (long long)best_lpc_cost,
+                                         eff_bps, wasted, bl_shift, best_lpc_cost,
+                                         base);
+                        }
+#endif
+                        if (cost < best_lpc_cost) {
+                            best_lpc_cost = cost;
+                            std::memcpy(bl_qc, try_qc,
+                                        (size_t)bl_ord * sizeof(int32_t));
+                            INSTR(g_instr.lattice_accepts.fetch_add(1, std::memory_order_relaxed));
+                            accepted = true;
+                            break; // this tap moved; go on to the next one
+                        }
+                    }
+                    if (!accepted) try_qc[j] = base;
+                    improved |= accepted;
+                }
+                if (!improved) break; // a clean sweep: this is an axis-local min
+            }
+        }
+
         // Materialize the winning LPC candidate, if it beat the non-LPC modes.
         // Re-deriving its residuals costs one more pass out of the millions the
         // search just ran, and in exchange every candidate above skipped the
         // per-candidate parameter bookkeeping.
         if (bl_ord > 0) {
             compute_lpc_residuals(shifted.data(), bsize, bl_qc, bl_ord, bl_shift,
-                                  residuals.data());
+                                  residuals.data(), nullptr, max_sum_abs_qc);
             SubframeParams cur{};
             cur.mode          = 3;
             cur.order         = bl_ord;
@@ -2534,6 +2950,7 @@ void Optimizer::precompute_granules(
                 m_granules[c][g].autoc[i] = s;
             }
         }
+
 }
 
 uint32_t Optimizer::estimate_lpc_bits_fast(
@@ -2576,7 +2993,26 @@ uint32_t Optimizer::estimate_lpc_bits_fast(
 std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
     const std::vector<std::vector<int32_t>>& pcm_data)
 {
+    // Only the estimated path reads the granule cache: estimate_lpc_bits_fast
+    // is called from the !full_search() branch of phase 1, and select_windows
+    // (which already falls back to the configured set on an empty cache) is
+    // gated on m_adaptive && !full_search() in compute_block. Under -e the
+    // cache was built and then never touched, at 4.5 bytes per sample per
+    // channel — 91.5 MB on a 10.2M-sample stereo track, a fifth of that run's
+    // 466 MB peak — plus a single-threaded pass over the whole stream before
+    // any worker starts.
+    //
+    // Nothing reads what this skips, so exact-DP output is unchanged by
+    // construction rather than by measurement.
+    //
+    // FLACOUT_DUMP_BLOCKCOST is the exception: its phase-1 block *does* read
+    // the cache under full_search(), because comparing the estimator against
+    // exact costs is the entire point of that build.
+#ifdef FLACOUT_DUMP_BLOCKCOST
     precompute_granules(pcm_data);
+#else
+    if (!full_search()) precompute_granules(pcm_data);
+#endif
 
     const size_t total_samples  = pcm_data[0].size();
 
@@ -2595,7 +3031,7 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
         if (m_channels == 1) {
             bp.stereo_mode  = 0;
             bp.subframes[0] = optimize_subframe(pcm_data[0].data(),
-                                                (uint32_t)total_samples, m_bps, m_windows, m_max_candidates, m_patience, m_precision_rungs);
+                                                (uint32_t)total_samples, m_bps, m_windows, m_max_candidates, m_patience, m_precision_rungs, m_lattice_sweeps);
         } else {
             uint32_t best_bits = std::numeric_limits<uint32_t>::max();
             for (int mode : {0, 8, 9, 10}) {
@@ -2610,8 +3046,8 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
                 // mode 9 = right+side: ch0 is side (needs +1 bit), ch1 is right
                 uint32_t bps0 = (mode == 9) ? m_bps + 1 : m_bps;
                 uint32_t bps1 = (mode == 9) ? m_bps     : (mode == 0 ? m_bps : m_bps + 1);
-                SubframeParams s0 = optimize_subframe(ch0.data(), (uint32_t)total_samples, bps0, m_windows, m_max_candidates, m_patience, m_precision_rungs);
-                SubframeParams s1 = optimize_subframe(ch1.data(), (uint32_t)total_samples, bps1, m_windows, m_max_candidates, m_patience, m_precision_rungs);
+                SubframeParams s0 = optimize_subframe(ch0.data(), (uint32_t)total_samples, bps0, m_windows, m_max_candidates, m_patience, m_precision_rungs, m_lattice_sweeps);
+                SubframeParams s1 = optimize_subframe(ch1.data(), (uint32_t)total_samples, bps1, m_windows, m_max_candidates, m_patience, m_precision_rungs, m_lattice_sweeps);
                 if (s0.bits_cost + s1.bits_cost < best_bits) {
                     best_bits = s0.bits_cost + s1.bits_cost;
                     bp.stereo_mode  = mode;
@@ -2630,7 +3066,7 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
     // Variable-block-size DP
     // -----------------------------------------------------------------
     //
-    // Candidates: {4096, 8192, 16384} with STEP = GCD = 4096.
+    // Candidates: the -b ladder, default {1024..16384}, with STEP = its GCD.
     // Node i = position i*STEP in the audio.
     // Edge (i→j) = one FLAC frame covering [i*STEP, j*STEP).
     // Cost = FrameWriter::frame_bits: the exact encoded frame size, header
@@ -2646,9 +3082,12 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
 
     // Shared with the window-table cache, which precomputes coefficients for
     // exactly these sizes (see DP_CANDIDATES at file scope).
-    static const auto&    CANDIDATES     = DP_CANDIDATES;
-    static const size_t   NUM_CANDS      = std::size(DP_CANDIDATES);
-    static constexpr uint32_t STEP = 1024u; // GCD of all candidates
+    // Configurable via -b; defaults to DP_CANDIDATES, for which the window
+    // coefficient tables are precomputed. STEP is the ladder's GCD, so every
+    // candidate walks from one node to another.
+    const std::vector<uint32_t>& CANDIDATES = m_dp_candidates;
+    const size_t   NUM_CANDS = CANDIDATES.size();
+    const uint32_t STEP      = m_dp_step;
 
     const size_t   num_nodes = total_samples / STEP;
     const uint32_t remainder = (uint32_t)(total_samples % STEP);
@@ -2670,7 +3109,7 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
     // leaves only cheap blocks to fill the tail. Purely a scheduling change:
     // cost_table is indexed by (node, candidate), not by completion order.
     std::stable_sort(work.begin(), work.end(),
-                     [](const WorkItem& a, const WorkItem& b) {
+                     [&CANDIDATES](const WorkItem& a, const WorkItem& b) {
                          return CANDIDATES[a.ci] > CANDIDATES[b.ci];
                      });
 
@@ -2699,7 +3138,8 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
                             compute_block(pcm_data, (uint64_t)node * STEP, CANDIDATES[ci]);
                     } else {
                         uint32_t bits = 0;
-                        // granules are 16 samples each; nodes are STEP=1024 samples each
+                        // granules are 16 samples each; nodes are STEP samples
+                        // each, and -b validation keeps STEP a multiple of 16
                         static constexpr uint32_t GRANULE_SIZE = 16u;
                         uint32_t g_start = (uint32_t)(node * (STEP / GRANULE_SIZE));
                         uint32_t g_end   = g_start + CANDIDATES[ci] / GRANULE_SIZE;
@@ -2714,6 +3154,82 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
                         bp.total_bits = bits;
                         cost_table[node * NUM_CANDS + ci] = bp;
                     }
+#ifdef FLACOUT_DUMP_BLOCKCOST
+                    // Phase-0 dataset: what the DP's estimator claimed for this
+                    // (node, block size) against what encoding it actually
+                    // costs. Both numbers are subframe payload bits on the same
+                    // footing — frame_bits() adds the header afterwards to
+                    // whichever the DP used — so they are directly comparable.
+                    //
+                    // Cost is why this is a separate build: it evaluates every
+                    // candidate exactly *and* estimates it, so a dump run does
+                    // the work of -e plus the estimator.
+                    {
+                        static constexpr uint32_t GS = 16u;
+                        const uint32_t bsize = CANDIDATES[ci];
+                        const uint32_t g0 = (uint32_t)(node * (STEP / GS));
+                        const uint32_t g1 = g0 + bsize / GS;
+                        uint32_t est = 0;
+                        for (uint32_t ch = 0; ch < std::min(m_channels, 2u); ++ch)
+                            est += estimate_lpc_bits_fast((int)ch, g0, g1, m_bps);
+                        const BlockParams exact = full_search()
+                            ? cost_table[node * NUM_CANDS + ci]
+                            : compute_block(pcm_data, (uint64_t)node * STEP, bsize);
+
+                        // Span features, all from the granule cache — no PCM
+                        // pass. cv2 of granule energy is the transient measure
+                        // -a already uses; the lag ratios are spectral tilt.
+                        double e_sum = 0.0, e_sq = 0.0, a1 = 0.0, a2 = 0.0, a0 = 0.0;
+                        for (uint32_t g = g0; g < g1; ++g) {
+                            const double e = m_granules[0][g].autoc[0];
+                            e_sum += e; e_sq += e * e;
+                            a0 += e; a1 += m_granules[0][g].autoc[1];
+                            a2 += m_granules[0][g].autoc[2];
+                        }
+                        const double n  = (double)(g1 - g0);
+                        const double mu = e_sum / n;
+                        const double cv2 = (mu > 0.0) ? (e_sq / n - mu * mu) / (mu * mu) : 0.0;
+                        // Per-mode estimates, computed straight from PCM so
+                        // the shipping estimator is untouched. This is what
+                        // says *which* term is wrong, rather than only that
+                        // the total is: two attempts at a stereo term were
+                        // reverted for want of exactly this breakdown.
+                        double eL = 0, eR = 0, eM = 0, eS = 0;
+                        if (m_channels >= 2) {
+                            const uint64_t s0 = (uint64_t)node * STEP;
+                            auto est_of = [&](int which) {
+                                double ac[9] = {};
+                                for (uint32_t i = 0; i + 8 < bsize; ++i) {
+                                    const int32_t L = pcm_data[0][s0 + i];
+                                    const int32_t R = pcm_data[1][s0 + i];
+                                    const double v = which == 0 ? L : which == 1 ? R
+                                                   : which == 2 ? ((L + R) >> 1) : (L - R);
+                                    for (int k = 0; k <= 8; ++k) {
+                                        const int32_t L2 = pcm_data[0][s0 + i + k];
+                                        const int32_t R2 = pcm_data[1][s0 + i + k];
+                                        const double w = which == 0 ? L2 : which == 1 ? R2
+                                                       : which == 2 ? ((L2 + R2) >> 1) : (L2 - R2);
+                                        ac[k] += v * w;
+                                    }
+                                }
+                                float c[32];
+                                compute_lpc_coefficients(ac, c, 8);
+                                double e = ac[0];
+                                for (int k = 0; k < 8; ++k) e -= (double)c[k] * ac[k+1];
+                                if (e <= 0) return 8.0 + (double)m_bps;
+                                double bp = 0.5 * std::log2(2.0*M_PI*M_E*(e/bsize));
+                                if (bp < 1.0) bp = 1.0;
+                                return 8.0 + bsize * bp;
+                            };
+                            eL = est_of(0); eR = est_of(1); eM = est_of(2); eS = est_of(3);
+                        }
+                        g_block_dump.row(node, (uint64_t)node * STEP, bsize,
+                                         m_channels, m_bps, est, exact.total_bits,
+                                         a0, (a0 > 0 ? a1 / a0 : 0.0),
+                                         (a0 > 0 ? a2 / a0 : 0.0), cv2,
+                                         exact.stereo_mode, eL, eR, eM, eS);
+                    }
+#endif
                     size_t d = done.fetch_add(1, std::memory_order_relaxed) + 1;
                     if (m_verbose && (d % 10 == 0 || d == work.size())) {
                         std::lock_guard<std::mutex> lk(cout_mtx);
@@ -3181,7 +3697,7 @@ BlockParams Optimizer::compute_block(
     if (m_channels == 1) {
         bp.stereo_mode  = 0;
         bp.subframes[0] = optimize_subframe(
-            &pcm_data[0][sample_start], block_size, m_bps, wins, m_max_candidates, patience, m_precision_rungs);
+            &pcm_data[0][sample_start], block_size, m_bps, wins, m_max_candidates, patience, m_precision_rungs, m_lattice_sweeps);
     } else {
         uint32_t best_bits = std::numeric_limits<uint32_t>::max();
 
@@ -3231,9 +3747,9 @@ BlockParams Optimizer::compute_block(
         auto get_sig = [&](int sig) -> const SubframeParams& {
             if (have[sig]) return cache[sig];
             if (sig == SIG_L) {
-                cache[sig] = optimize_subframe(&pcm_data[0][sample_start], block_size, m_bps, wins, m_max_candidates, patience, m_precision_rungs);
+                cache[sig] = optimize_subframe(&pcm_data[0][sample_start], block_size, m_bps, wins, m_max_candidates, patience, m_precision_rungs, m_lattice_sweeps);
             } else if (sig == SIG_R) {
-                cache[sig] = optimize_subframe(&pcm_data[1][sample_start], block_size, m_bps, wins, m_max_candidates, patience, m_precision_rungs);
+                cache[sig] = optimize_subframe(&pcm_data[1][sample_start], block_size, m_bps, wins, m_max_candidates, patience, m_precision_rungs, m_lattice_sweeps);
             } else {
                 std::vector<int32_t> ch(block_size);
                 uint32_t bps_s;
@@ -3246,7 +3762,7 @@ BlockParams Optimizer::compute_block(
                         ch[k] = (pcm_data[0][sample_start + k] + pcm_data[1][sample_start + k]) >> 1;
                     bps_s = m_bps;
                 }
-                cache[sig] = optimize_subframe(ch.data(), block_size, bps_s, wins, m_max_candidates, patience, m_precision_rungs);
+                cache[sig] = optimize_subframe(ch.data(), block_size, bps_s, wins, m_max_candidates, patience, m_precision_rungs, m_lattice_sweeps);
             }
             have[sig] = true;
             return cache[sig];

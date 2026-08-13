@@ -65,6 +65,18 @@ struct Config {
     std::vector<WindowType> windows;
 
     /**
+     * @brief DP block-size ladder (`-b`).
+     *
+     * Empty (the default) uses the built-in `{1024, 2048, 4096, 8192, 16384}`.
+     * Every entry must be a multiple of 16 and within [16, 65520]: the DP
+     * places nodes every GCD-of-the-ladder samples and each frame spans
+     * exactly one candidate, so a size that is not a multiple of that step
+     * could never land on a node. 65535 is therefore unreachable — it is odd;
+     * 65520 is the largest usable size.
+     */
+    std::vector<uint32_t> dp_candidates;
+
+    /**
      * @brief Maximum number of worker threads.
      *
      * Set to @c 0 (default) to use all logical CPUs reported by the OS.
@@ -166,6 +178,26 @@ struct Config {
      * @c -e is given without an explicit @c -L.
      */
     unsigned precision_rungs = 1;
+
+    /**
+     * @brief Coefficient-lattice refinement sweeps (`-Q`, experimental).
+     *
+     * The search quantizes LPC coefficients by one fixed rule — round the
+     * Levinson solution with error feedback — and never revisits the integer
+     * vector it lands on. That rule minimizes the quantization error's
+     * quadratic form, not the Rice cost actually being paid, so a neighbouring
+     * lattice point can be cheaper.
+     *
+     * When non-zero, the winning candidate of each subframe is refined by
+     * coordinate descent: each tap is tried at +-1 and any perturbation that
+     * strictly lowers the exact cost is adopted, repeating until a full sweep
+     * finds nothing or this many sweeps have run. It can only shrink a
+     * subframe, never grow one.
+     *
+     * @c 0 (default) disables it, which is bit-exact with the pre-existing
+     * behaviour. Costs 2 x order residual+Rice passes per sweep per subframe.
+     */
+    unsigned lattice_sweeps = 0;
 
     /**
      * @brief Effort level 0-9: one dial across the measured size/time frontier.

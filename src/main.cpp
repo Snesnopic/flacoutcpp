@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -29,18 +30,22 @@ static void print_usage(const char* prog) {
         << "                       still improving; stop after N consecutive that\n"
         << "                       are not. Makes -c a floor, not a ceiling.\n"
         << "                       Default: 2x -c. 0 disables it (plain top-N cut).\n"
-        << "  -E, --effort N       Effort 0-9: one dial along the measured\n"
-        << "                       size/time frontier, setting -c, -L and -a\n"
-        << "                       together (they are not independent —\n"
-        << "                       which mix is efficient shifts with the\n"
-        << "                       budget). 0 fastest, 9 = every candidate and\n"
-        << "                       every rung. Level 3 is the default. Against\n"
-        << "                       it, on a 188-track mix: 0 is +0.15% at 0.8x\n"
-        << "                       the time, 6 is -0.03% at 1.5x, 9 is -0.05% at\n"
-        << "                       5.7x. An explicit -c/-p/-L/-a wins; the\n"
-        << "                       level's -a yields to -e/-w rather than\n"
-        << "                       erroring. The dial tunes the search *within*\n"
-        << "                       a mode; it is not a substitute for -e.\n"
+        << "  -E, --effort N       Effort 0-12: one dial along the measured\n"
+        << "                       size/time frontier, setting -c, -L, -a and\n"
+        << "                       — from level 10 — exact DP, together (they\n"
+        << "                       are not independent; which mix is efficient\n"
+        << "                       shifts with the budget). 0 fastest, 9 = every\n"
+        << "                       candidate and every rung under estimated DP,\n"
+        << "                       10-12 = exact DP at increasing depth. Level 3\n"
+        << "                       is the default. Against it, on a 188-track\n"
+        << "                       mix: 0 is +0.15% at 0.8x the time, 6 is\n"
+        << "                       -0.03% at 1.5x, 9 is -0.05% at 5.7x, 10 is\n"
+        << "                       -0.52% at 7.7x, 12 is -0.61% at 24x. Level 10\n"
+        << "                       is the value corner — ten times level 9's\n"
+        << "                       compression for 20% more time — because exact\n"
+        << "                       pricing is worth far more than search depth.\n"
+        << "                       An explicit -c/-p/-L/-a wins; the level's -a\n"
+        << "                       yields to -e/-w rather than erroring.\n"
         << "  -L, --rungs N        Encode only the N most promising of the 8 LPC\n"
         << "                       coefficient precisions per candidate, chosen by\n"
         << "                       an analytic model of the quantization error\n"
@@ -52,6 +57,25 @@ static void print_usage(const char* prog) {
         << "                       -c and -L are not independent —\n"
         << "                       prefer -E, which pairs them along the measured\n"
         << "                       frontier, unless you know which pair you want.\n"
+        << "  -Q, --lattice N      Refine the winning subframe's quantized LPC\n"
+        << "                       coefficients by coordinate descent: try each\n"
+        << "                       tap at +-1, keep what lowers the exact cost,\n"
+        << "                       up to N sweeps (0 = off, the default).\n"
+        << "                       Experimental. Never grows a subframe.\n"
+        << "  -b, --blocks <list>  Comma-separated block sizes the DP may choose\n"
+        << "                       from (default: 1024,2048,4096,8192,16384).\n"
+        << "                       Each must be a multiple of 16 in [16, 65520],\n"
+        << "                       and every size must be a multiple of the\n"
+        << "                       smallest, or the DP cannot reach the stream's\n"
+        << "                       end. FLAC's own limits are 16 and 65535, but\n"
+        << "                       65535 is odd, so no usable grid reaches it;\n"
+        << "                       65520 is the largest attainable size, and\n"
+        << "                       needs a smallest size that divides it (e.g.\n"
+        << "                       16 or 5040, not 1024). Cost scales with\n"
+        << "                       sum(sizes)/gcd(sizes): the default is 31 block\n"
+        << "                       -samples of work per input sample, and\n"
+        << "                       16,...,32768 is 4095 — about 130x. Best paired\n"
+        << "                       with -e, which prices every choice exactly.\n"
         << "  -n, --no-metadata    Do not copy metadata from input to output\n"
         << "  -a, --adaptive-windows  Add windows chosen from each block's signal\n"
         << "                       statistics to the shortlist. On by default;\n"
@@ -71,7 +95,8 @@ static void print_usage(const char* prog) {
         << "  -q, --quiet          Suppress all progress output\n"
         << "  -t, --threads N      Limit parallel worker threads (default: all CPUs)\n"
         << "  -w, --windows <list> Comma-separated list of apodization windows to use\n"
-        << "                       (default: all 26 with -e, else tukey005,tukey020,\n"
+        << "                       (default: all 26 with a bare -e, else\n"
+        << "                       tukey005,tukey020,\n"
         << "                       tukey050,hann,welch,rect and the partial/punchout\n"
         << "                       tukey pair at .33/.67)\n"
         << "                       An entry of the form custom:<file> loads a window\n"
@@ -173,7 +198,7 @@ int main(int argc, char* argv[]) {
                 if (argv[i][0] == '-') throw std::invalid_argument("negative");
                 effort = static_cast<int>(std::stoul(argv[i]));
             } catch (const std::exception&) {
-                std::cerr << "Error: -E requires an effort level 0-9, got '" << argv[i] << "'.\n";
+                std::cerr << "Error: -E requires an effort level 0-12, got '" << argv[i] << "'.\n";
                 return EXIT_FAILURE;
             }
 
@@ -189,6 +214,20 @@ int main(int argc, char* argv[]) {
                 rungs_given = true;
             } catch (const std::exception&) {
                 std::cerr << "Error: -L requires a non-negative integer, got '" << argv[i] << "'.\n";
+                return EXIT_FAILURE;
+            }
+
+        } else if (arg == "-Q" || arg == "--lattice") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: -Q requires a number.\n";
+                return EXIT_FAILURE;
+            }
+            ++i;
+            try {
+                if (argv[i][0] == '-') throw std::invalid_argument("negative");
+                cfg.lattice_sweeps = static_cast<unsigned>(std::stoul(argv[i]));
+            } catch (const std::exception&) {
+                std::cerr << "Error: -Q requires a non-negative integer, got '" << argv[i] << "'.\n";
                 return EXIT_FAILURE;
             }
 
@@ -253,6 +292,69 @@ int main(int argc, char* argv[]) {
                 return EXIT_FAILURE;
             }
 
+        } else if (arg == "-b" || arg == "--blocks") {
+            // Block-size ladder for the DP. Rejecting bad ladders here keeps
+            // the optimizer free of the checks: it may assume the list is
+            // non-empty and that its GCD is a usable node spacing.
+            if (i + 1 >= argc) {
+                std::cerr << "Error: -b requires a comma-separated block-size list.\n";
+                return EXIT_FAILURE;
+            }
+            ++i;
+            std::vector<uint32_t> sizes;
+            for (const auto& tok : split_csv(argv[i])) {
+                unsigned long v = 0;
+                try {
+                    size_t used = 0;
+                    v = std::stoul(tok, &used);
+                    if (used != tok.size()) throw std::invalid_argument("junk");
+                } catch (const std::exception&) {
+                    std::cerr << "Error: -b: not a block size: '" << tok << "'.\n";
+                    return EXIT_FAILURE;
+                }
+                // 16 is FLAC's minimum; 65535 is the maximum a 16-bit
+                // STREAMINFO field can hold, but the DP needs multiples of 16
+                // (its nodes sit on a grid whose spacing divides every
+                // candidate, and the estimated path indexes 16-sample
+                // granules), so 65520 is the largest reachable size.
+                if (v < 16 || v > 65520) {
+                    std::cerr << "Error: -b: block size " << v
+                              << " out of range [16, 65520].\n";
+                    return EXIT_FAILURE;
+                }
+                if (v % 16 != 0) {
+                    std::cerr << "Error: -b: block size " << v
+                              << " is not a multiple of 16.\n";
+                    return EXIT_FAILURE;
+                }
+                sizes.push_back((uint32_t)v);
+            }
+            if (sizes.empty()) {
+                std::cerr << "Error: -b: empty block-size list.\n";
+                return EXIT_FAILURE;
+            }
+            // Every size must be a multiple of the smallest. The DP's nodes
+            // sit every gcd(sizes) samples, but the positions actually
+            // *reachable* from the start are the sums of candidates. If the
+            // smallest candidate is larger than the gcd, most nodes — quite
+            // possibly the final one — cannot be reached at all, and the DP
+            // finds no path and emits an empty stream. (Caught the hard way:
+            // 1024,...,65520 gives gcd 16 with a smallest step of 1024, and
+            // produced a 99-byte file that failed `flac -t`.)
+            std::sort(sizes.begin(), sizes.end());
+            sizes.erase(std::unique(sizes.begin(), sizes.end()), sizes.end());
+            for (uint32_t v : sizes) {
+                if (v % sizes.front() != 0) {
+                    std::cerr << "Error: -b: " << v << " is not a multiple of the "
+                              << "smallest size " << sizes.front()
+                              << ". Every block size must be a multiple of the "
+                              << "smallest, or the DP cannot reach the end of "
+                              << "the stream.\n";
+                    return EXIT_FAILURE;
+                }
+            }
+            cfg.dp_candidates = std::move(sizes);
+
         } else if (arg.substr(0, 2) == "--" || arg.substr(0, 1) == "-") {
             std::cerr << "Unknown option: " << arg << "\n";
             print_usage(argv[0]);
@@ -276,7 +378,7 @@ int main(int argc, char* argv[]) {
     // Effort first, then whatever was named explicitly — so `-E 7 -L 0` means
     // "level 7's depth, but price the whole ladder".
     if (effort >= 0 && !flacoutcpp::apply_effort(cfg, effort)) {
-        std::cerr << "Error: -E takes an effort level 0-9, got " << effort << ".\n";
+        std::cerr << "Error: -E takes an effort level 0-12, got " << effort << ".\n";
         return EXIT_FAILURE;
     }
     if (candidates_given)  cfg.max_candidates  = given_candidates;
@@ -335,8 +437,19 @@ int main(int argc, char* argv[]) {
         if (cfg.windows.empty()) {
             if (cfg.exhaustive)
                 std::cout << "Windows: all (" << all_window_types().size() << " functions)\n";
-            else
-                std::cout << "Windows: default short list (tukey050, hann, welch, rect)\n";
+            else {
+                // Printed from default_shortlist(), never from a copy of it:
+                // this line named four windows long after the list grew to ten.
+                const auto sl = default_shortlist();
+                std::cout << "Windows: default short list (" << sl.size() << "): ";
+                for (size_t i = 0; i < sl.size(); ++i) {
+                    if (i) std::cout << ", ";
+                    std::cout << window_to_name(sl[i]);
+                }
+                if (cfg.adaptive_windows)
+                    std::cout << " (+ adaptive per-block additions)";
+                std::cout << "\n";
+            }
         }
         else {
             std::cout << "Windows: ";

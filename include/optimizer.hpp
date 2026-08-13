@@ -151,6 +151,16 @@ constexpr int MAX_CUSTOM_WINDOWS =
 WindowType register_custom_window(const std::string& path, std::string* error);
 
 /**
+ * @brief The window set the estimated-DP modes search by default.
+ *
+ * Exported so the startup banner can name the real list. It used to print a
+ * hardcoded copy, which drifted: the list grew to ten while the banner still
+ * said the original four, and CLAUDE.md tells the reader both to trust the
+ * banner and never to judge a window against those four.
+ */
+std::vector<WindowType> default_shortlist();
+
+/**
  * @brief Parse a window type from its name (case-insensitive).
  * @param raw  Human-readable window name (e.g. @c "hann", @c "blackman").
  * @return      The corresponding WindowType, or @c WindowType::COUNT if not found.
@@ -285,7 +295,9 @@ public:
               unsigned max_candidates = 0,
               bool adaptive_windows = false,
               unsigned patience = 0,
-              unsigned precision_rungs = 0);
+              unsigned precision_rungs = 0,
+              std::vector<uint32_t> dp_candidates = {},
+              unsigned lattice_sweeps = 0);
 
     /**
      * @brief Find the optimal variable block-size partition for the stream.
@@ -334,7 +346,8 @@ public:
         const std::vector<WindowType>& windows,
         unsigned                    max_candidates = 0,
         unsigned                    patience = 0,
-        unsigned                    precision_rungs = 0);
+        unsigned                    precision_rungs = 0,
+        unsigned                    lattice_sweeps = 0);
 
 private:
     /// @cond INTERNAL
@@ -407,6 +420,15 @@ private:
     bool                  m_adaptive;
     unsigned              m_patience;
     unsigned              m_precision_rungs;
+    unsigned              m_lattice_sweeps;
+
+    /// DP block-size ladder, ascending. Every entry is a multiple of
+    /// m_dp_step (itself a multiple of the 16-sample granule), because the DP
+    /// places nodes every m_dp_step samples and each edge spans exactly one
+    /// candidate — a size that is not a multiple of the step could never land
+    /// on a node. That is also why 65535 is unreachable: it is odd.
+    std::vector<uint32_t> m_dp_candidates;
+    uint32_t              m_dp_step = 1024;
     std::vector<ReuseEdge> m_reuse_edges;
 
     /// True when block costs come from real encodes rather than the granule

@@ -6,6 +6,7 @@
 #ifndef PROCESSOR_HPP
 #define PROCESSOR_HPP
 
+#include <atomic>
 #include <string>
 #include <vector>
 #include <cstdint>
@@ -33,6 +34,10 @@ struct ProcessorConfig {
      * (experimental windows must be named explicitly).
      */
     std::vector<WindowType> windows;
+
+    /// DP block-size ladder (`-b`); empty uses the built-in default.
+    /// See Config::dp_candidates for the multiple-of-16 constraint.
+    std::vector<uint32_t> dp_candidates;
 
     /**
      * @brief Maximum number of threads to spawn for dynamic programming evaluation.
@@ -69,6 +74,12 @@ struct ProcessorConfig {
      * See flacoutcpp::Config::precision_rungs.
      */
     unsigned precision_rungs = 0;
+
+    /**
+     * @brief Coefficient-lattice refinement sweeps; 0 = off.
+     * See flacoutcpp::Config::lattice_sweeps.
+     */
+    unsigned lattice_sweeps = 0;
 
     /**
      * @brief Adaptive per-subframe window selection (experimental,
@@ -132,6 +143,17 @@ public:
      */
     bool process();
 
+    /// What a worker records per frame; merged into InputFrame after the join.
+    /// Public only because the decode workers keep it in a file-scope
+    /// thread_local -- one per worker, since byte offsets chain within a single
+    /// decoder and cannot be placed by sample position the way the PCM can.
+    struct PendingFrameRec {
+        uint64_t first_sample;
+        uint32_t block_size;
+        uint64_t byte_start;
+        uint64_t byte_end;
+    };
+
 private:
     /// @cond INTERNAL
 
@@ -152,6 +174,35 @@ private:
     std::string     m_output;
     ProcessorConfig m_config;
 
+    // --- Parallel decode ----
+    /// Decode the whole stream with `nthr` workers into preallocated m_pcm_data,
+    /// each seeking to its own block-aligned range, and join them.
+    ///
+    /// `first` is an already-initialised decoder positioned past the metadata;
+    /// worker 0 reuses it, since it starts at sample 0 and needs no seek. The
+    /// caller owns and deletes it.
+    ///
+    /// Collects the frame byte-range map when reuse is enabled, merging the
+    /// per-worker records afterwards; sets m_frame_pos_ok false if any worker
+    /// could not report positions or the merged map does not tile the stream.
+    bool decode_parallel(FLAC__StreamDecoder* first, unsigned nthr,
+                         uint64_t range_len);
+
+    /// Threads per parallel decode: half the cores, capped, overridable with
+    /// FLACOUT_DECODE_THREADS. 1 disables the parallel path entirely.
+    unsigned decode_thread_count(uint64_t total_samples, uint64_t align) const;
+
+    /// Merge and validate what the workers recorded; see decode_parallel().
+    void merge_input_frames(std::vector<std::vector<PendingFrameRec>>& per_worker);
+
+    /// True while a parallel decode is in flight: write_callback then places each
+    /// frame by its own sample number into a *preallocated* m_pcm_data, clipped to
+    /// the writing worker's range, instead of appending. Every sample has exactly
+    /// one writer, so the sample data needs no lock; nothing reads it until the
+    /// join.
+    bool              m_stream_mode = false;
+    std::atomic<bool> m_decode_failed{false};
+
     // Input frame map for frame reuse: sample span and byte range of every
     // frame in the input file, recorded during decode (reuse_frames only).
     struct InputFrame {
@@ -162,6 +213,9 @@ private:
     };
     std::vector<InputFrame> m_input_frames;
     uint64_t m_prev_frame_end = 0;   // rolling byte offset during decode
+    /// STREAMINFO's max blocksize, used to align parallel-decode ranges onto
+    /// frame boundaries so a worker's first frame is usually its own.
+    uint32_t m_max_blocksize  = 0;
     bool     m_frame_pos_ok   = true; // false if the decoder can't report positions
 
     // Decoded PCM (per-channel, arrays of channel samples)

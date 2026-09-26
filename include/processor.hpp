@@ -7,6 +7,7 @@
 #define PROCESSOR_HPP
 
 #include <atomic>
+#include <iosfwd>
 #include <string>
 #include <vector>
 #include <cstdint>
@@ -169,6 +170,12 @@ private:
     // Raw byte copy of non-STREAMINFO metadata blocks from input file.
     bool read_extra_metadata_blocks(std::vector<std::vector<uint8_t>>& out_blocks) const;
 
+    // Appends what follows the input's last frame (ID3v1 or APEv2 tags) to out.
+    bool copy_trailing_data(std::ostream& out) const;
+
+    // The frame byte-range map serves frame reuse and tells where the input's audio ends.
+    bool track_frames() const { return m_config.reuse_frames || m_config.copy_metadata; }
+
     // --- Member state ----
     std::string     m_input;
     std::string     m_output;
@@ -182,7 +189,7 @@ private:
     /// worker 0 reuses it, since it starts at sample 0 and needs no seek. The
     /// caller owns and deletes it.
     ///
-    /// Collects the frame byte-range map when reuse is enabled, merging the
+    /// Collects the frame byte-range map when frames are tracked, merging the
     /// per-worker records afterwards; sets m_frame_pos_ok false if any worker
     /// could not report positions or the merged map does not tile the stream.
     bool decode_parallel(FLAC__StreamDecoder* first, unsigned nthr,
@@ -204,7 +211,7 @@ private:
     std::atomic<bool> m_decode_failed{false};
 
     // Input frame map for frame reuse: sample span and byte range of every
-    // frame in the input file, recorded during decode (reuse_frames only).
+    // frame in the input file, recorded during decode (see track_frames()).
     struct InputFrame {
         uint64_t first_sample;
         uint32_t block_size;

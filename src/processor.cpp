@@ -106,6 +106,28 @@ bool Processor::read_extra_metadata_blocks(
     return true;
 }
 
+bool Processor::copy_trailing_data(std::ostream& out) const
+{
+    std::ifstream in(m_input, std::ios::binary | std::ios::ate);
+    if (!in) return false;
+    const uint64_t size = (uint64_t)in.tellg();
+    if (!m_frame_pos_ok || m_input_frames.empty()) {
+        // without the frame map the audio's end is unknown: refuse rather than drop a trailing tag
+        std::string end((size_t)std::min<uint64_t>(size, 160), '\0');
+        in.seekg(-(std::streamoff)end.size(), std::ios::end);
+        in.read(end.data(), (std::streamsize)end.size());
+        const bool id3v1 = end.size() >= 128 && end.compare(end.size() - 128, 3, "TAG") == 0;
+        return !id3v1 && end.find("APETAGEX") == std::string::npos;
+    }
+    const uint64_t audio_end = m_input_frames.back().byte_end;
+    if (audio_end >= size) return true;
+    in.seekg((std::streamoff)audio_end, std::ios::beg);
+    std::vector<char> buf(1 << 16);
+    while (in.read(buf.data(), (std::streamsize)buf.size()) || in.gcount() > 0)
+        out.write(buf.data(), in.gcount());
+    return !in.bad() && (bool)out;
+}
+
 // Vendor identity from a VORBIS_COMMENT block (type 4): the payload begins
 // with a 32-bit little-endian length followed by the UTF-8 vendor string —
 // which is where encoders identify themselves ("reference libFLAC x.y.z",
@@ -243,7 +265,7 @@ bool Processor::process() {
     // for the parallel path, so STREAMINFO's sample count is known before the
     // buffers are sized.
     bool ok = FLAC__stream_decoder_process_until_end_of_metadata(decoder);
-    if (ok && m_config.reuse_frames &&
+    if (ok && track_frames() &&
         !FLAC__stream_decoder_get_decode_position(decoder, &m_prev_frame_end))
         m_frame_pos_ok = false;
 
@@ -562,6 +584,14 @@ bool Processor::process() {
     if (md5_thread.joinable()) md5_thread.join();
     const auto md5_digest = md5.digest();
 
+    // --- Step 5b: carry over what follows the input's audio (ID3v1, APEv2 tags) ----
+    if (m_config.copy_metadata && !copy_trailing_data(out)) {
+        std::cerr << "Error: could not copy the data after the audio of " << m_input << "\n";
+        out.close();
+        std::remove(tmp_output.c_str());
+        return false;
+    }
+
     // --- Step 6: seek back and update STREAMINFO with frame sizes + MD5 ----
     // Block sizes come from the emitted frames — with reuse they can differ
     // from the DP's blocks.
@@ -769,7 +799,7 @@ bool Processor::decode_parallel(FLAC__StreamDecoder* first, unsigned nthr,
             t_range_lo = lo;
             t_range_hi = hi;
             t_frames.clear();
-            t_pos_ok = m_config.reuse_frames;
+            t_pos_ok = track_frames();
             t_prev_end = 0;
             t_skip_rec = false;
 
@@ -809,8 +839,8 @@ bool Processor::decode_parallel(FLAC__StreamDecoder* first, unsigned nthr,
             // ends exactly at the boundary and stops on one that crosses it
             // (already the next worker's landing frame, hence already covered).
             // The extra samples are clipped away by range, so only the byte map
-            // grows. Without reuse there is nothing to record and no overlap.
-            const uint64_t cover = (m_config.reuse_frames && hi < m_total_samples)
+            // grows. Without a frame map to record there is no overlap.
+            const uint64_t cover = (track_frames() && hi < m_total_samples)
                                  ? hi + 1 : hi;
 
             bool ok = true;
@@ -833,7 +863,7 @@ bool Processor::decode_parallel(FLAC__StreamDecoder* first, unsigned nthr,
     }
     for (auto& t : workers) if (t.joinable()) t.join();
 
-    if (m_config.reuse_frames) {
+    if (track_frames()) {
         for (unsigned i = 0; i < nthr; ++i)
             if (!pos_ok[i]) { m_frame_pos_ok = false; break; }
         if (m_frame_pos_ok) merge_input_frames(per_worker);
@@ -886,7 +916,7 @@ FLAC__StreamDecoderWriteStatus Processor::write_callback(
             // frame that exists in the file at all. Either way the previous
             // worker records this frame properly.
             t_skip_rec = false;
-        } else if (self->m_config.reuse_frames && t_pos_ok) {
+        } else if (self->track_frames() && t_pos_ok) {
             uint64_t end = 0;
             if (FLAC__stream_decoder_get_decode_position(decoder, &end)) {
                 t_frames.push_back(Processor::PendingFrameRec{at, bsize, t_prev_end, end});
@@ -907,7 +937,7 @@ FLAC__StreamDecoderWriteStatus Processor::write_callback(
     // frame's end; its start is the previous frame's end. Sample position
     // comes from the running decode count, so it is right for both fixed-
     // and variable-blocksize inputs.
-    if (self->m_config.reuse_frames && self->m_frame_pos_ok) {
+    if (self->track_frames() && self->m_frame_pos_ok) {
         uint64_t end = 0;
         if (FLAC__stream_decoder_get_decode_position(decoder, &end)) {
             self->m_input_frames.push_back(InputFrame{

@@ -72,13 +72,14 @@ bool Processor::read_extra_metadata_blocks(
 
     char magic[4];
     f.read(magic, 4);
-    if (std::string(magic, 4) != "fLaC") return false;
+    if (f.gcount() < 4 || std::string(magic, 4) != "fLaC") return false;
 
     bool is_last = false;
-    while (!is_last && f) {
+    while (!is_last) {
         uint8_t hdr[4];
         f.read(reinterpret_cast<char*>(hdr), 4);
-        if (!f || f.gcount() < 4) break;
+        // metadata ending before its last block is truncated: copying part of it would lose the rest
+        if (f.gcount() < 4) return false;
 
         is_last      = (hdr[0] & 0x80u) != 0;
         uint8_t type = hdr[0] & 0x7Fu;
@@ -88,6 +89,7 @@ bool Processor::read_extra_metadata_blocks(
 
         std::vector<uint8_t> data(len);
         f.read(reinterpret_cast<char*>(data.data()), len);
+        if (static_cast<uint32_t>(f.gcount()) < len) return false;
 
         if (type != 0) { // skip STREAMINFO (we re-generate it)
             // Store: 4-byte header (is_last cleared for now) + payload
@@ -217,9 +219,10 @@ void rebuild_seektable(std::vector<uint8_t>& payload,
 bool Processor::process() {
     // --- Step 1: collect raw extra metadata blocks ----
     std::vector<std::vector<uint8_t>> extra_blocks;
-    if (m_config.copy_metadata) {
-        if (!read_extra_metadata_blocks(extra_blocks))
-            std::cerr << "Warning: could not copy metadata from " << m_input << "\n";
+    // an output without the source's tags, pictures and other blocks would silently lose them
+    if (m_config.copy_metadata && !read_extra_metadata_blocks(extra_blocks)) {
+        std::cerr << "Error: could not copy metadata from " << m_input << "\n";
+        return false;
     }
 
     // --- Step 2: decode PCM with libFLAC ----

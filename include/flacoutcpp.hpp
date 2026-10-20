@@ -86,6 +86,16 @@ struct Config {
     unsigned max_threads = 0;
 
     /**
+     * @brief The caller's own parallel loop, to run on instead of flacoutcpp's threads.
+     *
+     * When set, the decode, the search and the MD5 hand their independent pieces of
+     * work to it and flacoutcpp starts no thread of its own; @ref max_threads should
+     * then be the number of threads behind it, which sizes the parallel decode. Empty
+     * (the default) keeps flacoutcpp's own threads. The output is the same either way.
+     */
+    ParallelFor parallel_for;
+
+    /**
      * @brief Exact-search mode: price every block-partitioning choice exactly.
      *
      * When true, every (position, block size) pair in the partitioning DP is

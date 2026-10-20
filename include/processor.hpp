@@ -48,6 +48,11 @@ struct ProcessorConfig {
     unsigned max_threads = 0;
 
     /**
+     * @brief The caller's own parallel loop; see Config::parallel_for.
+     */
+    ParallelFor parallel_for;
+
+    /**
      * @brief Exact-search mode: fully encode every block-partitioning choice
      * (and every stereo mode) instead of pricing them by estimate. Orthogonal
      * to `max_candidates`.

@@ -11,6 +11,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <thread>
 #include <vector>
 #include <cstring>
@@ -259,6 +260,9 @@ bool Processor::process() {
         FLAC__stream_decoder_delete(decoder);
         return false;
     }
+    // freed on every way out, a caller's parallel loop throwing to stop early included
+    std::unique_ptr<FLAC__StreamDecoder, decltype(&FLAC__stream_decoder_delete)>
+        decoder_owner(decoder, &FLAC__stream_decoder_delete);
 
     // For frame reuse we need each input frame's byte range. Decode metadata
     // first so the position query below lands on the first audio frame -- and,
@@ -294,7 +298,7 @@ bool Processor::process() {
     } else {
         ok = ok && FLAC__stream_decoder_process_until_end_of_stream(decoder);
     }
-    FLAC__stream_decoder_delete(decoder);
+    decoder_owner.reset();
 
     if (!ok || m_pcm_data.empty() || m_total_samples == 0) return false;
 
@@ -332,7 +336,7 @@ bool Processor::process() {
         std::thread& t;
         ~Joiner() { if (t.joinable()) t.join(); }
     };
-    std::thread md5_thread([this, bytes_per_sample, &md5]() {
+    const auto hash = [this, bytes_per_sample, &md5]() {
         const uint32_t stride = m_channels * (uint32_t)bytes_per_sample;
         constexpr uint64_t BATCH = 4096;
         std::vector<uint8_t> buf((size_t)BATCH * stride);
@@ -348,7 +352,10 @@ bool Processor::process() {
             md5.update(buf.data(), (size_t)n * stride);
             at += n;
         }
-    });
+    };
+    // under the caller's parallel loop the hash waits to run beside the search instead
+    std::thread md5_thread;
+    if (!m_config.parallel_for) md5_thread = std::thread(hash);
     Joiner md5_joiner{md5_thread};
 
     // --- Step 2c: frame-reuse preparation ----
@@ -415,7 +422,16 @@ bool Processor::process() {
                   m_config.lattice_sweeps);
     if (!reuse_edges.empty())
         opt.set_reuse_edges(std::move(reuse_edges));
-    std::vector<BlockParams> blocks = opt.find_optimal_block_partitioning(m_pcm_data);
+    std::vector<BlockParams> blocks;
+    if (m_config.parallel_for) {
+        opt.set_parallel_for(m_config.parallel_for);
+        m_config.parallel_for(2, [&](size_t i) {
+            if (i == 0) blocks = opt.find_optimal_block_partitioning(m_pcm_data);
+            else        hash();
+        });
+    } else {
+        blocks = opt.find_optimal_block_partitioning(m_pcm_data);
+    }
 
     if (blocks.empty()) {
         std::cerr << "Error: optimizer produced no blocks.\n";
@@ -745,7 +761,7 @@ bool Processor::process() {
 
 unsigned Processor::decode_thread_count(uint64_t total_samples, uint64_t align) const
 {
-    unsigned n = std::thread::hardware_concurrency();
+    unsigned n = m_config.max_threads ? m_config.max_threads : std::thread::hardware_concurrency();
     n = std::max(1u, std::min(n ? n / 2 : 1u, 8u));
     if (const char* e = std::getenv("FLACOUT_DECODE_THREADS"))
         n = (unsigned)std::max(1, std::min(32, atoi(e)));
@@ -790,78 +806,83 @@ bool Processor::decode_parallel(FLAC__StreamDecoder* first, unsigned nthr,
 {
     std::vector<std::vector<PendingFrameRec>> per_worker(nthr);
     std::vector<uint8_t> pos_ok(nthr, 1);
-    std::vector<std::thread> workers;
 
-    for (unsigned i = 0; i < nthr; ++i) {
-        workers.emplace_back([this, i, range_len, first, &per_worker, &pos_ok]() {
-            const uint64_t lo = (uint64_t)i * range_len;
-            const uint64_t hi = std::min(lo + range_len, m_total_samples);
-            t_range_lo = lo;
-            t_range_hi = hi;
-            t_frames.clear();
-            t_pos_ok = track_frames();
-            t_prev_end = 0;
+    const auto worker = [this, range_len, first, &per_worker, &pos_ok](size_t i) {
+        const uint64_t lo = (uint64_t)i * range_len;
+        const uint64_t hi = std::min(lo + range_len, m_total_samples);
+        // a pooled thread may have run another range before this one
+        t_range_lo = lo;
+        t_range_hi = hi;
+        t_frame_end = 0;
+        t_frames.clear();
+        t_pos_ok = track_frames();
+        t_prev_end = 0;
+        t_skip_rec = false;
+
+        FLAC__StreamDecoder* d = first;
+        bool own = false;
+        if (i != 0) {
+            d = FLAC__stream_decoder_new();
+            if (!d || FLAC__stream_decoder_init_file(
+                          d, m_input.c_str(), write_callback, nullptr,
+                          error_callback, this)
+                      != FLAC__STREAM_DECODER_INIT_STATUS_OK) {
+                if (d) FLAC__stream_decoder_delete(d);
+                m_decode_failed.store(true, std::memory_order_release);
+                return;
+            }
+            own = true;
+            // The seek hands the landing frame to the write callback before
+            // it returns; that record is the previous worker's to make.
+            t_skip_rec = true;
+            const bool seek_ok = FLAC__stream_decoder_seek_absolute(d, lo);
             t_skip_rec = false;
-
-            FLAC__StreamDecoder* d = first;
-            bool own = false;
-            if (i != 0) {
-                d = FLAC__stream_decoder_new();
-                if (!d || FLAC__stream_decoder_init_file(
-                              d, m_input.c_str(), write_callback, nullptr,
-                              error_callback, this)
-                          != FLAC__STREAM_DECODER_INIT_STATUS_OK) {
-                    if (d) FLAC__stream_decoder_delete(d);
-                    m_decode_failed.store(true, std::memory_order_release);
-                    return;
-                }
-                own = true;
-                // The seek hands the landing frame to the write callback before
-                // it returns; that record is the previous worker's to make.
-                t_skip_rec = true;
-                const bool seek_ok = FLAC__stream_decoder_seek_absolute(d, lo);
-                t_skip_rec = false;
-                if (!seek_ok) {
-                    FLAC__stream_decoder_delete(d);
-                    m_decode_failed.store(true, std::memory_order_release);
-                    return;
-                }
+            if (!seek_ok) {
+                FLAC__stream_decoder_delete(d);
+                m_decode_failed.store(true, std::memory_order_release);
+                return;
             }
-            // The byte offset the first frame starts at: after the seek for a
-            // worker that seeked, after the metadata for worker 0 (which the
-            // caller has already positioned).
-            if (t_pos_ok && !FLAC__stream_decoder_get_decode_position(d, &t_prev_end))
-                t_pos_ok = false;
+        }
+        // The byte offset the first frame starts at: after the seek for a
+        // worker that seeked, after the metadata for worker 0 (which the
+        // caller has already positioned).
+        if (t_pos_ok && !FLAC__stream_decoder_get_decode_position(d, &t_prev_end))
+            t_pos_ok = false;
 
-            // Reuse needs one frame of overlap past the range end. The next
-            // worker seeks to `hi` and cannot record the frame it lands on, so
-            // this worker decodes it: `hi + 1` keeps going through a frame that
-            // ends exactly at the boundary and stops on one that crosses it
-            // (already the next worker's landing frame, hence already covered).
-            // The extra samples are clipped away by range, so only the byte map
-            // grows. Without a frame map to record there is no overlap.
-            const uint64_t cover = (track_frames() && hi < m_total_samples)
-                                 ? hi + 1 : hi;
+        // Reuse needs one frame of overlap past the range end. The next
+        // worker seeks to `hi` and cannot record the frame it lands on, so
+        // this worker decodes it: `hi + 1` keeps going through a frame that
+        // ends exactly at the boundary and stops on one that crosses it
+        // (already the next worker's landing frame, hence already covered).
+        // The extra samples are clipped away by range, so only the byte map
+        // grows. Without a frame map to record there is no overlap.
+        const uint64_t cover = (track_frames() && hi < m_total_samples)
+                             ? hi + 1 : hi;
 
-            bool ok = true;
-            for (;;) {
-                const FLAC__StreamDecoderState st = FLAC__stream_decoder_get_state(d);
-                if (st == FLAC__STREAM_DECODER_END_OF_STREAM) break;
-                if (st == FLAC__STREAM_DECODER_ABORTED ||
-                    st == FLAC__STREAM_DECODER_OGG_ERROR ||
-                    st == FLAC__STREAM_DECODER_SEEK_ERROR ||
-                    st == FLAC__STREAM_DECODER_MEMORY_ALLOCATION_ERROR) { ok = false; break; }
-                if (!FLAC__stream_decoder_process_single(d)) { ok = false; break; }
-                if (t_frame_end >= cover) break;
-            }
-            if (own) FLAC__stream_decoder_delete(d);
-            if (!ok) m_decode_failed.store(true, std::memory_order_release);
+        bool ok = true;
+        for (;;) {
+            const FLAC__StreamDecoderState st = FLAC__stream_decoder_get_state(d);
+            if (st == FLAC__STREAM_DECODER_END_OF_STREAM) break;
+            if (st == FLAC__STREAM_DECODER_ABORTED ||
+                st == FLAC__STREAM_DECODER_OGG_ERROR ||
+                st == FLAC__STREAM_DECODER_SEEK_ERROR ||
+                st == FLAC__STREAM_DECODER_MEMORY_ALLOCATION_ERROR) { ok = false; break; }
+            if (!FLAC__stream_decoder_process_single(d)) { ok = false; break; }
+            if (t_frame_end >= cover) break;
+        }
+        if (own) FLAC__stream_decoder_delete(d);
+        if (!ok) m_decode_failed.store(true, std::memory_order_release);
 
-            per_worker[i] = std::move(t_frames);
-            pos_ok[i] = t_pos_ok ? 1 : 0;
-        });
+        per_worker[i] = std::move(t_frames);
+        pos_ok[i] = t_pos_ok ? 1 : 0;
+    };
+    if (m_config.parallel_for) {
+        m_config.parallel_for(nthr, worker);
+    } else {
+        std::vector<std::thread> workers;
+        for (unsigned i = 0; i < nthr; ++i) workers.emplace_back(worker, i);
+        for (auto& t : workers) if (t.joinable()) t.join();
     }
-    for (auto& t : workers) if (t.joinable()) t.join();
 
     if (track_frames()) {
         for (unsigned i = 0; i < nthr; ++i)

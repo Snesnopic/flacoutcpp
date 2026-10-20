@@ -67,6 +67,7 @@ bool optimise(const std::string& input_path, const std::string& output_path, con
     pc.copy_metadata = config.copy_metadata;
     pc.windows       = config.windows;
     pc.max_threads   = config.max_threads;
+    pc.parallel_for  = config.parallel_for;
     pc.exhaustive    = config.exhaustive;
     pc.max_candidates = config.max_candidates;
     pc.adaptive_windows = config.adaptive_windows;

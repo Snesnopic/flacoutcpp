@@ -22,6 +22,8 @@
 #ifndef OPTIMIZER_HPP
 #define OPTIMIZER_HPP
 
+#include <cstddef>
+#include <functional>
 #include <vector>
 #include <cstdint>
 #include <string>
@@ -249,6 +251,19 @@ struct ReuseEdge {
 // ---------------------------------------------------------------------------
 
 /**
+ * @brief A caller's own parallel loop: runs body(i) once for every i in [0, n),
+ * on any of its threads and in any order, and returns once all of them are done.
+ */
+using ParallelFor = std::function<void(std::size_t n, const std::function<void(std::size_t)>& body)>;
+
+/**
+ * @brief Runs body(i) once for every i in [0, n): through @p pf when it is set,
+ * otherwise on @p nthreads threads started for the call.
+ */
+void run_parallel(const ParallelFor& pf, std::size_t n, unsigned nthreads,
+                  const std::function<void(std::size_t)>& body);
+
+/**
  * @brief Finds the globally optimal FLAC encoding for a decoded PCM stream.
  *
  * ### Algorithm Overview
@@ -320,6 +335,12 @@ public:
      * BlockParams::reuse_index set instead of encoded parameters.
      */
     void set_reuse_edges(std::vector<ReuseEdge> edges) { m_reuse_edges = std::move(edges); }
+
+    /**
+     * @brief Run the parallel steps through @p pf instead of on threads of the
+     * Optimizer's own. The output does not change.
+     */
+    void set_parallel_for(ParallelFor pf) { m_parallel_for = std::move(pf); }
 
     /**
      * @brief Find the cheapest encoding for a single channel block.
@@ -414,6 +435,7 @@ private:
     uint32_t              m_sample_rate;
     std::vector<WindowType> m_windows;
     unsigned              m_max_threads;
+    ParallelFor           m_parallel_for;
     bool                  m_exhaustive;
     bool                  m_verbose;
     unsigned              m_max_candidates;

@@ -458,6 +458,17 @@ bool Processor::process() {
         std::cerr << "Error: cannot open output file: " << tmp_output << "\n";
         return false;
     }
+    // a caller's parallel loop that throws to stop early must not leave it behind
+    struct PartialGuard {
+        const std::string& path;
+        std::fstream&      out;
+        bool               done = false;
+        ~PartialGuard() {
+            if (done) return;
+            if (out.is_open()) out.close();
+            std::remove(path.c_str());
+        }
+    } partial{tmp_output, out};
 
     // 4-byte FLAC magic
     out.write("fLaC", 4);
@@ -543,12 +554,36 @@ bool Processor::process() {
         return fb;
     };
 
-    if (!reuse) {
-        uint64_t sample_number = 0;
-        for (const auto& block : blocks) {
-            emit(build_frame(block, sample_number), block.block_size);
-            sample_number += block.block_size;
+    // A frame depends on nothing but its block and its first sample, so frames
+    // are built a batch at a time across the threads and handed out in order.
+    std::vector<uint64_t> first_sample(blocks.size());
+    uint64_t frame_start = 0;
+    for (size_t k = 0; k < blocks.size(); ++k) {
+        first_sample[k] = frame_start;
+        frame_start += blocks[k].block_size;
+    }
+    unsigned build_threads = std::max(1u, std::thread::hardware_concurrency());
+    if (m_config.max_threads > 0) build_threads = std::min(build_threads, m_config.max_threads);
+    constexpr size_t BATCH_BYTES = size_t(32) << 20;
+    std::vector<std::vector<uint8_t>> built;
+    size_t built_from = 0;
+    auto take_frame = [&](size_t k) -> std::vector<uint8_t> {
+        if (k >= built_from + built.size()) {
+            size_t end = k, bytes = 0;
+            while (end < blocks.size() && (end == k || bytes < BATCH_BYTES))
+                bytes += blocks[end++].total_bits / 8;
+            built.assign(end - k, {});
+            built_from = k;
+            run_parallel(m_config.parallel_for, built.size(), build_threads, [&](size_t i) {
+                built[i] = build_frame(blocks[k + i], first_sample[k + i]);
+            });
         }
+        return std::move(built[k - built_from]);
+    };
+
+    if (!reuse) {
+        for (size_t k = 0; k < blocks.size(); ++k)
+            emit(take_frame(k), blocks[k].block_size);
     } else {
         // Two-pointer walk over both partitions. A segment closes whenever
         // they hit a common sample boundary; whichever side spent fewer
@@ -562,9 +597,10 @@ bool Processor::process() {
 
         while (bi < blocks.size() || ij < m_input_frames.size()) {
             if (our_end <= in_end && bi < blocks.size()) {
-                const auto& block = blocks[bi++];
+                const size_t k = bi++;
+                const auto& block = blocks[k];
                 if (block.reuse_index >= 0) our_reused++;
-                auto fb = build_frame(block, our_end);
+                auto fb = take_frame(k);
                 our_sz += fb.size();
                 our_end += block.block_size;
                 ours.emplace_back(std::move(fb), block.block_size);
@@ -739,6 +775,7 @@ bool Processor::process() {
         std::remove(tmp_output.c_str());
         return false;
     }
+    partial.done = true;
 
     if (m_config.verbose) {
         if (copied_through)

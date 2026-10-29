@@ -92,6 +92,8 @@ struct Config {
      * work to it and flacoutcpp starts no thread of its own; @ref max_threads should
      * then be the number of threads behind it, which sizes the parallel decode. Empty
      * (the default) keeps flacoutcpp's own threads. The output is the same either way.
+     * It must accept being called again from inside @c body: a pool whose workers
+     * block waiting on a nested call deadlocks.
      */
     ParallelFor parallel_for;
 

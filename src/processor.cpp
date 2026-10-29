@@ -72,6 +72,7 @@ bool Processor::read_extra_metadata_blocks(
     if (!f) return false;
 
     char magic[4];
+    f.seekg((std::streamoff)m_flac_offset);
     f.read(magic, 4);
     if (f.gcount() < 4 || std::string(magic, 4) != "fLaC") return false;
 
@@ -105,6 +106,55 @@ bool Processor::read_extra_metadata_blocks(
         }
     }
     return true;
+}
+
+// Bytes of ID3v2 tags, and of the zero padding some taggers leave after them,
+// in front of the "fLaC" marker; 0 when the file does not start that way.
+static uint64_t id3v2_prefix_size(const std::string& path)
+{
+    std::ifstream f(path, std::ios::binary);
+    uint64_t end = 0;
+    uint8_t h[10];
+    while (f.seekg((std::streamoff)end) && f.read(reinterpret_cast<char*>(h), 10)) {
+        if (std::memcmp(h, "ID3", 3) != 0 || h[3] < 2 || h[3] > 4 || h[4] == 0xFFu) break;
+        uint64_t size = 0;
+        bool syncsafe = true;
+        for (int i = 6; i < 10; ++i) {
+            syncsafe = syncsafe && (h[i] & 0x80u) == 0;
+            size = (size << 7) | h[i];
+        }
+        if (!syncsafe) break;
+        const bool footer = h[3] == 4 && (h[5] & 0x10u) != 0;
+        end += 10 + size + (footer ? 10 : 0);
+    }
+    if (end == 0) return 0;
+    f.clear();
+    f.seekg((std::streamoff)end);
+    for (int c = f.get(); c == 0; c = f.get()) ++end;
+    // only a prefix the stream follows directly is one to skip
+    char magic[4];
+    f.clear();
+    f.seekg((std::streamoff)end);
+    return f.read(magic, 4) && std::memcmp(magic, "fLaC", 4) == 0 ? end : 0;
+}
+
+// libFLAC loses the stream behind more than one ID3v2 tag or behind padding
+// after one, so a prefix is skipped here rather than left to the decoder.
+// Positions stay absolute in the file either way.
+bool Processor::init_decoder(FLAC__StreamDecoder* d,
+                             FLAC__StreamDecoderMetadataCallback meta)
+{
+    if (m_flac_offset == 0)
+        return FLAC__stream_decoder_init_file(d, m_input.c_str(), write_callback, meta,
+                                              error_callback, this)
+            == FLAC__STREAM_DECODER_INIT_STATUS_OK;
+    if (m_flac_offset > (uint64_t)std::numeric_limits<long>::max()) return false;
+    FILE* f = std::fopen(m_input.c_str(), "rb");
+    if (!f) return false;
+    if (std::fseek(f, (long)m_flac_offset, SEEK_SET) != 0) { std::fclose(f); return false; }
+    // the decoder owns f from here and closes it
+    return FLAC__stream_decoder_init_FILE(d, f, write_callback, meta, error_callback, this)
+        == FLAC__STREAM_DECODER_INIT_STATUS_OK;
 }
 
 bool Processor::copy_trailing_data(std::ostream& out) const
@@ -241,11 +291,18 @@ void rebuild_seektable(std::vector<uint8_t>& payload,
 
 bool Processor::process() {
     // --- Step 1: collect raw extra metadata blocks ----
+    m_flac_offset = id3v2_prefix_size(m_input);
     std::vector<std::vector<uint8_t>> extra_blocks;
+    // ID3v2 tags in front of the stream go back in front of the output
+    std::vector<char> id3v2_tags(m_config.copy_metadata ? (size_t)m_flac_offset : 0);
     // an output without the source's tags, pictures and other blocks would silently lose them
-    if (m_config.copy_metadata && !read_extra_metadata_blocks(extra_blocks)) {
-        std::cerr << "Error: could not copy metadata from " << m_input << "\n";
-        return false;
+    if (m_config.copy_metadata) {
+        std::ifstream f(m_input, std::ios::binary);
+        if (!f.read(id3v2_tags.data(), (std::streamsize)id3v2_tags.size())
+            || !read_extra_metadata_blocks(extra_blocks)) {
+            std::cerr << "Error: could not copy metadata from " << m_input << "\n";
+            return false;
+        }
     }
 
     // --- Step 2: decode PCM with libFLAC ----
@@ -253,10 +310,7 @@ bool Processor::process() {
     if (!decoder) return false;
 
     FLAC__stream_decoder_set_metadata_respond(decoder, FLAC__METADATA_TYPE_STREAMINFO);
-    if (FLAC__stream_decoder_init_file(decoder, m_input.c_str(),
-                                       write_callback, metadata_callback,
-                                       error_callback, this)
-        != FLAC__STREAM_DECODER_INIT_STATUS_OK) {
+    if (!init_decoder(decoder, metadata_callback)) {
         FLAC__stream_decoder_delete(decoder);
         return false;
     }
@@ -470,6 +524,8 @@ bool Processor::process() {
         }
     } partial{tmp_output, out};
 
+    out.write(id3v2_tags.data(), (std::streamsize)id3v2_tags.size());
+
     // 4-byte FLAC magic
     out.write("fLaC", 4);
 
@@ -647,8 +703,8 @@ bool Processor::process() {
     // --- Step 6: seek back and update STREAMINFO with frame sizes + MD5 ----
     // Block sizes come from the emitted frames — with reuse they can differ
     // from the DP's blocks.
-    // Position: fLaC(4) + STREAMINFO block header(4) = byte 8
-    out.seekp(8, std::ios::beg);
+    // Position: ID3v2 tags + fLaC(4) + STREAMINFO block header(4)
+    out.seekp((std::streamoff)id3v2_tags.size() + 8, std::ios::beg);
     auto si_updated = FrameWriter::make_streaminfo_block(
         si_is_last, emit_min_bs, emit_max_bs,
         min_frm, max_frm,
@@ -716,7 +772,8 @@ bool Processor::process() {
             if (audio_end > audio_start && (uint64_t)out_sz > HDR + (audio_end - audio_start)) {
                 std::ifstream b(m_input, std::ios::binary);
                 std::vector<char> head(HDR);
-                if (b && b.read(head.data(), (std::streamsize)HDR)
+                if (b && b.seekg((std::streamoff)m_flac_offset)
+                      && b.read(head.data(), (std::streamsize)HDR)
                       && std::memcmp(head.data(), "fLaC", 4) == 0
                       && (head[4] & 0x7F) == 0                       // STREAMINFO
                       && ((uint8_t)head[5] << 16 | (uint8_t)head[6] << 8
@@ -860,10 +917,7 @@ bool Processor::decode_parallel(FLAC__StreamDecoder* first, unsigned nthr,
         bool own = false;
         if (i != 0) {
             d = FLAC__stream_decoder_new();
-            if (!d || FLAC__stream_decoder_init_file(
-                          d, m_input.c_str(), write_callback, nullptr,
-                          error_callback, this)
-                      != FLAC__STREAM_DECODER_INIT_STATUS_OK) {
+            if (!d || !init_decoder(d, nullptr)) {
                 if (d) FLAC__stream_decoder_delete(d);
                 m_decode_failed.store(true, std::memory_order_release);
                 return;

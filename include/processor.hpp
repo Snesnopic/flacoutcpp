@@ -175,6 +175,9 @@ private:
     // Raw byte copy of non-STREAMINFO metadata blocks from input file.
     bool read_extra_metadata_blocks(std::vector<std::vector<uint8_t>>& out_blocks) const;
 
+    // Initialises d on the input, starting at the "fLaC" marker.
+    bool init_decoder(FLAC__StreamDecoder* d, FLAC__StreamDecoderMetadataCallback meta);
+
     // Appends what follows the input's last frame (ID3v1 or APEv2 tags) to out.
     bool copy_trailing_data(std::ostream& out) const;
 
@@ -185,6 +188,7 @@ private:
     std::string     m_input;
     std::string     m_output;
     ProcessorConfig m_config;
+    uint64_t        m_flac_offset = 0; // bytes of ID3v2 tags in front of "fLaC"
 
     // --- Parallel decode ----
     /// Decode the whole stream with `nthr` workers into preallocated m_pcm_data,

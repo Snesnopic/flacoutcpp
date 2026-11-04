@@ -1563,7 +1563,7 @@ uint32_t Optimizer::calculate_rice_cost(
     uint64_t sums2[MAX_PARTS][NUM_K2];
     bool     any_high = false;
     uint32_t n_res[MAX_PARTS];
-    uint32_t max_abs_arr[MAX_PARTS];
+    uint32_t or_arr[MAX_PARTS]; // bitwise or of the folded residuals: |r| <= or >> 1, all zero iff or == 0
 
     INSTR(g_instr.rice_calls.fetch_add(1, std::memory_order_relaxed));
     INSTR(g_instr.rice_scan_samples.fetch_add(block_size - order, std::memory_order_relaxed));
@@ -1654,8 +1654,8 @@ uint32_t Optimizer::calculate_rice_cost(
                 }
             }
 
-            n_res[p]       = cnt;
-            max_abs_arr[p] = or_all >> 1;
+            n_res[p]  = cnt;
+            or_arr[p] = or_all;
             continue;
         }
 #endif
@@ -1714,15 +1714,13 @@ uint32_t Optimizer::calculate_rice_cost(
             or_all |= or_chunk;
             base = stop;
         }
-        const uint32_t mabs = or_all >> 1;
-
-        n_res[p]        = (first < end) ? (end - first) : 0;
-        max_abs_arr[p]  = mabs;
+        n_res[p]  = (first < end) ? (end - first) : 0;
+        or_arr[p] = or_all;
     }
 
     // Second pass for the high-k sums, only where they can be non-zero.
     for (uint32_t p = 0; p < num_parts; ++p) {
-        if ((max_abs_arr[p] >> 14) == 0) continue; // all u < 2^15 → sums2 ≡ 0
+        if ((or_arr[p] >> 15) == 0) continue; // all u < 2^15 → sums2 ≡ 0
         if (!any_high) {
             any_high = true;
             std::memset(sums2, 0, sizeof(uint64_t) * num_parts * NUM_K2);
@@ -1848,8 +1846,8 @@ uint32_t Optimizer::calculate_rice_cost(
             // The bps field is 5 bits, so residuals wider than 31 bits cannot
             // be represented by escape at all; skip it so normal Rice (which
             // has no such limit) is chosen instead.
-            if (max_abs_arr[p] < (1u << 30)) {
-                uint32_t max_abs = max_abs_arr[p];
+            if ((or_arr[p] >> 1) < (1u << 30)) {
+                uint32_t max_abs = or_arr[p] >> 1;
                 // Smallest width whose sign bit clears max_abs: 2 + floor(log2)
                 // for nonzero values, 1 for zero — same result the old
                 // increment loop produced, in one bit-scan.
@@ -1859,6 +1857,8 @@ uint32_t Optimizer::calculate_rice_cost(
 #else
                 int escape_bps = max_abs ? 33 - __builtin_clz(max_abs) : 1;
 #endif
+                // a width of 0 codes a partition of zeros in the escape's 5 bits alone
+                if (or_arr[p] == 0) escape_bps = 0;
 
                 uint64_t escape_bits = 5ull + (uint64_t)escape_bps * n;
                 if (escape_bits < best0_bits) {
@@ -1901,7 +1901,7 @@ uint32_t Optimizer::calculate_rice_cost(
         for (uint32_t p = 0; p < next_num_parts; ++p) {
             uint32_t left = 2 * p, right = 2 * p + 1;
             n_res[p]       = n_res[left] + n_res[right];
-            max_abs_arr[p] = std::max(max_abs_arr[left], max_abs_arr[right]);
+            or_arr[p]      = or_arr[left] | or_arr[right];
             for (int k = 0; k < NUM_K; ++k)
                 sums[p][k] = sums[left][k] + sums[right][k];
             if (any_high)

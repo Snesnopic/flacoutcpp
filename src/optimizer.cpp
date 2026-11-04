@@ -3697,69 +3697,39 @@ BlockParams Optimizer::compute_block(
     } else {
         uint32_t best_bits = std::numeric_limits<uint32_t>::max();
 
-        // Independent stereo (mode 0)
-        std::vector<int> modes_to_test = {0, 8, 9, 10};
-        if (!full_search()) {
-            // Fast estimation using Fixed Predictor (order 2)
-            auto estimate_ch = [&](const int32_t* smp, int bits_per_sample) -> uint32_t {
-                int wasted = 0;
-                int32_t mask = 0;
-                for (uint32_t i = 0; i < block_size; ++i) mask |= smp[i];
-                if (mask != 0) while ((mask & 1) == 0) { mask >>= 1; ++wasted; }
-                return estimate_subframe_cost(smp, block_size, 2, 2, 0, wasted, bits_per_sample);
-            };
-            
-            uint32_t best_est = std::numeric_limits<uint32_t>::max();
-            int best_mode = 0;
-            for (int mode : modes_to_test) {
-                uint32_t cost = 0;
-                if (mode == 0) {
-                    cost = estimate_ch(&pcm_data[0][sample_start], m_bps) +
-                           estimate_ch(&pcm_data[1][sample_start], m_bps);
-                } else {
-                    std::vector<int32_t> ch0(block_size), ch1(block_size);
-                    for (uint32_t k = 0; k < block_size; ++k) {
-                        int32_t L = pcm_data[0][sample_start + k], R = pcm_data[1][sample_start + k];
-                        if      (mode == 8)  { ch0[k] = L;        ch1[k] = L - R; }
-                        else if (mode == 9)  { ch0[k] = L - R;    ch1[k] = R;     }
-                        else                 { ch0[k] = (L+R)>>1; ch1[k] = L - R; }
-                    }
-                    cost = estimate_ch(ch0.data(), m_bps) + estimate_ch(ch1.data(), m_bps + 1);
-                }
-                if (cost < best_est) {
-                    best_est = cost;
-                    best_mode = mode;
-                }
-            }
-            modes_to_test = {best_mode};
-        }
-
         // the 4 stereo modes draw from only 4 distinct channel signals; S=L-R
         // alone appears in modes 8/9/10, so optimize each signal at most once.
         enum { SIG_L = 0, SIG_R, SIG_S, SIG_M };
+        std::vector<int32_t> side, mid;
+        auto sig_data = [&](int sig, uint32_t& sig_bps) -> const int32_t* {
+            sig_bps = m_bps;
+            if (sig == SIG_L) return &pcm_data[0][sample_start];
+            if (sig == SIG_R) return &pcm_data[1][sample_start];
+            if (sig == SIG_S) {
+                sig_bps = m_bps + 1;
+                if (side.empty()) {
+                    side.resize(block_size);
+                    for (uint32_t k = 0; k < block_size; ++k)
+                        side[k] = pcm_data[0][sample_start + k] - pcm_data[1][sample_start + k];
+                }
+                return side.data();
+            }
+            if (mid.empty()) {
+                mid.resize(block_size);
+                for (uint32_t k = 0; k < block_size; ++k)
+                    mid[k] = (pcm_data[0][sample_start + k] + pcm_data[1][sample_start + k]) >> 1;
+            }
+            return mid.data();
+        };
+
         bool           have[4] = { false, false, false, false };
         SubframeParams cache[4];
 
         auto get_sig = [&](int sig) -> const SubframeParams& {
             if (have[sig]) return cache[sig];
-            if (sig == SIG_L) {
-                cache[sig] = optimize_subframe(&pcm_data[0][sample_start], block_size, m_bps, wins, m_max_candidates, patience, m_precision_rungs, m_lattice_sweeps);
-            } else if (sig == SIG_R) {
-                cache[sig] = optimize_subframe(&pcm_data[1][sample_start], block_size, m_bps, wins, m_max_candidates, patience, m_precision_rungs, m_lattice_sweeps);
-            } else {
-                std::vector<int32_t> ch(block_size);
-                uint32_t bps_s;
-                if (sig == SIG_S) {
-                    for (uint32_t k = 0; k < block_size; ++k)
-                        ch[k] = pcm_data[0][sample_start + k] - pcm_data[1][sample_start + k];
-                    bps_s = m_bps + 1;
-                } else { // SIG_M
-                    for (uint32_t k = 0; k < block_size; ++k)
-                        ch[k] = (pcm_data[0][sample_start + k] + pcm_data[1][sample_start + k]) >> 1;
-                    bps_s = m_bps;
-                }
-                cache[sig] = optimize_subframe(ch.data(), block_size, bps_s, wins, m_max_candidates, patience, m_precision_rungs, m_lattice_sweeps);
-            }
+            uint32_t sig_bps;
+            const int32_t* smp = sig_data(sig, sig_bps);
+            cache[sig] = optimize_subframe(smp, block_size, sig_bps, wins, m_max_candidates, patience, m_precision_rungs, m_lattice_sweeps);
             have[sig] = true;
             return cache[sig];
         };
@@ -3773,6 +3743,31 @@ BlockParams Optimizer::compute_block(
                 default: return { SIG_M, SIG_S }; // mode 10
             }
         };
+
+        std::vector<int> modes_to_test = {0, 8, 9, 10};
+        if (!full_search()) {
+            // a minimal search over all four signals picks the mode; an order-2 fixed
+            // predictor picked it badly enough to lose 0.1%, this recovers 97% of it at 1.15x
+            static const std::vector<WindowType> probe_windows = {WindowType::TUKEY_050};
+            uint32_t probe[4];
+            for (int sig = 0; sig < 4; ++sig) {
+                uint32_t sig_bps;
+                const int32_t* smp = sig_data(sig, sig_bps);
+                probe[sig] = optimize_subframe(smp, block_size, sig_bps, probe_windows,
+                                               1, 0, 1, 0).bits_cost;
+            }
+            uint64_t best_est = std::numeric_limits<uint64_t>::max();
+            int best_mode = 0;
+            for (int mode : modes_to_test) {
+                auto [sig0, sig1] = mode_sigs(mode);
+                const uint64_t cost = (uint64_t)probe[sig0] + probe[sig1];
+                if (cost < best_est) {
+                    best_est = cost;
+                    best_mode = mode;
+                }
+            }
+            modes_to_test = {best_mode};
+        }
 
         for (int mode : modes_to_test) {
             auto [sig0, sig1] = mode_sigs(mode);

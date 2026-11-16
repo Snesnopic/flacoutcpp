@@ -1,0 +1,98 @@
+name: Publish to WinGet
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish, e.g. v1.3.0
+        required: true
+        type: string
+      submit:
+        description: Open the pull request on winget-pkgs (untick to only build the manifests and attach them to the run)
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  PACKAGE_ID: Snesnopic.Flacoutcpp
+  TAG_NAME: ${{ github.event.release.tag_name || inputs.tag }}
+  SUBMIT: ${{ github.event_name != 'workflow_dispatch' || inputs.submit }}
+
+jobs:
+  update-winget:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      GH_TOKEN: ${{ github.token }}
+      WINGET_CREATE_GITHUB_TOKEN: ${{ secrets.WINGET_TOKEN }}
+    steps:
+      - name: Find the Windows assets
+        run: |
+          if ($env:TAG_NAME -notmatch '^v\d+\.\d+\.\d+$') {
+              throw "unexpected tag '$env:TAG_NAME'"
+          }
+
+          # a release can be published a moment before its last asset finishes uploading
+          for ($try = 1; $try -le 20; $try++) {
+              $json = gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$env:TAG_NAME"
+              if ($LASTEXITCODE -ne 0) {
+                  throw "release $env:TAG_NAME not found"
+              }
+              $release = $json | ConvertFrom-Json
+              $urls = @()
+              foreach ($arch in 'x64', 'x86', 'arm64') {
+                  $asset = $release.assets | Where-Object { $_.name -like "*-windows-$arch.zip" -and $_.state -eq 'uploaded' }
+                  if ($asset) {
+                      $urls += "$($asset.browser_download_url)|$arch"
+                  }
+              }
+              if ($urls.Count -eq 3) {
+                  break
+              }
+              Write-Host "found $($urls.Count) of 3 Windows assets, waiting"
+              Start-Sleep -Seconds 30
+          }
+          if ($urls.Count -ne 3) {
+              throw "expected 3 Windows assets, found $($urls.Count)"
+          }
+          $urls | ForEach-Object { Write-Host $_ }
+          "WINGET_URLS=$($urls -join ' ')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Download wingetcreate
+        run: |
+          for ($try = 1; $try -le 5; $try++) {
+              Invoke-WebRequest -Uri https://aka.ms/wingetcreate/latest -OutFile wingetcreate.exe
+              if ((Get-Item wingetcreate.exe).Length -gt 1MB) {
+                  break
+              }
+              Start-Sleep -Seconds (10 * $try)
+          }
+          if ((Get-Item wingetcreate.exe).Length -le 1MB) {
+              throw "could not download wingetcreate"
+          }
+
+      - name: Update the manifest
+        run: |
+          $version = $env:TAG_NAME.TrimStart('v')
+          $urls = $env:WINGET_URLS -split ' '
+          if ($env:SUBMIT -eq 'true') {
+              .\wingetcreate.exe update $env:PACKAGE_ID --version $version --urls $urls --submit
+          } else {
+              .\wingetcreate.exe update $env:PACKAGE_ID --version $version --urls $urls -o manifests
+          }
+          if ($LASTEXITCODE -ne 0) {
+              throw "wingetcreate failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Attach the manifests
+        if: env.SUBMIT != 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: manifests
+          path: manifests

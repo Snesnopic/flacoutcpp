@@ -1,0 +1,73 @@
+name: Publish to Homebrew
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish, e.g. v1.3.0
+        required: true
+        type: string
+      push:
+        description: Push the change to the tap (untick to only show the diff)
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  FORMULA: flacoutcpp
+  TAG_NAME: ${{ github.event.release.tag_name || inputs.tag }}
+
+jobs:
+  update-tap:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the tag
+        run: |
+          if [[ ! "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::unexpected tag '$TAG_NAME'"
+            exit 1
+          fi
+
+      - name: Checkout Homebrew tap
+        uses: actions/checkout@v6
+        with:
+          repository: Snesnopic/homebrew-tools
+          token: ${{ secrets.TAP_GITHUB_TOKEN }}
+          path: homebrew-tap
+
+      - name: Point the formula at the new tag
+        run: |
+          f="homebrew-tap/Formula/${FORMULA}.rb"
+          sed -i -E "s/(tag:[[:space:]]+)\"v[^\"]*\"/\1\"${TAG_NAME}\"/" "$f"
+          if ! grep -q "tag:[[:space:]]*\"${TAG_NAME}\"" "$f"; then
+            echo "::error::no tag line to update in $f"
+            exit 1
+          fi
+          git -C homebrew-tap diff
+
+      - name: Commit and push
+        if: github.event_name != 'workflow_dispatch' || inputs.push
+        working-directory: homebrew-tap
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          if git diff --quiet; then
+            echo "Formula already up to date."
+            exit 0
+          fi
+          git add "Formula/${FORMULA}.rb"
+          git commit -m "Update ${FORMULA}"
+          for _ in 1 2 3; do
+            git push && exit 0
+            git pull --rebase
+          done
+          echo "::error::could not push to the tap"
+          exit 1

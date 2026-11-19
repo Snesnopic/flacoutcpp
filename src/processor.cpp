@@ -6,10 +6,10 @@
 #include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
-#include <iostream>
 #include <limits>
 #include <memory>
 #include <thread>
@@ -55,7 +55,8 @@ static thread_local bool t_skip_rec = false;
 
 Processor::Processor(const std::string& in, const std::string& out,
                      ProcessorConfig config)
-    : m_input(in), m_output(out), m_config(std::move(config)) {}
+    : m_input(in), m_output(out), m_config(std::move(config)),
+      m_messages(m_config.on_message) {}
 
 Processor::~Processor() = default;
 
@@ -290,6 +291,18 @@ void rebuild_seektable(std::vector<uint8_t>& payload,
 // ============================================================
 
 bool Processor::process() {
+    bool ok;
+    try {
+        ok = run();
+    } catch (...) {
+        m_messages.flush();
+        throw;
+    }
+    m_messages.flush();
+    return ok;
+}
+
+bool Processor::run() {
     // --- Step 1: collect raw extra metadata blocks ----
     m_flac_offset = id3v2_prefix_size(m_input);
     std::vector<std::vector<uint8_t>> extra_blocks;
@@ -300,18 +313,22 @@ bool Processor::process() {
         std::ifstream f(m_input, std::ios::binary);
         if (!f.read(id3v2_tags.data(), (std::streamsize)id3v2_tags.size())
             || !read_extra_metadata_blocks(extra_blocks)) {
-            std::cerr << "Error: could not copy metadata from " << m_input << "\n";
+            m_messages.report(MessageLevel::error, "could not copy metadata from " + m_input);
             return false;
         }
     }
 
     // --- Step 2: decode PCM with libFLAC ----
     FLAC__StreamDecoder* decoder = FLAC__stream_decoder_new();
-    if (!decoder) return false;
+    if (!decoder) {
+        m_messages.report(MessageLevel::error, "could not create a FLAC decoder for " + m_input);
+        return false;
+    }
 
     FLAC__stream_decoder_set_metadata_respond(decoder, FLAC__METADATA_TYPE_STREAMINFO);
     if (!init_decoder(decoder, metadata_callback)) {
         FLAC__stream_decoder_delete(decoder);
+        m_messages.report(MessageLevel::error, "cannot open input file: " + m_input);
         return false;
     }
     // freed on every way out, a caller's parallel loop throwing to stop early included
@@ -352,14 +369,28 @@ bool Processor::process() {
     } else {
         ok = ok && FLAC__stream_decoder_process_until_end_of_stream(decoder);
     }
+    // a failed parallel worker has reported its own cause
+    const std::string stopped = ok || nthr > 1 ? std::string() :
+        std::string(" (") + FLAC__StreamDecoderStateString[FLAC__stream_decoder_get_state(decoder)] + ")";
     decoder_owner.reset();
 
-    if (!ok || m_pcm_data.empty() || m_total_samples == 0) return false;
+    if (!ok) {
+        m_messages.report(MessageLevel::error, "could not decode " + m_input + stopped);
+        return false;
+    }
+    if (m_channels == 0 || m_total_samples == 0 || m_pcm_data.empty()) {
+        m_messages.report(MessageLevel::error,
+            m_channels == 0      ? "no STREAMINFO in " + m_input
+          : m_total_samples == 0 ? "the STREAMINFO of " + m_input + " gives no sample count"
+          :                        "no audio frames in " + m_input);
+        return false;
+    }
 
     if (m_config.verbose)
-        std::cout << "Decoded " << m_total_samples << " samples ("
-                  << m_channels << " ch, " << m_bps << " bps, "
-                  << m_sample_rate << " Hz)\n";
+        m_messages.report(MessageLevel::info,
+            "Decoded " + std::to_string(m_total_samples) + " samples ("
+            + std::to_string(m_channels) + " ch, " + std::to_string(m_bps) + " bps, "
+            + std::to_string(m_sample_rate) + " Hz)");
 
     // --- Step 2b: MD5 over interleaved little-endian PCM, on its own thread ----
     //
@@ -474,6 +505,7 @@ bool Processor::process() {
                   m_config.adaptive_windows, resolved_patience,
                   m_config.precision_rungs, m_config.dp_candidates,
                   m_config.lattice_sweeps);
+    opt.set_messages(&m_messages);
     if (!reuse_edges.empty())
         opt.set_reuse_edges(std::move(reuse_edges));
     std::vector<BlockParams> blocks;
@@ -488,7 +520,7 @@ bool Processor::process() {
     }
 
     if (blocks.empty()) {
-        std::cerr << "Error: optimizer produced no blocks.\n";
+        m_messages.report(MessageLevel::error, "optimizer produced no blocks for " + m_input);
         return false;
     }
 
@@ -509,7 +541,7 @@ bool Processor::process() {
     std::fstream out(tmp_output,
                      std::ios::binary | std::ios::out | std::ios::trunc);
     if (!out) {
-        std::cerr << "Error: cannot open output file: " << tmp_output << "\n";
+        m_messages.report(MessageLevel::error, "cannot open output file: " + tmp_output);
         return false;
     }
     // a caller's parallel loop that throws to stop early must not leave it behind
@@ -694,7 +726,7 @@ bool Processor::process() {
 
     // --- Step 5b: carry over what follows the input's audio (ID3v1, APEv2 tags) ----
     if (m_config.copy_metadata && !copy_trailing_data(out)) {
-        std::cerr << "Error: could not copy the data after the audio of " << m_input << "\n";
+        m_messages.report(MessageLevel::error, "could not copy the data after the audio of " + m_input);
         out.close();
         std::remove(tmp_output.c_str());
         return false;
@@ -723,7 +755,7 @@ bool Processor::process() {
 
     out.flush();
     if (!out) {
-        std::cerr << "Error: write failed.\n";
+        m_messages.report(MessageLevel::error, "write failed: " + tmp_output);
         out.close();
         std::remove(tmp_output.c_str());
         return false;
@@ -753,7 +785,7 @@ bool Processor::process() {
                 std::ofstream repl(tmp_output, std::ios::binary | std::ios::trunc);
                 repl << b.rdbuf();
                 if (!repl) {
-                    std::cerr << "Error: copy-through write failed.\n";
+                    m_messages.report(MessageLevel::error, "copy-through write failed: " + tmp_output);
                     std::remove(tmp_output.c_str());
                     return false;
                 }
@@ -793,7 +825,7 @@ bool Processor::process() {
                         if (b.gcount() == 0) break;
                     }
                     if (!repl || left != 0) {
-                        std::cerr << "Error: copy-through write failed.\n";
+                        m_messages.report(MessageLevel::error, "copy-through write failed: " + tmp_output);
                         std::remove(tmp_output.c_str());
                         return false;
                     }
@@ -814,21 +846,21 @@ bool Processor::process() {
             blocks_src = &fresh;
         }
         const std::string vendor = vendor_from_blocks(*blocks_src);
-        std::cerr << "Warning: ";
-        if (copied_through)
-            std::cerr << "the entire input was copied through — "
-                         "the re-encode would have been larger";
-        else
-            std::cerr << "input frames beat the re-encode for " << frames_reused
-                      << " of " << frames_emitted << " frames";
-        std::cerr << " (input encoder: "
-                  << (vendor.empty() ? std::string("unknown")
-                                     : "\"" + vendor + "\"")
-                  << ").\n";
+        std::string w = copied_through
+            ? std::string("the entire input was copied through — "
+                          "the re-encode would have been larger")
+            : "input frames beat the re-encode for " + std::to_string(frames_reused)
+              + " of " + std::to_string(frames_emitted) + " frames";
+        w += " (input encoder: "
+             + (vendor.empty() ? std::string("unknown") : "\"" + vendor + "\"")
+             + ").";
+        m_messages.report(MessageLevel::warning, std::move(w));
     }
 
     if (std::rename(tmp_output.c_str(), m_output.c_str()) != 0) {
-        std::cerr << "Error: could not finalize output file: " << m_output << "\n";
+        const int err = errno;
+        m_messages.report(MessageLevel::error, "could not finalize output file: " + m_output
+                          + " (renaming " + tmp_output + ": " + std::strerror(err) + ")");
         std::remove(tmp_output.c_str());
         return false;
     }
@@ -836,15 +868,17 @@ bool Processor::process() {
 
     if (m_config.verbose) {
         if (copied_through)
-            std::cout << "Output would exceed the input; copied the input through unchanged.\n";
+            m_messages.report(MessageLevel::info,
+                "Output would exceed the input; copied the input through unchanged.");
         else
-            std::cout << "Wrote " << total_written << " bytes of audio data ("
-                      << blocks.size() << " frames, min=" << emit_min_bs
-                      << " max=" << emit_max_bs << " samples/frame"
-                      << (frames_reused
-                          ? ", " + std::to_string(frames_reused) + " input frames reused"
-                          : std::string())
-                      << ").\n";
+            m_messages.report(MessageLevel::info,
+                "Wrote " + std::to_string(total_written) + " bytes of audio data ("
+                + std::to_string(blocks.size()) + " frames, min=" + std::to_string(emit_min_bs)
+                + " max=" + std::to_string(emit_max_bs) + " samples/frame"
+                + (frames_reused
+                   ? ", " + std::to_string(frames_reused) + " input frames reused"
+                   : std::string())
+                + ").");
     }
     return true;
 }
@@ -919,6 +953,7 @@ bool Processor::decode_parallel(FLAC__StreamDecoder* first, unsigned nthr,
             d = FLAC__stream_decoder_new();
             if (!d || !init_decoder(d, nullptr)) {
                 if (d) FLAC__stream_decoder_delete(d);
+                m_messages.report(MessageLevel::error, "could not open a second decoder on " + m_input);
                 m_decode_failed.store(true, std::memory_order_release);
                 return;
             }
@@ -930,6 +965,8 @@ bool Processor::decode_parallel(FLAC__StreamDecoder* first, unsigned nthr,
             t_skip_rec = false;
             if (!seek_ok) {
                 FLAC__stream_decoder_delete(d);
+                m_messages.report(MessageLevel::error,
+                    "could not seek to sample " + std::to_string(lo) + " of " + m_input);
                 m_decode_failed.store(true, std::memory_order_release);
                 return;
             }
@@ -961,8 +998,13 @@ bool Processor::decode_parallel(FLAC__StreamDecoder* first, unsigned nthr,
             if (!FLAC__stream_decoder_process_single(d)) { ok = false; break; }
             if (t_frame_end >= cover) break;
         }
+        if (!ok) {
+            m_messages.report(MessageLevel::error,
+                "decoding " + m_input + " from sample " + std::to_string(lo) + " stopped ("
+                + FLAC__StreamDecoderStateString[FLAC__stream_decoder_get_state(d)] + ")");
+            m_decode_failed.store(true, std::memory_order_release);
+        }
         if (own) FLAC__stream_decoder_delete(d);
-        if (!ok) m_decode_failed.store(true, std::memory_order_release);
 
         per_worker[i] = std::move(t_frames);
         pos_ok[i] = t_pos_ok ? 1 : 0;
@@ -1070,9 +1112,11 @@ FLAC__StreamDecoderWriteStatus Processor::write_callback(
 }
 
 void Processor::error_callback(
-    const FLAC__StreamDecoder*, FLAC__StreamDecoderErrorStatus status, void*)
+    const FLAC__StreamDecoder*, FLAC__StreamDecoderErrorStatus status, void* client_data)
 {
-    std::cerr << "Decoder error: " << FLAC__StreamDecoderErrorStatusString[status] << "\n";
+    auto* self = static_cast<Processor*>(client_data);
+    self->m_messages.report(MessageLevel::error, "decoder error in " + self->m_input + ": "
+                            + FLAC__StreamDecoderErrorStatusString[status]);
 }
 
 void Processor::metadata_callback(

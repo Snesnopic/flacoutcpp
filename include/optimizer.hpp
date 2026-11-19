@@ -27,6 +27,7 @@
 #include <vector>
 #include <cstdint>
 #include <string>
+#include <string_view>
 
 namespace flacoutcpp {
 
@@ -256,6 +257,19 @@ struct ReuseEdge {
  */
 using ParallelFor = std::function<void(std::size_t n, const std::function<void(std::size_t)>& body)>;
 
+/// @brief Severity of a message handed to a MessageSink.
+enum class MessageLevel { error, warning, info };
+
+/**
+ * @brief Receives one message: a single line, without a level prefix or a
+ * trailing newline. See Config::on_message.
+ */
+using MessageSink = std::function<void(MessageLevel level, std::string_view text)>;
+
+/// @cond
+namespace detail { class Messages; }
+/// @endcond
+
 /**
  * @brief Runs body(i) once for every i in [0, n): through @p pf when it is set,
  * otherwise on @p nthreads threads started for the call.
@@ -341,6 +355,12 @@ public:
      * Optimizer's own. The output does not change.
      */
     void set_parallel_for(ParallelFor pf) { m_parallel_for = std::move(pf); }
+
+    /**
+     * @brief Report progress lines through @p m instead of printing them to
+     * stdout. @p m must outlive every run of this Optimizer.
+     */
+    void set_messages(detail::Messages* m) { m_messages = m; }
 
     /**
      * @brief Find the cheapest encoding for a single channel block.
@@ -436,6 +456,7 @@ private:
     std::vector<WindowType> m_windows;
     unsigned              m_max_threads;
     ParallelFor           m_parallel_for;
+    detail::Messages*     m_messages = nullptr;
     bool                  m_exhaustive;
     bool                  m_verbose;
     unsigned              m_max_candidates;
@@ -461,6 +482,9 @@ private:
     // by the granule estimates. Orthogonal to m_max_candidates, which bounds
     // the per-subframe LPC search depth in every mode.
     [[nodiscard]] bool full_search() const { return m_exhaustive; }
+
+    // set_messages()'s target, or one that prints when none was given
+    detail::Messages& messages() const;
 
     /// @endcond
 };

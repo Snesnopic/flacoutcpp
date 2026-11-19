@@ -1,5 +1,6 @@
 #include "optimizer.hpp"
 #include "frame_writer.hpp"
+#include "messages.hpp"
 #include <algorithm>
 #include <array>
 #include <unordered_map>
@@ -2977,6 +2978,22 @@ uint32_t Optimizer::estimate_lpc_bits_fast(
     return 8u + (uint32_t)(bsize * bps_est);
 }
 
+detail::Messages& Optimizer::messages() const
+{
+    static detail::Messages printing;
+    return m_messages ? *m_messages : printing;
+}
+
+static std::string distribution_line(const std::vector<BlockParams>& blocks)
+{
+    std::map<uint32_t, int> bs_hist;
+    for (const auto& bp : blocks) ++bs_hist[bp.block_size];
+    std::string line = "DP done. Distribution:";
+    for (const auto& [bs, cnt] : bs_hist)
+        line += "  bs=" + std::to_string(bs) + "×" + std::to_string(cnt);
+    return line;
+}
+
 void run_parallel(const ParallelFor& pf, size_t n, unsigned nthreads,
                   const std::function<void(size_t)>& body)
 {
@@ -3045,8 +3062,8 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
     // block covering all samples (FLAC allows block sizes from 1 to 65535).
     if (total_samples < 1024) {
         if (m_verbose)
-            std::cout << "Short stream (" << total_samples << " samples): "
-                      << "using single block.\n";
+            messages().report(MessageLevel::info, "Short stream (" + std::to_string(total_samples)
+                              + " samples): using single block.");
         BlockParams bp{};
         bp.block_size = (uint32_t)total_samples;
         if (m_channels == 1) {
@@ -3140,13 +3157,12 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
     if (m_max_threads > 0) nthreads = std::min(nthreads, (unsigned)m_max_threads);
 
     if (m_verbose)
-        std::cout << "DP: " << num_nodes << " nodes × " << NUM_CANDS
-                  << " candidates = " << work.size() << " blocks on "
-                  << nthreads << " threads\n";
+        messages().report(MessageLevel::info, "DP: " + std::to_string(num_nodes) + " nodes × "
+                          + std::to_string(NUM_CANDS) + " candidates = " + std::to_string(work.size())
+                          + " blocks on " + std::to_string(nthreads) + " threads");
 
     {
         std::atomic<size_t> done{0};
-        std::mutex           cout_mtx;
         run_parallel(m_parallel_for, work.size(), nthreads, [&](size_t idx) {
             auto [node, ci] = work[idx];
             if (full_search()) {
@@ -3247,13 +3263,10 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
             }
 #endif
             size_t d = done.fetch_add(1, std::memory_order_relaxed) + 1;
-            if (m_verbose && (d % 10 == 0 || d == work.size())) {
-                std::lock_guard<std::mutex> lk(cout_mtx);
-                std::cout << "\r  " << d << "/" << work.size()
-                          << " (" << d * 100 / work.size() << "%)" << std::flush;
-            }
+            if (m_verbose && (d % 10 == 0 || d == work.size()))
+                messages().progress(d, work.size(), true);
         });
-        if (m_verbose) std::cout << "\n";
+        if (m_verbose) messages().end_progress();
     }
 
     // Remainder block
@@ -3332,9 +3345,10 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
         }
 
         if (m_verbose)
-            std::cout << "DP: irregular reuse graph — " << NN << " nodes, "
-                      << m_reuse_edges.size() << " input-frame edges, "
-                      << bridges.size() << " bridge blocks\n";
+            messages().report(MessageLevel::info, "DP: irregular reuse graph — " + std::to_string(NN)
+                              + " nodes, " + std::to_string(m_reuse_edges.size())
+                              + " input-frame edges, " + std::to_string(bridges.size())
+                              + " bridge blocks");
 
         // Per-node edge lists for the non-grid edge types.
         std::vector<std::vector<uint32_t>> reuse_at2(NN), bridge_at(NN);
@@ -3421,14 +3435,7 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
             }
         }
         if (!rpath.empty()) {
-            if (m_verbose) {
-                std::map<uint32_t, int> bs_hist;
-                for (const auto& bp : result2) ++bs_hist[bp.block_size];
-                std::cout << "DP done. Distribution:";
-                for (const auto& [bs, cnt] : bs_hist)
-                    std::cout << "  bs=" << bs << "×" << cnt;
-                std::cout << "\n";
-            }
+            if (m_verbose) messages().report(MessageLevel::info, distribution_line(result2));
             return result2;
         }
         // Unreachable terminal would mean a malformed graph — fall through
@@ -3502,18 +3509,17 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
     std::vector<BlockParams> result(path.size() + (remainder > 0 ? 1 : 0));
     if (!full_search()) {
         std::atomic<size_t> done{0};
-        std::mutex           cout_mtx;
-        if (m_verbose) std::cout << "Optimizing " << path.size() << " selected blocks...\n";
+        if (m_verbose)
+            messages().report(MessageLevel::info,
+                              "Optimizing " + std::to_string(path.size()) + " selected blocks...");
         run_parallel(m_parallel_for, path.size(), nthreads, [&](size_t idx) {
             auto [node, ci] = path[idx];
             result[idx] = compute_block(pcm_data, (uint64_t)node * STEP, CANDIDATES[ci]);
             size_t d = done.fetch_add(1, std::memory_order_relaxed) + 1;
-            if (m_verbose && (d % 10 == 0 || d == path.size())) {
-                std::lock_guard<std::mutex> lk(cout_mtx);
-                std::cout << "\r  " << d << "/" << path.size() << std::flush;
-            }
+            if (m_verbose && (d % 10 == 0 || d == path.size()))
+                messages().progress(d, path.size(), false);
         });
-        if (m_verbose) std::cout << "\n";
+        if (m_verbose) messages().end_progress();
     } else {
         for (size_t idx = 0; idx < path.size(); ++idx) {
             auto [node, ci] = path[idx];
@@ -3535,14 +3541,7 @@ std::vector<BlockParams> Optimizer::find_optimal_block_partitioning(
     if (remainder > 0)
         result.back() = remainder_bp;
 
-    if (m_verbose) {
-        std::map<uint32_t,int> bs_hist;
-        for (const auto& bp : result) ++bs_hist[bp.block_size];
-        std::cout << "DP done. Distribution:";
-        for (const auto& [bs, cnt] : bs_hist)
-            std::cout << "  bs=" << bs << "×" << cnt;
-        std::cout << "\n";
-    }
+    if (m_verbose) messages().report(MessageLevel::info, distribution_line(result));
 
     return result;
 }

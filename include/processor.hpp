@@ -12,6 +12,7 @@
 #include <vector>
 #include <cstdint>
 #include "FLAC/stream_decoder.h"
+#include "messages.hpp"
 #include "optimizer.hpp"
 
 namespace flacoutcpp {
@@ -101,16 +102,22 @@ struct ProcessorConfig {
     bool reuse_frames = true;
 
     /**
-     * @brief Warn on stderr when input frames beat the re-encode. See
+     * @brief Warn when input frames beat the re-encode. See
      * flacoutcpp::Config::warn_superior.
      */
     bool warn_superior = false;
 
     /**
-     * @brief If false, suppresses progress/statistics stdout output.
-     * Errors always go to stderr regardless of this setting.
+     * @brief If false, suppresses progress/statistics output.
+     * Errors and warnings are reported regardless of this setting.
      */
     bool verbose = true;
+
+    /**
+     * @brief Where messages go instead of stdout and stderr; see
+     * flacoutcpp::Config::on_message.
+     */
+    MessageSink on_message;
 };
 
 /**
@@ -172,6 +179,9 @@ private:
     static void metadata_callback(
         const FLAC__StreamDecoder* decoder, const FLAC__StreamMetadata* metadata, void* client_data);
 
+    // The whole pipeline; process() wraps it to deliver what workers queued.
+    bool run();
+
     // Raw byte copy of non-STREAMINFO metadata blocks from input file.
     bool read_extra_metadata_blocks(std::vector<std::vector<uint8_t>>& out_blocks) const;
 
@@ -188,6 +198,7 @@ private:
     std::string     m_input;
     std::string     m_output;
     ProcessorConfig m_config;
+    detail::Messages m_messages;       // owned by the thread that constructs the Processor
     uint64_t        m_flac_offset = 0; // bytes of ID3v2 tags in front of "fLaC"
 
     // --- Parallel decode ----

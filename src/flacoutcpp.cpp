@@ -78,6 +78,7 @@ bool optimise(const std::string& input_path, const std::string& output_path, con
     pc.reuse_frames  = config.reuse_frames;
     pc.warn_superior = config.warn_superior;
     pc.verbose       = config.verbose;
+    pc.on_message    = config.on_message;
     Processor proc(input_path, output_path, pc);
     return proc.process();
 }

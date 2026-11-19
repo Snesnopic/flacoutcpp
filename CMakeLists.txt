@@ -47,6 +47,7 @@ add_library(flacout_lib
     src/bitwriter.cpp
     src/frame_writer.cpp
     src/flacoutcpp.cpp
+    src/messages.cpp
 )
 target_link_libraries(flacout_lib FLAC)
 

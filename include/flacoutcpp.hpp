@@ -282,13 +282,13 @@ struct Config {
     bool reuse_frames = true;
 
     /**
-     * @brief Warn (stderr) when the input's own frames beat the re-encode.
+     * @brief Warn when the input's own frames beat the re-encode.
      *
      * If any input frames were reused — or the whole input was copied
      * through — the search lost to whatever encoder produced the input
      * somewhere. The warning reports how many frames and the input's
      * encoder vendor string (from its VORBIS_COMMENT block) when present.
-     * Prints even with @ref verbose off; requires @ref reuse_frames, whose
+     * Reported even with @ref verbose off; requires @ref reuse_frames, whose
      * comparison machinery is what detects superiority.
      */
     bool warn_superior = false;
@@ -298,10 +298,35 @@ struct Config {
      *
      * Set to @c false to suppress progress/statistics output — useful when
      * flacoutcpp is embedded as a library and the caller manages its own UI.
-     * Errors are always printed to stderr regardless of this setting, since
-     * the boolean return value alone does not say *why* encoding failed.
+     * Errors and warnings are reported regardless of this setting (to stderr,
+     * or to @ref on_message when set), since the boolean return value alone
+     * does not say *why* encoding failed.
      */
     bool verbose = true;
+
+    /**
+     * @brief Where messages go instead of stdout and stderr.
+     *
+     * When set, every error, warning and @ref verbose line is passed here as
+     * one line of text, without the "Error: " / "Warning: " prefix or a
+     * trailing newline, and nothing is written to stdout or stderr. Empty (the
+     * default) prints errors and warnings to stderr and the rest to stdout,
+     * which is what the CLI does.
+     *
+     * It is only ever called on the thread that called optimise(), never
+     * concurrently. Messages raised on other threads — decoder errors during
+     * the parallel decode, the search's lines when it runs on a
+     * @ref parallel_for worker — are held and delivered once those threads
+     * have joined, at the latest before optimise() returns or rethrows.
+     *
+     * Every failure that makes optimise() return @c false is reported here
+     * first, naming the file involved. Decoder errors are reported as errors
+     * even when the decoder recovers and the run goes on to succeed. The
+     * running block counter that @ref verbose draws on a terminal is not a
+     * message and is not forwarded. The FLACOUT_INSTRUMENT report and the
+     * FLACOUT_*_DUMP_PATH debug output do not go through it.
+     */
+    MessageSink on_message;
 };
 
 /**

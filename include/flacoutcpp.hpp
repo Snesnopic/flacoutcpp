@@ -320,11 +320,11 @@ struct Config {
      * have joined, at the latest before optimise() returns or rethrows.
      *
      * Every failure that makes optimise() return @c false is reported here
-     * first, naming the file involved. Decoder errors are reported as errors
-     * even when the decoder recovers and the run goes on to succeed. The
-     * running block counter that @ref verbose draws on a terminal is not a
-     * message and is not forwarded. The FLACOUT_INSTRUMENT report and the
-     * FLACOUT_*_DUMP_PATH debug output do not go through it.
+     * first, naming the file involved. Each decoder error arrives as its own
+     * line before the failure it causes. The running block counter that
+     * @ref verbose draws on a terminal is not a message and is not forwarded.
+     * The FLACOUT_INSTRUMENT report and the FLACOUT_*_DUMP_PATH debug output
+     * do not go through it.
      */
     MessageSink on_message;
 };
@@ -341,6 +341,10 @@ struct Config {
  * @param output_path  Path for the output FLAC file (created or overwritten).
  * @param config       Optimisation parameters (see Config).
  * @return             @c true on success, @c false on any decode/encode error.
+ *                     An input that `flac --test` would reject fails too, with
+ *                     nothing written: any decoder error, a sample count other
+ *                     than its STREAMINFO declares, or audio that does not
+ *                     match its STREAMINFO MD5 (when one is set).
  *
  * @note CPU time is proportional to @c (audio_duration × num_candidates ×
  *       num_windows × max_lpc_order) / @c max_threads.  For reference, a

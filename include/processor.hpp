@@ -229,6 +229,8 @@ private:
     /// join.
     bool              m_stream_mode = false;
     std::atomic<bool> m_decode_failed{false};
+    std::atomic<bool> m_decoder_error{false}; // set by error_callback, on any decoding thread
+    uint64_t          m_decoded_samples = 0;  // per channel, as the frames delivered them
 
     // Input frame map for frame reuse: sample span and byte range of every
     // frame in the input file, recorded during decode (see track_frames()).
@@ -251,6 +253,7 @@ private:
     uint32_t m_channels      = 0;
     uint32_t m_bps           = 0;
     uint64_t m_total_samples = 0;
+    uint8_t  m_input_md5[16] = {};  // all zero when the input's encoder left it unset
 
     /// @endcond
 };

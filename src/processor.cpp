@@ -27,6 +27,8 @@ static thread_local uint64_t t_range_hi = UINT64_MAX;
 /// End sample of the last frame this worker decoded, so its loop knows when it
 /// has covered its range.
 static thread_local uint64_t t_frame_end = 0;
+/// Samples this worker wrote inside its range; a range with a hole decodes fewer.
+static thread_local uint64_t t_written = 0;
 
 // Frame-reuse bookkeeping under a *parallel* decode. Each worker records the
 // frames it decodes with their byte ranges; the ranges are merged and sorted
@@ -343,6 +345,13 @@ bool Processor::run() {
     if (ok && track_frames() &&
         !FLAC__stream_decoder_get_decode_position(decoder, &m_prev_frame_end))
         m_frame_pos_ok = false;
+    // the buffers, the sample count check and the output header all come from STREAMINFO
+    if (ok && (m_channels == 0 || m_total_samples == 0)) {
+        m_messages.report(MessageLevel::error,
+            m_channels == 0 ? "no STREAMINFO in " + m_input
+                            : "the STREAMINFO of " + m_input + " gives no sample count");
+        return false;
+    }
 
     // Parallel decode. libFLAC is single-threaded and its decode is a fixed cost
     // the search cannot hide: measured at 0.24 s of a 1.05 s run on a 4.7-minute
@@ -353,8 +362,7 @@ bool Processor::run() {
     // without one keeps the serial path -- as do short files, where the seeks and
     // the extra decoder instances cost more than they save.
     const uint64_t align = (m_max_blocksize > 0) ? m_max_blocksize : 4096;
-    unsigned nthr = ok && m_total_samples > 0
-                  ? decode_thread_count(m_total_samples, align) : 1;
+    unsigned nthr = ok ? decode_thread_count(m_total_samples, align) : 1;
     if (nthr > 1) {
         m_pcm_data.assign(m_channels, std::vector<int32_t>());
         for (auto& ch : m_pcm_data) ch.resize((size_t)m_total_samples);
@@ -368,6 +376,7 @@ bool Processor::run() {
         m_stream_mode = false;
     } else {
         ok = ok && FLAC__stream_decoder_process_until_end_of_stream(decoder);
+        m_decoded_samples = m_pcm_data.empty() ? 0 : m_pcm_data[0].size();
     }
     // a failed parallel worker has reported its own cause
     const std::string stopped = ok || nthr > 1 ? std::string() :
@@ -378,11 +387,17 @@ bool Processor::run() {
         m_messages.report(MessageLevel::error, "could not decode " + m_input + stopped);
         return false;
     }
-    if (m_channels == 0 || m_total_samples == 0 || m_pcm_data.empty()) {
+    // libFLAC recovers by dropping the frame or filling it with silence, which is
+    // not the input's audio; flac itself stops here unless told -F
+    if (m_decoder_error.load(std::memory_order_acquire)) {
+        m_messages.report(MessageLevel::error, "could not decode " + m_input + " without errors");
+        return false;
+    }
+    // a short stream would be written under a STREAMINFO that promises more
+    if (m_decoded_samples != m_total_samples) {
         m_messages.report(MessageLevel::error,
-            m_channels == 0      ? "no STREAMINFO in " + m_input
-          : m_total_samples == 0 ? "the STREAMINFO of " + m_input + " gives no sample count"
-          :                        "no audio frames in " + m_input);
+            m_input + " decodes to " + std::to_string(m_decoded_samples)
+            + " samples but its STREAMINFO declares " + std::to_string(m_total_samples));
         return false;
     }
 
@@ -517,6 +532,21 @@ bool Processor::run() {
         });
     } else {
         blocks = opt.find_optimal_block_partitioning(m_pcm_data);
+    }
+
+    // The search is done, so there is nothing left to overlap the hash with.
+    // (Joiner would also join at scope exit, but the digest cannot be read before
+    // the thread is done.)
+    if (md5_thread.joinable()) md5_thread.join();
+    const auto md5_digest = md5.digest();
+    // frames that decode cleanly can still carry audio the input's signature disowns,
+    // and a new signature would cover that up
+    static constexpr uint8_t md5_unset[16] = {};
+    if (std::memcmp(m_input_md5, md5_unset, 16) != 0
+        && std::memcmp(m_input_md5, md5_digest.data(), 16) != 0) {
+        m_messages.report(MessageLevel::error,
+            "the audio of " + m_input + " does not match the MD5 in its STREAMINFO");
+        return false;
     }
 
     if (blocks.empty()) {
@@ -717,12 +747,6 @@ bool Processor::run() {
             }
         }
     }
-
-    // The search is done, so there is nothing left to overlap the hash with.
-    // (Joiner would also join at scope exit, but the digest cannot be read before
-    // the thread is done.)
-    if (md5_thread.joinable()) md5_thread.join();
-    const auto md5_digest = md5.digest();
 
     // --- Step 5b: carry over what follows the input's audio (ID3v1, APEv2 tags) ----
     if (m_config.copy_metadata && !copy_trailing_data(out)) {
@@ -934,14 +958,16 @@ bool Processor::decode_parallel(FLAC__StreamDecoder* first, unsigned nthr,
 {
     std::vector<std::vector<PendingFrameRec>> per_worker(nthr);
     std::vector<uint8_t> pos_ok(nthr, 1);
+    std::vector<uint64_t> written(nthr, 0);
 
-    const auto worker = [this, range_len, first, &per_worker, &pos_ok](size_t i) {
+    const auto worker = [this, range_len, first, &per_worker, &pos_ok, &written](size_t i) {
         const uint64_t lo = (uint64_t)i * range_len;
         const uint64_t hi = std::min(lo + range_len, m_total_samples);
         // a pooled thread may have run another range before this one
         t_range_lo = lo;
         t_range_hi = hi;
         t_frame_end = 0;
+        t_written = 0;
         t_frames.clear();
         t_pos_ok = track_frames();
         t_prev_end = 0;
@@ -1008,6 +1034,7 @@ bool Processor::decode_parallel(FLAC__StreamDecoder* first, unsigned nthr,
 
         per_worker[i] = std::move(t_frames);
         pos_ok[i] = t_pos_ok ? 1 : 0;
+        written[i] = t_written;
     };
     if (m_config.parallel_for) {
         m_config.parallel_for(nthr, worker);
@@ -1023,6 +1050,8 @@ bool Processor::decode_parallel(FLAC__StreamDecoder* first, unsigned nthr,
         if (m_frame_pos_ok) merge_input_frames(per_worker);
         else                m_input_frames.clear();
     }
+    m_decoded_samples = 0;
+    for (uint64_t n : written) m_decoded_samples += n;
     return !m_decode_failed.load(std::memory_order_acquire);
 }
 
@@ -1033,6 +1062,15 @@ FLAC__StreamDecoderWriteStatus Processor::write_callback(
     auto* self = static_cast<Processor*>(client_data);
     uint32_t nch   = frame->header.channels;
     uint32_t bsize = frame->header.blocksize;
+
+    // libFLAC does not hold a frame to STREAMINFO's channel count, and every
+    // buffer from here on is sized by it
+    if (nch != self->m_channels) {
+        self->m_messages.report(MessageLevel::error,
+            "the STREAMINFO of " + self->m_input + " declares " + std::to_string(self->m_channels)
+            + " channels, one of its frames has " + std::to_string(nch));
+        return FLAC__STREAM_DECODER_WRITE_STATUS_ABORT;
+    }
 
     if (self->m_stream_mode) {
         // The frame carries its own position, so a thread that seeked into the
@@ -1053,11 +1091,13 @@ FLAC__StreamDecoderWriteStatus Processor::write_callback(
         const uint64_t hi = std::min(at + bsize,
                                      std::min(t_range_hi, self->m_total_samples));
         t_frame_end = at + bsize;
-        if (hi > lo)
+        if (hi > lo) {
             for (uint32_t c = 0; c < nch; ++c)
                 std::memcpy(self->m_pcm_data[c].data() + lo,
                             buffer[c] + (lo - at),
                             (size_t)(hi - lo) * sizeof(int32_t));
+            t_written += hi - lo;
+        }
 
         // Reuse needs every input frame's byte range. Recorded per worker and
         // merged after the join -- unlike the sample data, this cannot be placed
@@ -1115,6 +1155,7 @@ void Processor::error_callback(
     const FLAC__StreamDecoder*, FLAC__StreamDecoderErrorStatus status, void* client_data)
 {
     auto* self = static_cast<Processor*>(client_data);
+    self->m_decoder_error.store(true, std::memory_order_release);
     self->m_messages.report(MessageLevel::error, "decoder error in " + self->m_input + ": "
                             + FLAC__StreamDecoderErrorStatusString[status]);
 }
@@ -1128,6 +1169,7 @@ void Processor::metadata_callback(
         self->m_channels      = metadata->data.stream_info.channels;
         self->m_bps           = metadata->data.stream_info.bits_per_sample;
         self->m_total_samples = metadata->data.stream_info.total_samples;
+        std::memcpy(self->m_input_md5, metadata->data.stream_info.md5sum, 16);
         // Only used to align the parallel decode's ranges onto frame boundaries.
         self->m_max_blocksize = metadata->data.stream_info.max_blocksize;
     }
